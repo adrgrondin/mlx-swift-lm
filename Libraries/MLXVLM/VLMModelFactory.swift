@@ -116,7 +116,6 @@ public enum VLMProcessorTypeRegistry {
             // PixtralProcessor can use either Pixtral or Mistral3 processor config
             "PixtralProcessor": create(
                 PixtralProcessorConfiguration.self, PixtralProcessor.init),
-            // Mistral3 uses PixtralProcessor but with its own config
             "Mistral3Processor": create(
                 Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
     ])
@@ -162,13 +161,8 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         id: "mlx-community/SmolVLM-Instruct-4bit",
         defaultPrompt: "Describe the image in English"
     )
-    
-    static public let mistral3_3B_R_4bit = ModelConfiguration(
-        id: "mlx-community/Ministral-3-3B-Reasoning-2512-4bit",
-        defaultPrompt: ""
-    )
-    
-    static public let mistral3_3B_Inst_4bit = ModelConfiguration(
+
+    static public let mistral3_3B_Instruct_4bit = ModelConfiguration(
         id: "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
         defaultPrompt: ""
     )
@@ -301,7 +295,8 @@ public final class VLMModelFactory: ModelFactory {
         // Support both processor_config.json and preprocessor_config.json
         let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
         let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
-        let processorConfigurationURL = FileManager.default.fileExists(atPath: processorConfigURL.path)
+        let processorConfigurationURL =
+            FileManager.default.fileExists(atPath: processorConfigURL.path)
             ? processorConfigURL
             : preprocessorConfigURL
 
@@ -322,8 +317,9 @@ public final class VLMModelFactory: ModelFactory {
         let processorTypeOverrides: [String: String] = [
             "mistral3": "Mistral3Processor"
         ]
-        let processorType = processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
-        
+        let processorType =
+            processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
+
         let processor = try processorRegistry.createModel(
             configuration: processorConfigurationURL,
             processorType: processorType, tokenizer: tokenizer)
