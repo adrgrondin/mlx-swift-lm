@@ -22,7 +22,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.29.1")),
-        .package(url: "https://github.com/huggingface/swift-transformers", branch: "v5-tokenizers-backend"),
+        .package(
+            url: "https://github.com/huggingface/swift-transformers",
+            .upToNextMinor(from: "1.1.0")
+        ),
     ],
     targets: [
         .target(
