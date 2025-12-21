@@ -490,7 +490,7 @@ private enum Language {
             let cache = cache ?? []
             let offset = cache.first?.offset ?? 0
 
-            let faMask = createAttentionMask(h: h, cache: cache.isEmpty ? nil : [cache[faIndex]])
+            let faMask = createAttentionMask(h: h, cache: cache[faIndex])
 
             var swaMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
             if let swaIndex, let slidingWindow, !cache.isEmpty {

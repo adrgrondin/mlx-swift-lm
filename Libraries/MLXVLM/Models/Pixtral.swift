@@ -670,11 +670,10 @@ private enum PixtralLanguage {
                 h = embedTokens(inputs)
             }
 
-            let cache = cache ?? []
-            let mask = createAttentionMask(h: h, cache: cache.isEmpty ? nil : cache)
+            let mask = createAttentionMask(h: h, cache: cache?.first)
 
             for (i, layer) in layers.enumerated() {
-                h = layer(h, mask: mask, cache: cache.isEmpty ? nil : cache[i])
+                h = layer(h, mask: mask, cache: cache?[i])
             }
 
             return norm(h)

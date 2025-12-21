@@ -113,11 +113,10 @@ public enum VLMProcessorTypeRegistry {
             SmolVLMProcessorConfiguration.self, SmolVLMProcessor.init),
         "FastVLMProcessor": create(
             FastVLMProcessorConfiguration.self, FastVLMProcessor.init),
-            // PixtralProcessor can use either Pixtral or Mistral3 processor config
-            "PixtralProcessor": create(
-                PixtralProcessorConfiguration.self, PixtralProcessor.init),
-            "Mistral3Processor": create(
-                Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
+        "PixtralProcessor": create(
+            PixtralProcessorConfiguration.self, PixtralProcessor.init),
+        "Mistral3Processor": create(
+            Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
     ])
 }
 
@@ -312,7 +311,7 @@ public final class VLMModelFactory: ModelFactory {
         }
 
         // Override processor type based on model type for models that need special handling
-        // Mistral3 models often ship with "PixtralProcessor" in their config but need Mistral3Processor
+        // Mistral3 model ship with "PixtralProcessor" in their config but need Mistral3Processor
         // to handle spatial merging correctly
         let processorTypeOverrides: [String: String] = [
             "mistral3": "Mistral3Processor"
@@ -320,7 +319,7 @@ public final class VLMModelFactory: ModelFactory {
         let processorType =
             processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
 
-        let processor = try processorRegistry.createModel(
+        let processor = try await processorRegistry.createModel(
             configuration: processorConfigurationURL,
             processorType: processorType, tokenizer: tokenizer)
 
