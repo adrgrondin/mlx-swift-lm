@@ -27,10 +27,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.6")),
-        .package(
-            url: "https://github.com/huggingface/swift-transformers",
-            .upToNextMinor(from: "1.1.0")
-        ),
+        .package(url: "https://github.com/huggingface/swift-transformers", branch: "mattt/fix-progress-handler")
     ],
     targets: [
         .target(
