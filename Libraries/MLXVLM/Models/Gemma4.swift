@@ -1781,15 +1781,15 @@ public struct Gemma4MessageGenerator: MessageGenerator {
         } else {
             [
                 "role": message.role.rawValue,
-                "content": [
-                    ["type": "text", "text": message.content]
-                ]
-                    + message.images.map { _ in
+                "content": message.images.map { _ in
                         ["type": "image"]
                     }
                     + message.videos.map { _ in
                         ["type": "video"]
-                    },
+                    }
+                    + [
+                        ["type": "text", "text": message.content]
+                    ],
             ]
         }
     }
