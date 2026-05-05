@@ -188,6 +188,22 @@ private enum Gemma4SharedKVState {
     }
 }
 
+private struct Gemma4TextModelOutput {
+    let hiddenStates: MLXArray
+    let capturedHiddenStates: [MLXArray]?
+    let sharedKVStates: [String: Gemma4SharedKVState]?
+}
+
+private struct Gemma4TextLanguageModelOutput {
+    let logits: MLXArray
+    let hiddenStates: [MLXArray]?
+    let sharedKVStates: [String: Gemma4SharedKVState]?
+
+    var lmOutput: LMOutput {
+        LMOutput(logits: logits)
+    }
+}
+
 private func gemma4AdjustAttentionMask(
     _ mask: MLXFast.ScaledDotProductAttentionMaskMode,
     keyLength: Int
@@ -602,21 +618,23 @@ private final class Gemma4TextAttention: Module {
     let scale: Float
     let isKVSharedLayer: Bool
     let useKEqV: Bool
+    let kvSharedOnly: Bool
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear?
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "k_norm") var kNorm: Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale
+    @ModuleInfo(key: "k_norm") var kNorm: Gemma4RMSNormZeroShift?
+    @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale?
     @ModuleInfo var rope: OffsetLayer
 
-    init(config: Gemma4TextConfiguration, layerIdx: Int) {
+    init(config: Gemma4TextConfiguration, layerIdx: Int, kvSharedOnly: Bool = false) {
         self.config = config
         self.layerIdx = layerIdx
         self.layerType = config.layerTypes[layerIdx]
         self.isSliding = layerType == "sliding_attention"
+        self.kvSharedOnly = kvSharedOnly
         self.headDim =
             layerType == "full_attention" && config.globalHeadDim > 0
             ? config.globalHeadDim : config.headDim
@@ -630,17 +648,22 @@ private final class Gemma4TextAttention: Module {
         self.isKVSharedLayer = layerIdx >= firstKVSharedLayer && firstKVSharedLayer > 0
 
         self._qProj.wrappedValue = Linear(config.hiddenSize, numHeads * headDim, bias: false)
-        self._kProj.wrappedValue = Linear(config.hiddenSize, numKVHeads * headDim, bias: false)
-        if !useKEqV {
-            self._vProj.wrappedValue = Linear(
+        if !kvSharedOnly {
+            self._kProj.wrappedValue = Linear(
                 config.hiddenSize, numKVHeads * headDim, bias: false)
+            if !useKEqV {
+                self._vProj.wrappedValue = Linear(
+                    config.hiddenSize, numKVHeads * headDim, bias: false)
+            }
         }
         self._oProj.wrappedValue = Linear(numHeads * headDim, config.hiddenSize, bias: false)
         self._qNorm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: headDim, eps: config.rmsNormEps)
-        self._kNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: headDim, eps: config.rmsNormEps)
-        self._vNorm.wrappedValue = Gemma4RMSNormNoScale(eps: config.rmsNormEps)
+        if !kvSharedOnly {
+            self._kNorm.wrappedValue = Gemma4RMSNormZeroShift(
+                dimensions: headDim, eps: config.rmsNormEps)
+            self._vNorm.wrappedValue = Gemma4RMSNormNoScale(eps: config.rmsNormEps)
+        }
 
         let ropeKey = isSliding ? "sliding_attention" : "full_attention"
         let ropeConfig = config.ropeParameters[ropeKey]
@@ -674,6 +697,9 @@ private final class Gemma4TextAttention: Module {
             currentOffset = offset ?? 0
             kvState = sharedKV
         } else {
+            guard let kProj, let kNorm, let vNorm else {
+                fatalError("Gemma4 KV-shared-only attention requires a shared KV state")
+            }
             currentOffset = cache?.offset ?? 0
             var keys = kProj(x).reshaped(batch, length, numKVHeads, headDim)
             var values =
@@ -767,10 +793,11 @@ private final class Gemma4TextDecoderLayer: Module {
     @ModuleInfo(key: "post_per_layer_input_norm") var postPerLayerInputNorm: Gemma4RMSNormZeroShift?
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
-    init(config: Gemma4TextConfiguration, layerIdx: Int) {
+    init(config: Gemma4TextConfiguration, layerIdx: Int, kvSharedOnly: Bool = false) {
         self.layerType = config.layerTypes[layerIdx]
         self.enableMoE = config.enableMoEBlock
-        self._selfAttention.wrappedValue = Gemma4TextAttention(config: config, layerIdx: layerIdx)
+        self._selfAttention.wrappedValue = Gemma4TextAttention(
+            config: config, layerIdx: layerIdx, kvSharedOnly: kvSharedOnly)
         self._mlp.wrappedValue = Gemma4TextMLP(config: config, layerIdx: layerIdx)
         self._inputLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
@@ -877,7 +904,7 @@ private final class Gemma4TextBackbone: Module {
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm:
         Gemma4RMSNormZeroShift?
 
-    init(_ config: Gemma4TextConfiguration) {
+    init(_ config: Gemma4TextConfiguration, kvSharedOnly: Bool = false) {
         self.config = config
         self.firstKVSharedLayerIdx = config.hiddenLayers - config.numKVSharedLayers
         self.embedScale = pow(Float(config.hiddenSize), 0.5)
@@ -904,7 +931,7 @@ private final class Gemma4TextBackbone: Module {
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
         self._layers.wrappedValue = (0 ..< config.hiddenLayers).map {
-            Gemma4TextDecoderLayer(config: config, layerIdx: $0)
+            Gemma4TextDecoderLayer(config: config, layerIdx: $0, kvSharedOnly: kvSharedOnly)
         }
         self._norm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
@@ -968,8 +995,11 @@ private final class Gemma4TextBackbone: Module {
         inputsEmbeds: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: [KVCache?]? = nil,
-        perLayerInputs: MLXArray? = nil
-    ) -> MLXArray {
+        perLayerInputs: MLXArray? = nil,
+        captureLayerIds: [Int]? = nil,
+        returnHidden: Bool = false,
+        returnSharedKV: Bool = false
+    ) -> Gemma4TextModelOutput {
         let h0: MLXArray
         if let inputsEmbeds {
             h0 = inputsEmbeds
@@ -1015,6 +1045,9 @@ private final class Gemma4TextBackbone: Module {
         }
 
         var h = h0
+        let captureSet = Set(captureLayerIds ?? [])
+        var capturedHiddenStates: [MLXArray]? =
+            (returnHidden || captureLayerIds != nil) ? [] : nil
         var intermediates = [(kv: Gemma4SharedKVState?, offset: Int?)](
             repeating: (nil, nil), count: config.hiddenLayers)
         for (idx, layer) in layers.enumerated() {
@@ -1049,8 +1082,29 @@ private final class Gemma4TextBackbone: Module {
             )
             h = output
             intermediates[idx] = (kvState, attentionOffset)
+            if capturedHiddenStates != nil, captureSet.contains(idx) {
+                capturedHiddenStates?.append(h)
+            }
         }
-        return norm(h)
+
+        var sharedKVStates: [String: Gemma4SharedKVState]? = returnSharedKV ? [:] : nil
+        if sharedKVStates != nil {
+            for (idx, layer) in layers.enumerated() {
+                if let kvState = intermediates[idx].kv {
+                    sharedKVStates?[layer.layerType] = kvState
+                }
+            }
+        }
+
+        if capturedHiddenStates != nil, captureSet.isEmpty {
+            capturedHiddenStates?.append(h)
+        }
+
+        return Gemma4TextModelOutput(
+            hiddenStates: norm(h),
+            capturedHiddenStates: capturedHiddenStates,
+            sharedKVStates: sharedKVStates
+        )
     }
 }
 
@@ -1100,23 +1154,111 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         cache: [KVCache]? = nil,
         inputsEmbeds: MLXArray? = nil,
         perLayerInputs: MLXArray? = nil,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
-    ) -> LMOutput {
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        captureLayerIds: [Int]? = nil,
+        returnHidden: Bool = false,
+        returnSharedKV: Bool = false
+    ) -> Gemma4TextLanguageModelOutput {
         let output = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
-            perLayerInputs: perLayerInputs
+            perLayerInputs: perLayerInputs,
+            captureLayerIds: captureLayerIds,
+            returnHidden: returnHidden,
+            returnSharedKV: returnSharedKV
         )
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(output)
+            logits = lmHead(output.hiddenStates)
         } else {
-            logits = model.embedTokens.asLinear(output)
+            logits = model.embedTokens.asLinear(output.hiddenStates)
         }
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
             let scale = MLXArray(finalLogitSoftcapping)
-            return LMOutput(logits: tanh(logits / scale) * scale)
+            return Gemma4TextLanguageModelOutput(
+                logits: tanh(logits / scale) * scale,
+                hiddenStates: output.capturedHiddenStates,
+                sharedKVStates: output.sharedKVStates
+            )
         }
-        return LMOutput(logits: logits)
+        return Gemma4TextLanguageModelOutput(
+            logits: logits,
+            hiddenStates: output.capturedHiddenStates,
+            sharedKVStates: output.sharedKVStates
+        )
+    }
+
+    func rollbackSpeculativeCache(
+        _ caches: [KVCache],
+        accepted: Int,
+        blockSize: Int
+    ) -> Int {
+        rollbackSpeculativeCache(
+            caches,
+            accepted: MLXArray([accepted], [1]),
+            blockSize: blockSize
+        )
+    }
+
+    func rollbackSpeculativeCache(
+        _ caches: [KVCache],
+        accepted: MLXArray,
+        blockSize: Int
+    ) -> Int {
+        let acceptedValues = accepted.flattened().asArray(Int.self)
+        guard !acceptedValues.isEmpty else {
+            return 0
+        }
+
+        let maxAccepted = acceptedValues.max() ?? 0
+        let validTokens = maxAccepted + 1
+        let trimCount = max(blockSize - validTokens, 0)
+        let validEnds = acceptedValues.map { $0 + 1 }
+        let isBatch = acceptedValues.count > 1
+
+        for var cache in caches {
+            if cache.offset == 0 {
+                continue
+            }
+
+            if trimCount > 0 {
+                cache.trim(trimCount)
+            }
+
+            guard isBatch, maxAccepted > 0 else {
+                continue
+            }
+
+            var state = cache.state
+            guard state.count >= 2 else {
+                continue
+            }
+
+            let kvLength = cache.offset
+            let verifyStart = kvLength - validTokens
+            guard verifyStart >= 0 else {
+                continue
+            }
+
+            let keys = state[0]
+            let values = state[state.count / 2]
+            for (batchIndex, validEnd) in validEnds.enumerated() {
+                let start = verifyStart + validEnd
+                if start < kvLength {
+                    let keySlice = keys[batchIndex, 0..., start ..< kvLength, 0...]
+                    let valueSlice = values[batchIndex, 0..., start ..< kvLength, 0...]
+                    keys[batchIndex, 0..., start ..< kvLength, 0...] = MLXArray.zeros(
+                        like: keySlice)
+                    values[batchIndex, 0..., start ..< kvLength, 0...] = MLXArray.zeros(
+                        like: valueSlice)
+                }
+            }
+
+            state[0] = keys
+            state[state.count / 2] = values
+            cache.state = state
+        }
+
+        return maxAccepted
     }
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -1734,10 +1876,10 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 inputsEmbeds: inputsEmbeds,
                 perLayerInputs: perLayerInputs
             )
-            return .logits(result)
+            return .logits(result.lmOutput)
         } else {
             let result = languageModel(input.text.tokens, cache: convertedCache)
-            return .logits(result)
+            return .logits(result.lmOutput)
         }
     }
 
