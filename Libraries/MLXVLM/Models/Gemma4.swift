@@ -1606,8 +1606,8 @@ public final class Gemma4Assistant: Module, LanguageModel {
                 position: position
             )
             previousHidden = gemma4MTPHiddenAt(output.hidden, index: -1)
-            token = sampler.sample(logits: output.logits[0..., -1, 0...])
-            tokens.append(token.reshaped(1, 1))
+            token = gemma4MTPTokenMatrix(sampler.sample(logits: output.logits[0..., -1, 0...]))
+            tokens.append(token)
         }
 
         guard let first = tokens.first else {
@@ -2246,6 +2246,19 @@ private func gemma4MTPHiddenAt(_ hidden: MLXArray, index: Int) -> MLXArray {
         return hidden[position, 0...].reshaped(1, 1, hidden.dim(1))
     default:
         fatalError("Gemma4 MTP expected hidden state with rank 2 or 3, got \(hidden.ndim)")
+    }
+}
+
+private func gemma4MTPTokenMatrix(_ token: MLXArray) -> MLXArray {
+    switch token.ndim {
+    case 0:
+        return token.reshaped(1, 1)
+    case 1:
+        return token.expandedDimensions(axis: 1)
+    case 2:
+        return token
+    default:
+        fatalError("Gemma4 MTP expected sampled token with rank <= 2, got \(token.ndim)")
     }
 }
 
