@@ -2318,6 +2318,21 @@ private func gemma4MTPSampleSequence(logits: MLXArray, sampler: LogitSampler) ->
     return concatenated([first] + tokens.dropFirst(), axis: 1).flattened()
 }
 
+private func gemma4MTPFormatMilliseconds(_ duration: TimeInterval) -> String {
+    String(format: "%.3f", duration * 1000)
+}
+
+private func gemma4MTPFormatPercent(_ numerator: Int, _ denominator: Int) -> String {
+    guard denominator > 0 else { return "0.00" }
+    return String(format: "%.2f", 100 * Double(numerator) / Double(denominator))
+}
+
+private func gemma4MTPKVSummary(_ states: [String: Gemma4SharedKVState]) -> String {
+    states.keys.sorted().map { key in
+        "\(key)=\(states[key]?.sequenceLength ?? 0)"
+    }.joined(separator: ",")
+}
+
 public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
     private let target: Gemma4
     private let assistant: Gemma4Assistant
@@ -2332,8 +2347,35 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
     private var lastBonus: Int
     private var pendingTokens: [Int]
     private var emitted = 0
+    private var rollingAccepted: [Int] = []
+    private var rollingDrafted: [Int] = []
 
     public let promptPrefillTime: TimeInterval
+    public private(set) var mtpRounds = 0
+    public private(set) var mtpDraftedTokens = 0
+    public private(set) var mtpAcceptedTokens = 0
+    public private(set) var mtpRejectedTokens = 0
+    public private(set) var mtpDraftTime: TimeInterval = 0
+    public private(set) var mtpVerifyTime: TimeInterval = 0
+    public private(set) var mtpWalkTime: TimeInterval = 0
+    public private(set) var mtpRollbackTime: TimeInterval = 0
+    public private(set) var mtpSharedKVSliceTime: TimeInterval = 0
+
+    public var mtpAcceptanceRate: Double {
+        guard mtpDraftedTokens > 0 else { return 0 }
+        return Double(mtpAcceptedTokens) / Double(mtpDraftedTokens)
+    }
+
+    public func debugSummary(generationTokenCount: Int, generationTime: TimeInterval) -> String {
+        let tokensPerSecond =
+            if generationTime > 0 {
+                String(format: "%.3f", Double(generationTokenCount) / generationTime)
+            } else {
+                "inf"
+            }
+        return
+            "[Gemma4MTP] summary generationTokens=\(generationTokenCount) generationMs=\(gemma4MTPFormatMilliseconds(generationTime)) tokensPerSecond=\(tokensPerSecond) prefillMs=\(gemma4MTPFormatMilliseconds(promptPrefillTime)) rounds=\(mtpRounds) drafted=\(mtpDraftedTokens) accepted=\(mtpAcceptedTokens) rejected=\(mtpRejectedTokens) acceptancePct=\(gemma4MTPFormatPercent(mtpAcceptedTokens, mtpDraftedTokens)) draftTotalMs=\(gemma4MTPFormatMilliseconds(mtpDraftTime)) verifyTotalMs=\(gemma4MTPFormatMilliseconds(mtpVerifyTime)) walkTotalMs=\(gemma4MTPFormatMilliseconds(mtpWalkTime)) rollbackTotalMs=\(gemma4MTPFormatMilliseconds(mtpRollbackTime)) sliceTotalMs=\(gemma4MTPFormatMilliseconds(mtpSharedKVSliceTime))"
+    }
 
     public init(
         input: LMInput,
@@ -2405,6 +2447,9 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         self.pendingTokens = [bonus]
         assistant.bind(target: target)
         assistant.setSharedKV(sharedKV, position: self.cache.first?.offset ?? input.text.tokens.dim(1))
+        print(
+            "[Gemma4MTP] prefill promptTokens=\(input.text.tokens.size) blockSize=\(self.blockSize) maxTokens=\(maxTokens.map(String.init) ?? "nil") cacheOffset=\(self.cache.first?.offset ?? -1) firstBonus=\(bonus) sharedKV=\(gemma4MTPKVSummary(sharedKV)) prefillMs=\(gemma4MTPFormatMilliseconds(self.promptPrefillTime))"
+        )
     }
 
     public mutating func next() -> Int? {
@@ -2425,6 +2470,10 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
     }
 
     private mutating func speculateRound() {
+        let roundIndex = mtpRounds + 1
+        let emittedBefore = emitted
+        let cacheOffsetBefore = cache.first?.offset ?? -1
+        let sharedKVBefore = gemma4MTPKVSummary(sharedKV)
         let remaining =
             if let maxTokens {
                 maxTokens - emitted + 1
@@ -2437,6 +2486,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         }
 
         assistant.setSharedKV(sharedKV, position: cache.first?.offset ?? 0)
+        let draftStart = Date.timeIntervalSinceReferenceDate
         let draftTokens = assistant.draftBlock(
             lastBonus: lastBonus,
             hidden: hidden,
@@ -2444,9 +2494,11 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
             sampler: sampler
         )
         eval(draftTokens)
+        let draftTime = Date.timeIntervalSinceReferenceDate - draftStart
 
         let verifyInput = concatenated(
             [MLXArray([lastBonus]).reshaped(1, 1), draftTokens], axis: 1)
+        let verifyStart = Date.timeIntervalSinceReferenceDate
         let verifyOutput = target.languageModel(
             verifyInput,
             cache: cache,
@@ -2461,7 +2513,9 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
 
         let targetTokens = gemma4MTPSampleSequence(logits: verifyOutput.logits, sampler: sampler)
         eval(targetTokens, hiddenFull)
+        let verifyTime = Date.timeIntervalSinceReferenceDate - verifyStart
 
+        let walkStart = Date.timeIntervalSinceReferenceDate
         let targetTokenValues = targetTokens.asArray(Int.self)
         let draftTokenValues = draftTokens.flattened().asArray(Int.self)
         let draftCount = Swift.min(draftTokenValues.count, verifyLength - 1)
@@ -2474,6 +2528,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         {
             accepted += 1
         }
+        let walkTime = Date.timeIntervalSinceReferenceDate - walkStart
 
         var newTokens = Array(draftTokenValues.prefix(accepted))
         if accepted < targetTokenValues.count, newTokens.count < generationBudget {
@@ -2490,21 +2545,56 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         lastBonus = newTokens.last!
         hidden = gemma4MTPHiddenAt(hiddenFull, index: accepted)
 
+        let rollbackStart = Date.timeIntervalSinceReferenceDate
+        var didRollback = false
         if accepted < verifyLength - 1 {
             _ = target.languageModel.rollbackSpeculativeCache(
                 cache,
                 accepted: accepted,
                 blockSize: verifyLength
             )
+            didRollback = true
         }
+        let rollbackTime = Date.timeIntervalSinceReferenceDate - rollbackStart
 
         let rejected = verifyLength - (accepted + 1)
+        let sliceStart = Date.timeIntervalSinceReferenceDate
         var nextSharedKV: [String: Gemma4SharedKVState] = [:]
         nextSharedKV.reserveCapacity(verifySharedKV.count)
         for (key, kv) in verifySharedKV {
             nextSharedKV[key] = kv.sliced(validLength: kv.sequenceLength - rejected)
         }
         sharedKV = nextSharedKV
+        let sliceTime = Date.timeIntervalSinceReferenceDate - sliceStart
+
+        mtpRounds += 1
+        mtpDraftedTokens += draftCount
+        mtpAcceptedTokens += accepted
+        mtpRejectedTokens += draftCount - accepted
+        mtpDraftTime += draftTime
+        mtpVerifyTime += verifyTime
+        mtpWalkTime += walkTime
+        mtpRollbackTime += rollbackTime
+        mtpSharedKVSliceTime += sliceTime
+
+        rollingAccepted.append(accepted)
+        rollingDrafted.append(draftCount)
+        if rollingAccepted.count > 32 {
+            rollingAccepted.removeFirst()
+            rollingDrafted.removeFirst()
+        }
+
+        let rollingAcceptedTotal = rollingAccepted.reduce(0, +)
+        let rollingDraftedTotal = rollingDrafted.reduce(0, +)
+        let mismatch: String
+        if accepted < draftCount, accepted < targetTokenValues.count {
+            mismatch = " mismatchDraft=\(draftTokenValues[accepted]) mismatchTarget=\(targetTokenValues[accepted])"
+        } else {
+            mismatch = " mismatch=none"
+        }
+        print(
+            "[Gemma4MTP] round=\(roundIndex) emitted=\(emittedBefore) cacheOffset=\(cacheOffsetBefore)->\(cache.first?.offset ?? -1) verifyLength=\(verifyLength) drafted=\(draftCount) accepted=\(accepted) rejected=\(draftCount - accepted) acceptPct=\(gemma4MTPFormatPercent(accepted, draftCount)) rolling32Pct=\(gemma4MTPFormatPercent(rollingAcceptedTotal, rollingDraftedTotal)) cumulativePct=\(gemma4MTPFormatPercent(mtpAcceptedTokens, mtpDraftedTokens)) draftMs=\(gemma4MTPFormatMilliseconds(draftTime)) verifyMs=\(gemma4MTPFormatMilliseconds(verifyTime)) walkMs=\(gemma4MTPFormatMilliseconds(walkTime)) rollbackMs=\(gemma4MTPFormatMilliseconds(rollbackTime)) sliceMs=\(gemma4MTPFormatMilliseconds(sliceTime)) rollback=\(didRollback) sharedKV=\(sharedKVBefore)->\(gemma4MTPKVSummary(sharedKV))\(mismatch)"
+        )
     }
 }
 
@@ -2535,12 +2625,12 @@ public func generateGemma4MTPTokens(
     )
     let promptTokenCount = input.text.tokens.size
     return AsyncStream { continuation in
-        let iterator = iterator
+        var iterator = iterator
         let start = Date.timeIntervalSinceReferenceDate
         var generationTokenCount = 0
         var stopReason: GenerateStopReason = .length
 
-        for token in iterator {
+        while let token = iterator.next() {
             if stopTokenIds.contains(token) {
                 stopReason = .stop
                 break
@@ -2550,6 +2640,7 @@ public func generateGemma4MTPTokens(
         }
 
         let end = Date.timeIntervalSinceReferenceDate
+        print(iterator.debugSummary(generationTokenCount: generationTokenCount, generationTime: end - start))
         continuation.yield(
             .info(
                 GenerateCompletionInfo(
@@ -2651,13 +2742,13 @@ public func generateGemma4MTP(
     let stopTokenIds = gemma4MTPStopTokenIds(context: targetContext)
 
     return AsyncStream { continuation in
-        let iterator = iterator
+        var iterator = iterator
         var detokenizer = NaiveStreamingDetokenizer(tokenizer: targetContext.tokenizer)
         let start = Date.timeIntervalSinceReferenceDate
         var generationTokenCount = 0
         var stopReason: GenerateStopReason = .length
 
-        for token in iterator {
+        while let token = iterator.next() {
             if token == targetContext.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
                 stopReason = .stop
                 break
@@ -2671,6 +2762,7 @@ public func generateGemma4MTP(
         }
 
         let end = Date.timeIntervalSinceReferenceDate
+        print(iterator.debugSummary(generationTokenCount: generationTokenCount, generationTime: end - start))
         continuation.yield(
             .info(
                 GenerateCompletionInfo(
