@@ -1477,16 +1477,36 @@ private func gemma4AssistantMask(
     }
 
     let keyLength = sharedKV.sequenceLength
-    if keyLength <= slidingWindow && queryOffset + queryLength <= keyLength + slidingWindow {
+    let localQueryOffset = min(queryOffset, keyLength)
+    if keyLength <= slidingWindow && localQueryOffset + queryLength <= keyLength + slidingWindow {
         return .none
     }
 
-    let qIndices = MLXArray(Int32(queryOffset) ..< Int32(queryOffset + queryLength))[
+    let qIndices = MLXArray(Int32(localQueryOffset) ..< Int32(localQueryOffset + queryLength))[
         0..., .newAxis]
     let kIndices = MLXArray(Int32(0) ..< Int32(keyLength))[.newAxis]
     let distance = qIndices - kIndices
     let inside = logicalAnd(distance .> -slidingWindow, distance .< slidingWindow)
     return .array(inside[.newAxis, .newAxis, 0..., 0...])
+}
+
+func gemma4MTPUsesExactGreedy(parameters: GenerateParameters) -> Bool {
+    let hasRepetitionPenalty =
+        parameters.repetitionPenalty.map { $0 != 0 && $0 != 1 } ?? false
+            && parameters.repetitionContextSize > 0
+    let hasPresencePenalty =
+        (parameters.presencePenalty ?? 0) != 0 && parameters.presenceContextSize > 0
+    let hasFrequencyPenalty =
+        (parameters.frequencyPenalty ?? 0) != 0 && parameters.frequencyContextSize > 0
+
+    return parameters.temperature == 0
+        && !hasRepetitionPenalty
+        && !hasPresencePenalty
+        && !hasFrequencyPenalty
+}
+
+func gemma4MTPSupportsTarget(_ target: Gemma4) -> Bool {
+    target.config.quantization == nil
 }
 
 public final class Gemma4Assistant: Module, LanguageModel {
@@ -2497,6 +2517,14 @@ public func generateGemma4MTPTokens(
     blockSize: Int? = nil,
     stopTokenIds: Set<Int> = []
 ) throws -> AsyncStream<TokenGeneration> {
+    guard gemma4MTPUsesExactGreedy(parameters: parameters) else {
+        throw VLMError.processing("Gemma4 MTP requires temperature=0 and no sampling penalties.")
+    }
+    guard gemma4MTPSupportsTarget(target) else {
+        throw VLMError.processing(
+            "Gemma4 MTP requires an unquantized target model paired with its assistant.")
+    }
+
     let iterator = try Gemma4MTPTokenIterator(
         input: input,
         target: target,
@@ -2519,6 +2547,127 @@ public func generateGemma4MTPTokens(
             }
             generationTokenCount += 1
             continuation.yield(.token(token))
+        }
+
+        let end = Date.timeIntervalSinceReferenceDate
+        continuation.yield(
+            .info(
+                GenerateCompletionInfo(
+                    promptTokenCount: promptTokenCount,
+                    generationTokenCount: generationTokenCount,
+                    promptTime: iterator.promptPrefillTime,
+                    generationTime: end - start,
+                    stopReason: stopReason
+                )
+            )
+        )
+        continuation.finish()
+    }
+}
+
+private func gemma4MTPStopTokenIds(context: ModelContext) -> Set<Int> {
+    var stopTokenIds = context.configuration.eosTokenIds
+    if let eosTokenId = context.tokenizer.eosTokenId {
+        stopTokenIds.insert(eosTokenId)
+    }
+    for token in context.configuration.extraEOSTokens {
+        if let id = context.tokenizer.convertTokenToId(token) {
+            stopTokenIds.insert(id)
+        }
+    }
+    return stopTokenIds
+}
+
+public func generateGemma4MTPTokens(
+    input: LMInput,
+    parameters: GenerateParameters,
+    targetContext: ModelContext,
+    assistantContext: ModelContext,
+    cache: [KVCache]? = nil,
+    blockSize: Int? = nil
+) throws -> AsyncStream<TokenGeneration> {
+    guard let target = targetContext.model as? Gemma4 else {
+        throw VLMError.processing("Gemma4 MTP target context must contain a Gemma4 model.")
+    }
+    guard gemma4MTPUsesExactGreedy(parameters: parameters), gemma4MTPSupportsTarget(target) else {
+        return try MLXLMCommon.generateTokens(
+            input: input,
+            cache: cache,
+            parameters: parameters,
+            context: targetContext
+        )
+    }
+
+    guard let assistant = assistantContext.model as? Gemma4Assistant else {
+        throw VLMError.processing(
+            "Gemma4 MTP assistant context must contain a gemma4_assistant model.")
+    }
+
+    return try generateGemma4MTPTokens(
+        input: input,
+        parameters: parameters,
+        target: target,
+        assistant: assistant,
+        cache: cache,
+        blockSize: blockSize,
+        stopTokenIds: gemma4MTPStopTokenIds(context: targetContext)
+    )
+}
+
+public func generateGemma4MTP(
+    input: LMInput,
+    parameters: GenerateParameters,
+    targetContext: ModelContext,
+    assistantContext: ModelContext,
+    cache: [KVCache]? = nil,
+    blockSize: Int? = nil
+) throws -> AsyncStream<Generation> {
+    guard let target = targetContext.model as? Gemma4 else {
+        throw VLMError.processing("Gemma4 MTP target context must contain a Gemma4 model.")
+    }
+    guard gemma4MTPUsesExactGreedy(parameters: parameters), gemma4MTPSupportsTarget(target) else {
+        return try MLXLMCommon.generate(
+            input: input,
+            cache: cache,
+            parameters: parameters,
+            context: targetContext
+        )
+    }
+
+    guard let assistant = assistantContext.model as? Gemma4Assistant else {
+        throw VLMError.processing(
+            "Gemma4 MTP assistant context must contain a gemma4_assistant model.")
+    }
+
+    let iterator = try Gemma4MTPTokenIterator(
+        input: input,
+        target: target,
+        assistant: assistant,
+        cache: cache,
+        parameters: parameters,
+        blockSize: blockSize
+    )
+    let promptTokenCount = input.text.tokens.size
+    let stopTokenIds = gemma4MTPStopTokenIds(context: targetContext)
+
+    return AsyncStream { continuation in
+        let iterator = iterator
+        var detokenizer = NaiveStreamingDetokenizer(tokenizer: targetContext.tokenizer)
+        let start = Date.timeIntervalSinceReferenceDate
+        var generationTokenCount = 0
+        var stopReason: GenerateStopReason = .length
+
+        for token in iterator {
+            if token == targetContext.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
+                stopReason = .stop
+                break
+            }
+
+            generationTokenCount += 1
+            detokenizer.append(token: token)
+            if let chunk = detokenizer.next(), !chunk.isEmpty {
+                continuation.yield(.chunk(chunk))
+            }
         }
 
         let end = Date.timeIntervalSinceReferenceDate

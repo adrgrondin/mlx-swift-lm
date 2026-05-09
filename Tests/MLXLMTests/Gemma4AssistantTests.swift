@@ -1,7 +1,25 @@
-import MLXVLM
+import MLXLMCommon
+@testable import MLXVLM
 import XCTest
 
 final class Gemma4AssistantTests: XCTestCase {
+    func testGemma4MTPRequiresGreedySamplingWithoutPenalties() {
+        XCTAssertTrue(gemma4MTPUsesExactGreedy(parameters: GenerateParameters(temperature: 0)))
+        XCTAssertTrue(
+            gemma4MTPUsesExactGreedy(
+                parameters: GenerateParameters(temperature: 0, repetitionPenalty: 1.0)))
+        XCTAssertFalse(gemma4MTPUsesExactGreedy(parameters: GenerateParameters()))
+        XCTAssertFalse(
+            gemma4MTPUsesExactGreedy(
+                parameters: GenerateParameters(temperature: 0, repetitionPenalty: 1.1)))
+        XCTAssertFalse(
+            gemma4MTPUsesExactGreedy(
+                parameters: GenerateParameters(temperature: 0, presencePenalty: 0.1)))
+        XCTAssertFalse(
+            gemma4MTPUsesExactGreedy(
+                parameters: GenerateParameters(temperature: 0, frequencyPenalty: 0.1)))
+    }
+
     func testGemma4AssistantConfigurationDefaultsSharedKVLayers() throws {
         let json = """
             {
