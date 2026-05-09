@@ -1591,7 +1591,7 @@ public final class Gemma4Assistant: Module, LanguageModel {
         }
 
         var token = MLXArray([lastBonus]).reshaped(1, 1)
-        var previousHidden = hidden
+        var previousHidden = gemma4MTPHiddenAt(hidden, index: -1)
         var tokens: [MLXArray] = []
         tokens.reserveCapacity(max(blockSize - 1, 0))
 
@@ -1605,7 +1605,7 @@ public final class Gemma4Assistant: Module, LanguageModel {
                 sharedKVStates: sharedKV,
                 position: position
             )
-            previousHidden = output.hidden
+            previousHidden = gemma4MTPHiddenAt(output.hidden, index: -1)
             token = sampler.sample(logits: output.logits[0..., -1, 0...])
             tokens.append(token.reshaped(1, 1))
         }
@@ -2233,6 +2233,22 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     }
 }
 
+private func gemma4MTPHiddenAt(_ hidden: MLXArray, index: Int) -> MLXArray {
+    switch hidden.ndim {
+    case 3:
+        let position = index >= 0 ? index : hidden.dim(1) + index
+        return hidden[0..., position, 0...].expandedDimensions(axis: 1)
+    case 2:
+        if hidden.dim(0) == 1 {
+            return hidden.expandedDimensions(axis: 1)
+        }
+        let position = index >= 0 ? index : hidden.dim(0) + index
+        return hidden[position, 0...].reshaped(1, 1, hidden.dim(1))
+    default:
+        fatalError("Gemma4 MTP expected hidden state with rank 2 or 3, got \(hidden.ndim)")
+    }
+}
+
 public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
     private let target: Gemma4
     private let assistant: Gemma4Assistant
@@ -2308,16 +2324,13 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         }
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
 
-        guard var hidden = prefillHidden, let sharedKV = prefillSharedKV, let bonus = prefillBonus
+        guard let hidden = prefillHidden, let sharedKV = prefillSharedKV, let bonus = prefillBonus
         else {
             throw VLMError.processing("Gemma4 MTP prefill did not produce hidden/shared KV state.")
         }
-        if hidden.dim(1) > 1 {
-            hidden = hidden[0..., (-1)..., 0...]
-        }
 
         self.processor = localProcessor
-        self.hidden = hidden
+        self.hidden = gemma4MTPHiddenAt(hidden, index: -1)
         self.sharedKV = sharedKV
         self.lastBonus = bonus
         self.pendingTokens = [bonus]
@@ -2406,7 +2419,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         }
         pendingTokens.append(contentsOf: newTokens)
         lastBonus = newTokens.last!
-        hidden = hiddenFull[0..., accepted ..< accepted + 1, 0...]
+        hidden = gemma4MTPHiddenAt(hiddenFull, index: accepted)
 
         if accepted < verifyLength - 1 {
             _ = target.languageModel.rollbackSpeculativeCache(
