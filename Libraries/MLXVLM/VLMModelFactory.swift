@@ -91,6 +91,7 @@ public enum VLMTypeRegistry {
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
+        "gemma4_assistant": create(Gemma4AssistantConfiguration.self, Gemma4Assistant.init),
         "smolvlm": create(SmolVLM2Configuration.self, SmolVLM2.init),
         // TODO: see if we can make it work with fastvlm rather than llava_qwen2
         "fastvlm": create(FastVLMConfiguration.self, FastVLM.init),
@@ -368,22 +369,26 @@ public final class VLMModelFactory: ModelFactory {
             mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
         }
 
-        // Load tokenizer, processor config, and weights in parallel using async let.
-        // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
-        // parallel scheduling. This may briefly block a cooperative thread pool thread,
-        // but the config file is small and model loading is not a high-concurrency path.
+        // Load tokenizer and weights in parallel using async let.
         async let tokenizerTask = loadTokenizer(configuration: configuration, hub: hub)
-        async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization)
 
         let tokenizer = try await tokenizerTask
+
+        if baseConfig.modelType == "gemma4_assistant" {
+            return .init(
+                configuration: mutableConfiguration, model: model,
+                processor: StandInUserInputProcessor(), tokenizer: tokenizer)
+        }
+
         let processorConfigData: Data
         let baseProcessorConfig: BaseProcessorConfiguration
         do {
-            (processorConfigData, baseProcessorConfig) = try await processorConfigTask
+            (processorConfigData, baseProcessorConfig) = try await loadProcessorConfig(
+                from: modelDirectory)
         } catch let error as ProcessorConfigError {
             if let decodingError = error.underlying as? DecodingError {
                 throw ModelFactoryError.configurationDecodingError(
