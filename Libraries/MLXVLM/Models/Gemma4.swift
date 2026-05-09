@@ -1423,6 +1423,7 @@ private final class Gemma4AssistantMaskedEmbedder: Module {
     let numCentroids: Int
     let topK: Int
     let vocabularySizePerCentroid: Int
+    fileprivate var lastSelectedCanonical: MLXArray?
 
     @ModuleInfo var centroids: Linear
     @ModuleInfo(key: "token_ordering") var tokenOrdering: MLXArray
@@ -1460,9 +1461,16 @@ private final class Gemma4AssistantMaskedEmbedder: Module {
             values: maskValue,
             dtype: selectedLogits.dtype
         )
+        let scatterIndices = selectedCanonical.reshaped(batch, length, -1)
+        lastSelectedCanonical = scatterIndices
         return putAlong(
-            output, selectedCanonical.reshaped(batch, length, -1), values: selectedLogits, axis: -1)
+            output, scatterIndices, values: selectedLogits, axis: -1)
     }
+}
+
+private struct Gemma4MTPDraftBlock {
+    let tokens: MLXArray
+    let candidateTokenIdsByStep: [MLXArray]
 }
 
 private func gemma4AssistantMask(
@@ -1597,12 +1605,12 @@ public final class Gemma4Assistant: Module, LanguageModel {
         return (hidden, logits)
     }
 
-    func draftBlock(
+    fileprivate func draftBlock(
         lastBonus: Int,
         hidden: MLXArray,
         blockSize: Int,
         sampler: LogitSampler
-    ) -> MLXArray {
+    ) -> Gemma4MTPDraftBlock {
         guard let sharedKV else {
             fatalError("setSharedKV must be called before draftBlock")
         }
@@ -1613,7 +1621,9 @@ public final class Gemma4Assistant: Module, LanguageModel {
         var token = MLXArray([lastBonus]).reshaped(1, 1)
         var previousHidden = gemma4MTPHiddenAt(hidden, index: -1)
         var tokens: [MLXArray] = []
+        var candidateTokenIdsByStep: [MLXArray] = []
         tokens.reserveCapacity(max(blockSize - 1, 0))
+        candidateTokenIdsByStep.reserveCapacity(max(blockSize - 1, 0))
 
         for _ in 0 ..< max(blockSize - 1, 0) {
             let tokenEmbeds =
@@ -1625,15 +1635,24 @@ public final class Gemma4Assistant: Module, LanguageModel {
                 sharedKVStates: sharedKV,
                 position: position
             )
+            if let selectedCanonical = maskedEmbedding?.lastSelectedCanonical {
+                candidateTokenIdsByStep.append(selectedCanonical)
+            }
             previousHidden = gemma4MTPHiddenAt(output.hidden, index: -1)
             token = gemma4MTPTokenMatrix(sampler.sample(logits: output.logits[0..., -1, 0...]))
             tokens.append(token)
         }
 
         guard let first = tokens.first else {
-            return MLXArray.zeros([1, 0], dtype: .int32)
+            return Gemma4MTPDraftBlock(
+                tokens: MLXArray.zeros([1, 0], dtype: .int32),
+                candidateTokenIdsByStep: []
+            )
         }
-        return concatenated([first] + tokens.dropFirst(), axis: 1)
+        return Gemma4MTPDraftBlock(
+            tokens: concatenated([first] + tokens.dropFirst(), axis: 1),
+            candidateTokenIdsByStep: candidateTokenIdsByStep
+        )
     }
 
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
@@ -2447,8 +2466,14 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         self.pendingTokens = [bonus]
         assistant.bind(target: target)
         assistant.setSharedKV(sharedKV, position: self.cache.first?.offset ?? input.text.tokens.dim(1))
+        let assistantCandidateCount =
+            assistant.config.useOrderedEmbeddings
+            ? assistant.config.centroidIntermediateTopK
+                * assistant.config.textConfiguration.vocabularySize
+                / Swift.max(assistant.config.numCentroids, 1)
+            : assistant.config.textConfiguration.vocabularySize
         print(
-            "[Gemma4MTP] prefill promptTokens=\(input.text.tokens.size) blockSize=\(self.blockSize) maxTokens=\(maxTokens.map(String.init) ?? "nil") cacheOffset=\(self.cache.first?.offset ?? -1) firstBonus=\(bonus) sharedKV=\(gemma4MTPKVSummary(sharedKV)) prefillMs=\(gemma4MTPFormatMilliseconds(self.promptPrefillTime))"
+            "[Gemma4MTP] prefill promptTokens=\(input.text.tokens.size) blockSize=\(self.blockSize) maxTokens=\(maxTokens.map(String.init) ?? "nil") cacheOffset=\(self.cache.first?.offset ?? -1) firstBonus=\(bonus) sharedKV=\(gemma4MTPKVSummary(sharedKV)) assistantOrderedEmbeddings=\(assistant.config.useOrderedEmbeddings) assistantCandidateCount=\(assistantCandidateCount) prefillMs=\(gemma4MTPFormatMilliseconds(self.promptPrefillTime))"
         )
     }
 
@@ -2487,12 +2512,13 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
 
         assistant.setSharedKV(sharedKV, position: cache.first?.offset ?? 0)
         let draftStart = Date.timeIntervalSinceReferenceDate
-        let draftTokens = assistant.draftBlock(
+        let draft = assistant.draftBlock(
             lastBonus: lastBonus,
             hidden: hidden,
             blockSize: verifyLength,
             sampler: sampler
         )
+        let draftTokens = draft.tokens
         eval(draftTokens)
         let draftTime = Date.timeIntervalSinceReferenceDate - draftStart
 
@@ -2587,13 +2613,25 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         let rollingAcceptedTotal = rollingAccepted.reduce(0, +)
         let rollingDraftedTotal = rollingDrafted.reduce(0, +)
         let mismatch: String
+        let candidateInfo: String
         if accepted < draftCount, accepted < targetTokenValues.count {
             mismatch = " mismatchDraft=\(draftTokenValues[accepted]) mismatchTarget=\(targetTokenValues[accepted])"
+            if draft.candidateTokenIdsByStep.indices.contains(accepted) {
+                let candidateTokenIds =
+                    draft.candidateTokenIdsByStep[accepted].flattened().asArray(Int.self)
+                candidateInfo =
+                    " targetInCandidates=\(candidateTokenIds.contains(targetTokenValues[accepted])) draftInCandidates=\(candidateTokenIds.contains(draftTokenValues[accepted])) candidateCount=\(candidateTokenIds.count)"
+            } else if assistant.config.useOrderedEmbeddings {
+                candidateInfo = " targetInCandidates=missing draftInCandidates=missing candidateCount=0"
+            } else {
+                candidateInfo = " targetInCandidates=fullVocab draftInCandidates=fullVocab"
+            }
         } else {
             mismatch = " mismatch=none"
+            candidateInfo = ""
         }
         print(
-            "[Gemma4MTP] round=\(roundIndex) emitted=\(emittedBefore) cacheOffset=\(cacheOffsetBefore)->\(cache.first?.offset ?? -1) verifyLength=\(verifyLength) drafted=\(draftCount) accepted=\(accepted) rejected=\(draftCount - accepted) acceptPct=\(gemma4MTPFormatPercent(accepted, draftCount)) rolling32Pct=\(gemma4MTPFormatPercent(rollingAcceptedTotal, rollingDraftedTotal)) cumulativePct=\(gemma4MTPFormatPercent(mtpAcceptedTokens, mtpDraftedTokens)) draftMs=\(gemma4MTPFormatMilliseconds(draftTime)) verifyMs=\(gemma4MTPFormatMilliseconds(verifyTime)) walkMs=\(gemma4MTPFormatMilliseconds(walkTime)) rollbackMs=\(gemma4MTPFormatMilliseconds(rollbackTime)) sliceMs=\(gemma4MTPFormatMilliseconds(sliceTime)) rollback=\(didRollback) sharedKV=\(sharedKVBefore)->\(gemma4MTPKVSummary(sharedKV))\(mismatch)"
+            "[Gemma4MTP] round=\(roundIndex) emitted=\(emittedBefore) cacheOffset=\(cacheOffsetBefore)->\(cache.first?.offset ?? -1) verifyLength=\(verifyLength) drafted=\(draftCount) accepted=\(accepted) rejected=\(draftCount - accepted) acceptPct=\(gemma4MTPFormatPercent(accepted, draftCount)) rolling32Pct=\(gemma4MTPFormatPercent(rollingAcceptedTotal, rollingDraftedTotal)) cumulativePct=\(gemma4MTPFormatPercent(mtpAcceptedTokens, mtpDraftedTokens)) draftMs=\(gemma4MTPFormatMilliseconds(draftTime)) verifyMs=\(gemma4MTPFormatMilliseconds(verifyTime)) walkMs=\(gemma4MTPFormatMilliseconds(walkTime)) rollbackMs=\(gemma4MTPFormatMilliseconds(rollbackTime)) sliceMs=\(gemma4MTPFormatMilliseconds(sliceTime)) rollback=\(didRollback) sharedKV=\(sharedKVBefore)->\(gemma4MTPKVSummary(sharedKV))\(mismatch)\(candidateInfo)"
         )
     }
 }
