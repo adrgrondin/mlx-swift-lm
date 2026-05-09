@@ -234,6 +234,12 @@ private struct Gemma4TextLanguageModelOutput {
     }
 }
 
+private struct Gemma4MTPVerifyOutput {
+    let logitHiddenStates: MLXArray
+    let hiddenStates: [MLXArray]?
+    let sharedKVStates: [String: Gemma4SharedKVState]?
+}
+
 private func gemma4AdjustAttentionMask(
     _ mask: MLXFast.ScaledDotProductAttentionMaskMode,
     keyLength: Int
@@ -1196,25 +1202,45 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             returnHidden: returnHidden,
             returnSharedKV: returnSharedKV
         )
-        let logits: MLXArray
-        if let lmHead {
-            logits = lmHead(output.hiddenStates)
-        } else {
-            logits = model.embedTokens.asLinear(output.hiddenStates)
-        }
-        if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
-            let scale = MLXArray(finalLogitSoftcapping)
-            return Gemma4TextLanguageModelOutput(
-                logits: tanh(logits / scale) * scale,
-                hiddenStates: output.capturedHiddenStates,
-                sharedKVStates: output.sharedKVStates
-            )
-        }
+        let logits = logits(from: output.hiddenStates)
         return Gemma4TextLanguageModelOutput(
             logits: logits,
             hiddenStates: output.capturedHiddenStates,
             sharedKVStates: output.sharedKVStates
         )
+    }
+
+    func mtpVerify(
+        _ inputs: MLXArray,
+        cache: [KVCache],
+        returnHidden: Bool = true,
+        returnSharedKV: Bool = true
+    ) -> Gemma4MTPVerifyOutput {
+        let output = model(
+            inputs,
+            cache: cache.map { $0 as KVCache? },
+            returnHidden: returnHidden,
+            returnSharedKV: returnSharedKV
+        )
+        return Gemma4MTPVerifyOutput(
+            logitHiddenStates: output.hiddenStates,
+            hiddenStates: output.capturedHiddenStates,
+            sharedKVStates: output.sharedKVStates
+        )
+    }
+
+    func logits(from hiddenStates: MLXArray) -> MLXArray {
+        let logits: MLXArray =
+            if let lmHead {
+                lmHead(hiddenStates)
+            } else {
+                model.embedTokens.asLinear(hiddenStates)
+            }
+        if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
+            let scale = MLXArray(finalLogitSoftcapping)
+            return tanh(logits / scale) * scale
+        }
+        return logits
     }
 
     func rollbackSpeculativeCache(
@@ -2337,6 +2363,26 @@ private func gemma4MTPSampleSequence(logits: MLXArray, sampler: LogitSampler) ->
     return concatenated([first] + tokens.dropFirst(), axis: 1).flattened()
 }
 
+private func gemma4MTPSampleTargetToken(
+    logitHiddenStates: MLXArray,
+    index: Int,
+    target: Gemma4,
+    sampler: LogitSampler
+) -> MLXArray {
+    let hidden: MLXArray
+    switch logitHiddenStates.ndim {
+    case 3:
+        hidden = logitHiddenStates[0..., index, 0...]
+    case 2:
+        hidden = logitHiddenStates[index, 0...].expandedDimensions(axis: 0)
+    default:
+        fatalError(
+            "Gemma4 MTP expected target logit hidden states with rank 2 or 3, got \(logitHiddenStates.ndim)"
+        )
+    }
+    return gemma4MTPTokenMatrix(sampler.sample(logits: target.languageModel.logits(from: hidden)))
+}
+
 private func gemma4MTPFormatMilliseconds(_ duration: TimeInterval) -> String {
     String(format: "%.3f", duration * 1000)
 }
@@ -2376,6 +2422,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
     public private(set) var mtpRejectedTokens = 0
     public private(set) var mtpDraftTime: TimeInterval = 0
     public private(set) var mtpVerifyTime: TimeInterval = 0
+    public private(set) var mtpTargetLogitTime: TimeInterval = 0
     public private(set) var mtpWalkTime: TimeInterval = 0
     public private(set) var mtpRollbackTime: TimeInterval = 0
     public private(set) var mtpSharedKVSliceTime: TimeInterval = 0
@@ -2393,7 +2440,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
                 "inf"
             }
         return
-            "[Gemma4MTP] summary generationTokens=\(generationTokenCount) generationMs=\(gemma4MTPFormatMilliseconds(generationTime)) tokensPerSecond=\(tokensPerSecond) prefillMs=\(gemma4MTPFormatMilliseconds(promptPrefillTime)) rounds=\(mtpRounds) drafted=\(mtpDraftedTokens) accepted=\(mtpAcceptedTokens) rejected=\(mtpRejectedTokens) acceptancePct=\(gemma4MTPFormatPercent(mtpAcceptedTokens, mtpDraftedTokens)) draftTotalMs=\(gemma4MTPFormatMilliseconds(mtpDraftTime)) verifyTotalMs=\(gemma4MTPFormatMilliseconds(mtpVerifyTime)) walkTotalMs=\(gemma4MTPFormatMilliseconds(mtpWalkTime)) rollbackTotalMs=\(gemma4MTPFormatMilliseconds(mtpRollbackTime)) sliceTotalMs=\(gemma4MTPFormatMilliseconds(mtpSharedKVSliceTime))"
+            "[Gemma4MTP] summary generationTokens=\(generationTokenCount) generationMs=\(gemma4MTPFormatMilliseconds(generationTime)) tokensPerSecond=\(tokensPerSecond) prefillMs=\(gemma4MTPFormatMilliseconds(promptPrefillTime)) rounds=\(mtpRounds) drafted=\(mtpDraftedTokens) accepted=\(mtpAcceptedTokens) rejected=\(mtpRejectedTokens) acceptancePct=\(gemma4MTPFormatPercent(mtpAcceptedTokens, mtpDraftedTokens)) draftTotalMs=\(gemma4MTPFormatMilliseconds(mtpDraftTime)) verifyTotalMs=\(gemma4MTPFormatMilliseconds(mtpVerifyTime)) targetLogitTotalMs=\(gemma4MTPFormatMilliseconds(mtpTargetLogitTime)) walkTotalMs=\(gemma4MTPFormatMilliseconds(mtpWalkTime)) rollbackTotalMs=\(gemma4MTPFormatMilliseconds(mtpRollbackTime)) sliceTotalMs=\(gemma4MTPFormatMilliseconds(mtpSharedKVSliceTime))"
     }
 
     public init(
@@ -2525,41 +2572,58 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         let verifyInput = concatenated(
             [MLXArray([lastBonus]).reshaped(1, 1), draftTokens], axis: 1)
         let verifyStart = Date.timeIntervalSinceReferenceDate
-        let verifyOutput = target.languageModel(
+        let verifyOutput = target.languageModel.mtpVerify(
             verifyInput,
-            cache: cache,
-            returnHidden: true,
-            returnSharedKV: true
+            cache: cache
         )
         guard let hiddenFull = verifyOutput.hiddenStates?.last,
             let verifySharedKV = verifyOutput.sharedKVStates
         else {
             fatalError("Gemma4 MTP verify step did not produce hidden/shared KV state.")
         }
-
-        let targetTokens = gemma4MTPSampleSequence(logits: verifyOutput.logits, sampler: sampler)
-        eval(targetTokens, hiddenFull)
+        eval(hiddenFull, verifyOutput.logitHiddenStates)
         let verifyTime = Date.timeIntervalSinceReferenceDate - verifyStart
 
         let walkStart = Date.timeIntervalSinceReferenceDate
-        let targetTokenValues = targetTokens.asArray(Int.self)
         let draftTokenValues = draftTokens.flattened().asArray(Int.self)
         let draftCount = Swift.min(draftTokenValues.count, verifyLength - 1)
         let generationBudget = maxTokens.map { Swift.max($0 - emitted, 0) } ?? draftCount
+        var targetLogitTime: TimeInterval = 0
+        var targetTokenValues: [Int] = []
+        targetTokenValues.reserveCapacity(verifyLength)
+
+        func sampleTargetTokenValue(at index: Int) -> Int {
+            if index < targetTokenValues.count {
+                return targetTokenValues[index]
+            }
+            let targetLogitStart = Date.timeIntervalSinceReferenceDate
+            let token = gemma4MTPSampleTargetToken(
+                logitHiddenStates: verifyOutput.logitHiddenStates,
+                index: index,
+                target: target,
+                sampler: sampler
+            )
+            eval(token)
+            targetLogitTime += Date.timeIntervalSinceReferenceDate - targetLogitStart
+            let value = token.item(Int.self)
+            targetTokenValues.append(value)
+            return value
+        }
 
         var accepted = 0
         while accepted < draftCount,
             accepted < generationBudget,
-            targetTokenValues[accepted] == draftTokenValues[accepted]
+            sampleTargetTokenValue(at: accepted) == draftTokenValues[accepted]
         {
             accepted += 1
         }
-        let walkTime = Date.timeIntervalSinceReferenceDate - walkStart
 
         var newTokens = Array(draftTokenValues.prefix(accepted))
-        if accepted < targetTokenValues.count, newTokens.count < generationBudget {
-            newTokens.append(targetTokenValues[accepted])
+        if newTokens.count < generationBudget {
+            newTokens.append(sampleTargetTokenValue(at: accepted))
         }
+        let decisionTime = Date.timeIntervalSinceReferenceDate - walkStart
+        let walkTime = Swift.max(decisionTime - targetLogitTime, 0)
         guard !newTokens.isEmpty else {
             return
         }
@@ -2599,6 +2663,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
         mtpRejectedTokens += draftCount - accepted
         mtpDraftTime += draftTime
         mtpVerifyTime += verifyTime
+        mtpTargetLogitTime += targetLogitTime
         mtpWalkTime += walkTime
         mtpRollbackTime += rollbackTime
         mtpSharedKVSliceTime += sliceTime
@@ -2631,7 +2696,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
             candidateInfo = ""
         }
         print(
-            "[Gemma4MTP] round=\(roundIndex) emitted=\(emittedBefore) cacheOffset=\(cacheOffsetBefore)->\(cache.first?.offset ?? -1) verifyLength=\(verifyLength) drafted=\(draftCount) accepted=\(accepted) rejected=\(draftCount - accepted) acceptPct=\(gemma4MTPFormatPercent(accepted, draftCount)) rolling32Pct=\(gemma4MTPFormatPercent(rollingAcceptedTotal, rollingDraftedTotal)) cumulativePct=\(gemma4MTPFormatPercent(mtpAcceptedTokens, mtpDraftedTokens)) draftMs=\(gemma4MTPFormatMilliseconds(draftTime)) verifyMs=\(gemma4MTPFormatMilliseconds(verifyTime)) walkMs=\(gemma4MTPFormatMilliseconds(walkTime)) rollbackMs=\(gemma4MTPFormatMilliseconds(rollbackTime)) sliceMs=\(gemma4MTPFormatMilliseconds(sliceTime)) rollback=\(didRollback) sharedKV=\(sharedKVBefore)->\(gemma4MTPKVSummary(sharedKV))\(mismatch)\(candidateInfo)"
+            "[Gemma4MTP] round=\(roundIndex) emitted=\(emittedBefore) cacheOffset=\(cacheOffsetBefore)->\(cache.first?.offset ?? -1) verifyLength=\(verifyLength) drafted=\(draftCount) accepted=\(accepted) rejected=\(draftCount - accepted) acceptPct=\(gemma4MTPFormatPercent(accepted, draftCount)) rolling32Pct=\(gemma4MTPFormatPercent(rollingAcceptedTotal, rollingDraftedTotal)) cumulativePct=\(gemma4MTPFormatPercent(mtpAcceptedTokens, mtpDraftedTokens)) draftMs=\(gemma4MTPFormatMilliseconds(draftTime)) verifyMs=\(gemma4MTPFormatMilliseconds(verifyTime)) targetLogitMs=\(gemma4MTPFormatMilliseconds(targetLogitTime)) targetLogitCount=\(targetTokenValues.count) walkMs=\(gemma4MTPFormatMilliseconds(walkTime)) rollbackMs=\(gemma4MTPFormatMilliseconds(rollbackTime)) sliceMs=\(gemma4MTPFormatMilliseconds(sliceTime)) rollback=\(didRollback) sharedKV=\(sharedKVBefore)->\(gemma4MTPKVSummary(sharedKV))\(mismatch)\(candidateInfo)"
         )
     }
 }
