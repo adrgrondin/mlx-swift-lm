@@ -2262,6 +2262,42 @@ private func gemma4MTPTokenMatrix(_ token: MLXArray) -> MLXArray {
     }
 }
 
+private func gemma4MTPSampleSequence(logits: MLXArray, sampler: LogitSampler) -> MLXArray {
+    let length: Int
+    switch logits.ndim {
+    case 3:
+        guard logits.dim(0) == 1 else {
+            fatalError("Gemma4 MTP currently supports single-sequence verification only.")
+        }
+        length = logits.dim(1)
+    case 2:
+        length = logits.dim(0)
+    case 1:
+        return gemma4MTPTokenMatrix(
+            sampler.sample(logits: logits.expandedDimensions(axis: 0))
+        ).flattened()
+    default:
+        fatalError("Gemma4 MTP expected verify logits with rank 1, 2, or 3, got \(logits.ndim)")
+    }
+
+    var tokens: [MLXArray] = []
+    tokens.reserveCapacity(length)
+    for i in 0 ..< length {
+        let positionLogits =
+            if logits.ndim == 3 {
+                logits[0..., i, 0...]
+            } else {
+                logits[i, 0...].expandedDimensions(axis: 0)
+            }
+        tokens.append(gemma4MTPTokenMatrix(sampler.sample(logits: positionLogits)))
+    }
+
+    guard let first = tokens.first else {
+        return MLXArray.zeros([0], dtype: .int32)
+    }
+    return concatenated([first] + tokens.dropFirst(), axis: 1).flattened()
+}
+
 public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
     private let target: Gemma4
     private let assistant: Gemma4Assistant
@@ -2403,7 +2439,7 @@ public struct Gemma4MTPTokenIterator: Sequence, IteratorProtocol {
             fatalError("Gemma4 MTP verify step did not produce hidden/shared KV state.")
         }
 
-        let targetTokens = sampler.sample(logits: verifyOutput.logits[0..., 0..., 0...].squeezed(axis: 0))
+        let targetTokens = gemma4MTPSampleSequence(logits: verifyOutput.logits, sampler: sampler)
         eval(targetTokens, hiddenFull)
 
         let targetTokenValues = targetTokens.asArray(Int.self)
