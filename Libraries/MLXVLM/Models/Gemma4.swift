@@ -2684,6 +2684,31 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
         let side = patchesPerSide * modelPatchSize
         return CGSize(width: side, height: side)
     }
+
+    /// Aspect-ratio-preserving resize target, matching HuggingFace's
+    /// `image_processing_gemma4.py: get_aspect_ratio_preserving_size`.
+    ///
+    /// Gemma 4 spends a fixed token budget per image (`maxSoftTokens`, default 280)
+    /// regardless of input resolution, so the resize is derived from the image's own
+    /// dimensions rather than the `size` field: scale to fit
+    /// `maxPatches = maxSoftTokens * poolingKernelSize^2` patches while preserving aspect
+    /// ratio, then floor each side to a multiple of `poolingKernelSize * patchSize`
+    /// (== `modelPatchSize`). A square image yields 768x768 (256 soft tokens); a 16:10
+    /// image ~1008x624 (273). The static `size` (224) would give only 4x4 = 16.
+    public func aspectPreservingSize(originalWidth: CGFloat, originalHeight: CGFloat) -> CGSize {
+        let w = max(1.0, Double(originalWidth))
+        let h = max(1.0, Double(originalHeight))
+        let maxPatches = Double(maxSoftTokens * poolingKernelSize * poolingKernelSize)
+        let sideMult = Double(poolingKernelSize * patchSize)
+        let factor = (maxPatches * Double(patchSize * patchSize) / (w * h)).squareRoot()
+        let maxSideLength =
+            (maxPatches / Double(poolingKernelSize * poolingKernelSize)) * sideMult
+        func snap(_ ideal: Double) -> Double {
+            let capped = min(ideal, maxSideLength)
+            return max(sideMult, (capped / sideMult).rounded(.down) * sideMult)
+        }
+        return CGSize(width: snap(factor * w), height: snap(factor * h))
+    }
 }
 
 public struct Gemma4UnifiedProcessor: UserInputProcessor {
@@ -2737,13 +2762,20 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
         pixels: MLXArray, positionIds: MLXArray, tokenCounts: [Int], frames: [THW]
     ) {
-        let targetSize = config.fixedSize
         var patchRows: [MLXArray] = []
         var positionRows: [MLXArray] = []
         var tokenCounts: [Int] = []
         var frames: [THW] = []
 
         for image in images {
+            // Resize per image into the soft-token budget so the patch grid uses ~maxSoftTokens
+            // tokens (a fixed square would waste the budget or distort the aspect ratio).
+            let extent = image.extent
+            let originalWidth = extent.isInfinite || extent.width <= 0 ? 768 : extent.width
+            let originalHeight = extent.isInfinite || extent.height <= 0 ? 768 : extent.height
+            let targetSize = config.aspectPreservingSize(
+                originalWidth: originalWidth, originalHeight: originalHeight)
+
             var userProcessing = processing ?? UserInput.Processing()
             userProcessing.resize = targetSize
 
