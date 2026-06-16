@@ -46,6 +46,42 @@ struct Gemma4UnifiedTests {
         try JSONDecoder.json5().decode(Gemma4UnifiedConfiguration.self, from: Data(json.utf8))
     }
 
+    private func tinyTextConfig() throws -> Gemma4UnifiedConfiguration {
+        try decodeConfig(
+            """
+            {
+              "model_type": "gemma4_unified",
+              "vocab_size": 32,
+              "image_token_id": 31,
+              "audio_token_id": 30,
+              "video_token_id": 29,
+              "text_config": {
+                "model_type": "gemma4_unified_text",
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "intermediate_size": 16,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "num_global_key_value_heads": 1,
+                "head_dim": 8,
+                "global_head_dim": 8,
+                "vocab_size": 32,
+                "vocab_size_per_layer_input": 32,
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+                "sliding_window": 8,
+                "sliding_window_pattern": 1,
+                "attention_k_eq_v": true,
+                "use_double_wide_mlp": false,
+                "layer_types": ["full_attention"],
+                "tie_word_embeddings": true
+              },
+              "vision_config": null,
+              "audio_config": null
+            }
+            """)
+    }
+
     @Test("Gemma4 Unified config decodes unified defaults and eoa_token_index")
     func configDecoding() throws {
         let config = try decodeConfig(
@@ -68,6 +104,50 @@ struct Gemma4UnifiedTests {
         #expect(config.textConfiguration.attentionKEqV)
         #expect(config.textConfiguration.useBidirectionalAttention == "vision")
         #expect(config.visionConfiguration?.modelPatchSize == 48)
+    }
+
+    @Test("Gemma4 Unified text-only prepare chunks prefill")
+    func textOnlyPrepareChunksPrefill() throws {
+        let model = Gemma4Unified(try tinyTextConfig())
+        let cache = model.newCache(parameters: nil)
+        let input = LMInput(tokens: MLXArray([0, 2, 3, 4, 5, 1]).expandedDimensions(axis: 0))
+
+        let result = try model.prepare(
+            input, cache: cache, windowSize: 2)
+
+        guard case .logits(let output) = result else {
+            Issue.record("Expected text-only Gemma4Unified.prepare to return logits")
+            return
+        }
+
+        #expect(output.logits.shape == [1, 1, 32])
+        #expect(cache.allSatisfy { $0.offset == 6 })
+    }
+
+    @Test("Gemma4 Unified text-only prefill is chunk-size invariant")
+    func textOnlyPrefillChunkSizeInvariant() throws {
+        let model = Gemma4Unified(try tinyTextConfig())
+        let input = LMInput(tokens: MLXArray([0, 2, 3, 4, 5, 1]).expandedDimensions(axis: 0))
+
+        func prefill(windowSize: Int) throws -> (logits: MLXArray, cacheOffsets: [Int]) {
+            let cache = model.newCache(parameters: nil)
+            let result = try model.prepare(input, cache: cache, windowSize: windowSize)
+            guard case .logits(let output) = result else {
+                Issue.record("Expected text-only Gemma4Unified.prepare to return logits")
+                return (MLXArray.zeros([1, 32]), [])
+            }
+            return (output.logits[0..., -1, 0...], cache.map { $0.offset })
+        }
+
+        let full = try prefill(windowSize: 16)
+        let chunked = try prefill(windowSize: 2)
+        #expect(full.cacheOffsets == chunked.cacheOffsets)
+        #expect(chunked.cacheOffsets.allSatisfy { $0 == 6 })
+
+        let diff = abs(full.logits.asType(.float32) - chunked.logits.asType(.float32)).max()
+        eval(diff)
+
+        #expect(diff.item(Float.self) < 1e-4)
     }
 
     @Test("Gemma4 Unified processor emits model patches and position ids")

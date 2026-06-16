@@ -248,6 +248,43 @@ private func gemma4TokenTypeIds(
     return tokenTypeIds
 }
 
+private func gemma4TextOnlyPromptTokens(_ input: LMInput) -> MLXArray {
+    let tokens = input.text.tokens
+    if tokens.ndim == 2, tokens.dim(0) == 1 {
+        return tokens[0]
+    }
+    if tokens.ndim == 1 {
+        return tokens
+    }
+    return tokens.flattened()
+}
+
+private func gemma4PrepareTextOnly(
+    _ input: LMInput,
+    cache: [any KVCache],
+    windowSize: Int?,
+    languageModel: Gemma4TextLanguageModel
+) -> PrepareResult {
+    let prefillStepSize = max(windowSize ?? 512, 1)
+    let y = gemma4TextOnlyPromptTokens(input).expandedDimensions(axis: 0)
+    let convertedCache = cache.map { $0 }
+    let totalPositions = y.dim(1)
+
+    var processed = 0
+    while totalPositions - processed > 1 {
+        let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+        _ = languageModel(
+            y[0..., processed ..< (processed + chunkLength)],
+            cache: convertedCache
+        )
+        asyncEval(cache)
+        processed += chunkLength
+    }
+
+    eval(cache)
+    return .logits(languageModel(y[0..., processed...], cache: convertedCache))
+}
+
 private func gemma4BlockSequenceIdsForMask(_ tokenTypeIds: MLXArray) -> MLXArray {
     let isVision = (tokenTypeIds .== 1) | (tokenTypeIds .== 2)
     let sequenceLength = isVision.dim(1)
@@ -1349,8 +1386,8 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         cache: [KVCache]? = nil,
         inputsEmbeds: MLXArray? = nil,
         perLayerInputs: MLXArray? = nil,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         tokenTypeIds: MLXArray? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         emitDrafterState: Bool = false
     ) -> LMOutput {
         let (hidden, sharedKV) = model(
@@ -1992,65 +2029,24 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         let convertedCache = cache.map { $0 }
-        let prefillStepSize = windowSize ?? 512
         if let imagePixels = input.image?.pixels {
-            let (allEmbeds, allPerLayerInputs) = try getInputEmbeddings(
+            let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
                 inputIds: input.text.tokens, pixelValues: imagePixels)
-            // Prefill the merged image+text embeddings (and the aligned
-            // per-layer inputs) in windowSize-sized chunks; the final
-            // position yields the first-token logits. Matches
-            // LLMModel.prepare and #297. asyncEval lets the CPU build
-            // chunk N+1's graph while the GPU evaluates chunk N.
-            let totalPositions = allEmbeds.dim(1)
-            var processed = 0
-            while totalPositions - processed > 1 {
-                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-                let range = processed ..< (processed + chunkLength)
-                _ = languageModel(
-                    nil,
-                    cache: convertedCache,
-                    inputsEmbeds: allEmbeds[0..., range, 0...],
-                    perLayerInputs: allPerLayerInputs.map { $0[0..., range, 0..., 0...] }
-                )
-                asyncEval(cache)
-                processed += chunkLength
-            }
-            // Single sync after the loop to flush any remaining async work.
-            eval(cache)
             let result = languageModel(
                 nil,
                 cache: convertedCache,
+                inputsEmbeds: inputsEmbeds,
+                perLayerInputs: perLayerInputs,
                 tokenTypeIds: gemma4TokenTypeIds(
                     inputIds: input.text.tokens,
                     imageTokenId: config.imageTokenId,
                     videoTokenId: nil,
-                    audioTokenId: config.audioTokenId),
-                inputsEmbeds: allEmbeds[0..., processed..., 0...],
-                perLayerInputs: allPerLayerInputs.map { $0[0..., processed..., 0..., 0...] }
+                    audioTokenId: config.audioTokenId)
             )
             return .logits(result)
         } else {
-            // Text-only path: chunk raw tokens (per-layer inputs are derived
-            // from each chunk's tokens inside the backbone).
-            var tokens = input.text.tokens
-            if tokens.ndim == 1 {
-                tokens = tokens.expandedDimensions(axis: 0)
-            }
-            let totalPositions = tokens.dim(1)
-            var processed = 0
-            while totalPositions - processed > 1 {
-                let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-                _ = languageModel(
-                    tokens[0..., processed ..< (processed + chunkLength)],
-                    cache: convertedCache
-                )
-                asyncEval(cache)
-                processed += chunkLength
-            }
-            // Single sync after the loop to flush any remaining async work.
-            eval(cache)
-            let result = languageModel(tokens[0..., processed...], cache: convertedCache)
-            return .logits(result)
+            return gemma4PrepareTextOnly(
+                input, cache: convertedCache, windowSize: windowSize, languageModel: languageModel)
         }
     }
 
@@ -2492,6 +2488,11 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        if input.image == nil, input.video == nil, input.audio == nil {
+            return gemma4PrepareTextOnly(
+                input, cache: cache, windowSize: windowSize, languageModel: languageModel)
+        }
+
         let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
             inputIds: input.text.tokens,
             pixelValues: input.image?.pixels,
