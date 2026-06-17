@@ -181,6 +181,53 @@ struct Gemma4UnifiedTests {
         #expect(input.text.tokens.asArray(Int32.self) == [28, 31, 31, 31, 31, 29, 2])
     }
 
+    @Test("Gemma4 Unified processor resizes images into max soft-token budget")
+    func processorResizesImagesIntoSoftTokenBudget() throws {
+        let data = Data(
+            """
+            {
+              "processor_class": "Gemma4UnifiedProcessor",
+              "image_token_id": 31,
+              "boi_token_id": 28,
+              "eoi_token_id": 29,
+              "image_processor": {
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "model_patch_size": 48,
+                "max_soft_tokens": 280,
+                "do_resize": true,
+                "do_rescale": true,
+                "rescale_factor": 0.00392156862745098,
+                "size": { "height": 224, "width": 224 }
+              }
+            }
+            """.utf8)
+        let config = try JSONDecoder.json5().decode(
+            Gemma4UnifiedProcessorConfiguration.self, from: data)
+        let processor = Gemma4UnifiedProcessor(config, tokenizer: Gemma4UnifiedTestTokenizer())
+
+        let targetSize = try config.aspectRatioPreservingSize(
+            for: CGSize(width: 2174, height: 1356))
+        #expect(targetSize == CGSize(width: 1008, height: 624))
+        #expect(config.fixedSize == CGSize(width: 768, height: 768))
+        #expect(config.doResize)
+        #expect(config.doRescale)
+        #expect(abs(config.rescaleFactor - (1.0 / 255.0)) < 1e-12)
+
+        let image = CIImage(color: .black).cropped(
+            to: CGRect(x: 0, y: 0, width: 2174, height: 1356))
+        let imageData = try processor.preprocess(images: [image], processing: nil)
+
+        #expect(imageData.pixels.shape == [1, 280, 6912])
+        #expect(imageData.positionIds.shape == [1, 280, 2])
+        #expect(imageData.tokenCounts == [273])
+
+        let frame = try #require(imageData.frames.first)
+        #expect(frame.t == 1)
+        #expect(frame.h == 624)
+        #expect(frame.w == 1008)
+    }
+
     @Test("Gemma4 Unified model accepts vision embeddings")
     func modelVisionForward() throws {
         let config = try decodeConfig(

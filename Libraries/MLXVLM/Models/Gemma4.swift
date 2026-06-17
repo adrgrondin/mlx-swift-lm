@@ -2715,6 +2715,9 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
 
 public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     public let processorClass: String
+    public let doResize: Bool
+    public let doRescale: Bool
+    public let rescaleFactor: CGFloat
     public let doNormalize: Bool
     public let imageMean: [CGFloat]
     public let imageStd: [CGFloat]
@@ -2733,6 +2736,9 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     public let eoiTokenId: Int?
 
     private struct ImageProcessorConfiguration: Decodable, Sendable {
+        let doResize: Bool?
+        let doRescale: Bool?
+        let rescaleFactor: CGFloat?
         let doNormalize: Bool?
         let imageMean: [CGFloat]?
         let imageStd: [CGFloat]?
@@ -2744,6 +2750,9 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
         let size: Gemma3ProcessorConfiguration.ImageSize?
 
         enum CodingKeys: String, CodingKey {
+            case doResize = "do_resize"
+            case doRescale = "do_rescale"
+            case rescaleFactor = "rescale_factor"
             case doNormalize = "do_normalize"
             case imageMean = "image_mean"
             case imageStd = "image_std"
@@ -2759,6 +2768,9 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
         case imageProcessor = "image_processor"
+        case doResize = "do_resize"
+        case doRescale = "do_rescale"
+        case rescaleFactor = "rescale_factor"
         case doNormalize = "do_normalize"
         case imageMean = "image_mean"
         case imageStd = "image_std"
@@ -2786,6 +2798,18 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
         processorClass =
             try c.decodeIfPresent(String.self, forKey: CodingKeys.processorClass)
             ?? "Gemma4UnifiedProcessor"
+        doResize =
+            try c.decodeIfPresent(Bool.self, forKey: CodingKeys.doResize)
+            ?? imageProcessor?.doResize
+            ?? true
+        doRescale =
+            try c.decodeIfPresent(Bool.self, forKey: CodingKeys.doRescale)
+            ?? imageProcessor?.doRescale
+            ?? true
+        rescaleFactor =
+            try c.decodeIfPresent(CGFloat.self, forKey: CodingKeys.rescaleFactor)
+            ?? imageProcessor?.rescaleFactor
+            ?? (1.0 / 255.0)
         doNormalize =
             try c.decodeIfPresent(Bool.self, forKey: CodingKeys.doNormalize)
             ?? imageProcessor?.doNormalize
@@ -2842,15 +2866,44 @@ public struct Gemma4UnifiedProcessorConfiguration: Decodable, Sendable {
     }
 
     public var fixedSize: CGSize {
-        if let size {
-            let width = max(modelPatchSize, (size.width / modelPatchSize) * modelPatchSize)
-            let height = max(modelPatchSize, (size.height / modelPatchSize) * modelPatchSize)
-            return CGSize(width: width, height: height)
+        let patchesPerSide = max(1, Int(floor(sqrt(Double(maxSoftTokens)))))
+        let side = patchesPerSide * patchSize * poolingKernelSize
+        return CGSize(width: side, height: side)
+    }
+
+    public func aspectRatioPreservingSize(for imageSize: CGSize) throws -> CGSize {
+        let width = max(1, Int(ceil(imageSize.width)))
+        let height = max(1, Int(ceil(imageSize.height)))
+        let sideMultiple = max(1, patchSize * poolingKernelSize)
+        let maxTokens = max(1, maxSoftTokens)
+
+        let targetPixels = Double(maxTokens * sideMultiple * sideMultiple)
+        let resizeFactor = sqrt(targetPixels / Double(width * height))
+
+        var targetWidth =
+            Int(floor(Double(width) * resizeFactor / Double(sideMultiple))) * sideMultiple
+        var targetHeight =
+            Int(floor(Double(height) * resizeFactor / Double(sideMultiple))) * sideMultiple
+
+        if targetWidth == 0 && targetHeight == 0 {
+            throw VLMError.processing("Image is too small to resize for Gemma4 unified vision.")
+        } else if targetHeight == 0 {
+            targetHeight = sideMultiple
+            targetWidth = max(
+                sideMultiple,
+                min(
+                    maxTokens * sideMultiple,
+                    Int(floor(Double(width) / Double(height))) * sideMultiple))
+        } else if targetWidth == 0 {
+            targetWidth = sideMultiple
+            targetHeight = max(
+                sideMultiple,
+                min(
+                    maxTokens * sideMultiple,
+                    Int(floor(Double(height) / Double(width))) * sideMultiple))
         }
 
-        let patchesPerSide = max(1, Int(floor(sqrt(Double(maxSoftTokens)))))
-        let side = patchesPerSide * modelPatchSize
-        return CGSize(width: side, height: side)
+        return CGSize(width: targetWidth, height: targetHeight)
     }
 }
 
@@ -2905,27 +2958,39 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
         pixels: MLXArray, positionIds: MLXArray, tokenCounts: [Int], frames: [THW]
     ) {
-        let targetSize = config.fixedSize
         var patchRows: [MLXArray] = []
         var positionRows: [MLXArray] = []
         var tokenCounts: [Int] = []
         var frames: [THW] = []
 
         for image in images {
-            var userProcessing = processing ?? UserInput.Processing()
-            userProcessing.resize = targetSize
-
-            let processedImage = MediaProcessing.apply(image, processing: userProcessing)
+            let processedImage = MediaProcessing.apply(image, processing: processing)
             let srgbImage = MediaProcessing.inSRGBToneCurveSpace(processedImage)
-            let resizedImage = MediaProcessing.resampleBicubic(srgbImage, to: targetSize)
-            let finalImage =
-                if config.doNormalize {
-                    MediaProcessing.normalize(
-                        resizedImage, mean: config.imageMeanTuple, std: config.imageStdTuple)
+            let resizedImage =
+                if config.doResize {
+                    try MediaProcessing.resampleBicubic(
+                        srgbImage,
+                        to: config.aspectRatioPreservingSize(for: srgbImage.extent.size))
                 } else {
-                    resizedImage
+                    srgbImage
                 }
-            let pixelValues = MediaProcessing.asMLXArray(finalImage)
+
+            var pixelValues = MediaProcessing.asMLXArray(resizedImage)
+            let rescaleMultiplier = Float(config.doRescale ? config.rescaleFactor * 255 : 255)
+            if rescaleMultiplier != 1 {
+                pixelValues = pixelValues * MLXArray(rescaleMultiplier, dtype: pixelValues.dtype)
+            }
+            if config.doNormalize {
+                let mean = MLXArray(
+                    config.imageMean.map { Float($0) }, [1, config.imageMean.count, 1, 1]
+                )
+                .asType(pixelValues.dtype)
+                let std = MLXArray(
+                    config.imageStd.map { Float($0) }, [1, config.imageStd.count, 1, 1]
+                )
+                .asType(pixelValues.dtype)
+                pixelValues = (pixelValues - mean) / std
+            }
             let (patches, positions, tokenCount, frame) = patchify(pixelValues)
             patchRows.append(patches)
             positionRows.append(positions)
