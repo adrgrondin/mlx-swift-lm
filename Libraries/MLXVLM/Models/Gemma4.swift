@@ -675,7 +675,7 @@ final class Gemma4TextMLP: Module, UnaryLayer {
 
     init(config: Gemma4TextConfiguration, layerIdx: Int) {
         let firstKVSharedLayer = config.hiddenLayers - config.numKVSharedLayers
-        let isKVSharedLayer = layerIdx >= firstKVSharedLayer && firstKVSharedLayer > 0
+        let isKVSharedLayer = config.numKVSharedLayers > 0 && layerIdx >= firstKVSharedLayer
         let useDoubleWide = config.useDoubleWideMLP && isKVSharedLayer
         let hiddenDimensions = config.intermediateSize * (useDoubleWide ? 2 : 1)
 
@@ -821,7 +821,7 @@ final class Gemma4TextAttention: Module {
         self.scale = 1.0
 
         let firstKVSharedLayer = config.hiddenLayers - config.numKVSharedLayers
-        self.isKVSharedLayer = layerIdx >= firstKVSharedLayer && firstKVSharedLayer > 0
+        self.isKVSharedLayer = config.numKVSharedLayers > 0 && layerIdx >= firstKVSharedLayer
 
         self._qProj.wrappedValue = Linear(config.hiddenSize, numHeads * headDim, bias: false)
         if !kvSharedOnly {
@@ -1088,7 +1088,9 @@ final class Gemma4TextBackbone: Module {
 
     init(_ config: Gemma4TextConfiguration) {
         self.config = config
-        self.firstKVSharedLayerIdx = config.hiddenLayers - config.numKVSharedLayers
+        let hasKVSharedLayers = config.numKVSharedLayers > 0
+        let firstKVSharedLayerIdx = config.hiddenLayers - config.numKVSharedLayers
+        self.firstKVSharedLayerIdx = firstKVSharedLayerIdx
         self.embedScale = pow(Float(config.hiddenSize), 0.5)
         self.embedTokensPerLayerScale = pow(Float(max(config.hiddenSizePerLayerInput, 1)), 0.5)
         self._perLayerInputScale = rsqrt(MLXArray(2.0))
@@ -1112,8 +1114,12 @@ final class Gemma4TextBackbone: Module {
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
-        self._layers.wrappedValue = (0 ..< config.hiddenLayers).map {
-            Gemma4TextDecoderLayer(config: config, layerIdx: $0)
+        self._layers.wrappedValue = (0 ..< config.hiddenLayers).map { layerIdx in
+            Gemma4TextDecoderLayer(
+                config: config,
+                layerIdx: layerIdx,
+                kvSharedOnly: hasKVSharedLayers && layerIdx >= firstKVSharedLayerIdx
+            )
         }
         self._norm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
@@ -1443,12 +1449,13 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             // Scope: text backbone only — the vision/audio towers share the
             // `layers.N.self_attn.{k,v}_proj` naming, so without these guards the drop
             // would amputate tower layers >= firstKVSharedLayer.
-            if firstKVSharedLayer > 0,
+            if config.numKVSharedLayers > 0,
                 !key.contains("vision_tower"),
                 !key.contains("audio_tower"),
                 key.contains("self_attn.k_proj")
                     || key.contains("self_attn.v_proj")
-                    || key.contains("self_attn.k_norm"),
+                    || key.contains("self_attn.k_norm")
+                    || key.contains("self_attn.v_norm"),
                 let layerIdx = Self.decoderLayerIndex(in: key),
                 layerIdx >= firstKVSharedLayer
             {
