@@ -1,0 +1,294 @@
+// Copyright © 2026 Apple Inc.
+
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXNN
+import Testing
+
+@testable import MLXLLM
+
+/// End-to-end coverage for the Gemma 4 QAT mobile (wNa8o8) load path
+/// (`quant_method: "gemma"`). Builds a tiny `gemma4` model, writes a synthetic
+/// checkpoint laid out like `gemma-4-E2B-it-qat-mobile-mlx-mm` (packed
+/// int2/4/8 weights + per-channel scales + scalar SRQ scales, packed
+/// `embedding_quantized` tables, and a plain-fp `per_layer_model_projection`),
+/// loads it, and verifies that `Linear`/`Embedding` leaves are swapped for
+/// `GemmaQuantizedLinear`/`GemmaQuantizedEmbedding` with the right per-layer
+/// bits and that a forward pass produces finite logits
+/// (see GEMMA4_QAT_MOBILE_SWIFT_PORT_PLAN.md §5.11).
+struct Gemma4MobileIntegrationTests {
+
+    private func tinyConfigJSON() -> String {
+        """
+        {
+          "model_type": "gemma4",
+          "vocab_size": 32,
+          "quantization_config": {
+            "quant_method": "gemma",
+            "num_bits": 4,
+            "quantize_embeddings": true,
+            "modules_to_not_convert": ["per_layer_model_projection"],
+            "module_quant_configs": {
+              "^lm_head$": {"num_bits": 2},
+              "language_model.embed_tokens$": {"num_bits": 2},
+              "language_model.embed_tokens_per_layer$": {"num_bits": 4},
+              "language_model.layers.[0-9]+.mlp.": {"num_bits": 4},
+              "language_model.layers.[0-9]+.self_attn.": {"num_bits": 4},
+              "language_model.layers.[0-9]+.per_layer_input_gate$": {"num_bits": 8},
+              "language_model.layers.[0-9]+.per_layer_projection$": {"num_bits": 8}
+            }
+          },
+          "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "num_attention_heads": 1,
+            "head_dim": 16,
+            "global_head_dim": 16,
+            "global_partial_rotary_factor": 0.25,
+            "rms_norm_eps": 0.000001,
+            "vocab_size": 32,
+            "vocab_size_per_layer_input": 32,
+            "num_key_value_heads": 1,
+            "num_global_key_value_heads": 1,
+            "num_kv_shared_layers": 0,
+            "hidden_size_per_layer_input": 8,
+            "sliding_window": 8,
+            "sliding_window_pattern": 2,
+            "max_position_embeddings": 64,
+            "attention_k_eq_v": false,
+            "final_logit_softcapping": 30.0,
+            "use_double_wide_mlp": false,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "tie_word_embeddings": false
+          }
+        }
+        """
+    }
+
+    @Test("Gemma 4 mobile checkpoint loads with quantized layers and runs")
+    func loadsAndRunsMobileCheckpoint() throws {
+        MLXRandom.seed(0)
+        let configData = Data(tinyConfigJSON().utf8)
+        let decoder = JSONDecoder()
+        decoder.userInfo[.rawConfigData] = configData
+        let config = try decoder.decode(Gemma4Configuration.self, from: configData)
+        let model = Gemma4Model(config)
+        eval(model)
+
+        let numLayers = config.textConfig.numHiddenLayers
+        let arrays = makeMobileCheckpoint(
+            model: model, quantizationConfig: config.quantizationConfig!, numLayers: numLayers)
+        let directory = try writeCheckpoint(arrays)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try loadWeights(modelDirectory: directory, model: model)
+
+        let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
+
+        // lm_head → 2-bit GemmaQuantizedLinear (untied).
+        let lmHead = try #require(modules["language_model.lm_head"] as? GemmaQuantizedLinear)
+        #expect(lmHead.numBits == 2)
+
+        // embed_tokens → 2-bit per-row GemmaQuantizedEmbedding.
+        let embed = try #require(
+            modules["language_model.model.embed_tokens"] as? GemmaQuantizedEmbedding)
+        #expect(embed.numBits == 2)
+        #expect(embed.numBlocks == 1)
+
+        // embed_tokens_per_layer → 4-bit block-wise GemmaQuantizedEmbedding
+        // (one block per layer).
+        let embedPerLayer = try #require(
+            modules["language_model.model.embed_tokens_per_layer"] as? GemmaQuantizedEmbedding)
+        #expect(embedPerLayer.numBits == 4)
+        #expect(embedPerLayer.numBlocks == numLayers)
+
+        // mlp / attention → 4-bit; PLE gates/projections → 8-bit.
+        let gate = try #require(
+            modules["language_model.model.layers.0.mlp.gate_proj"] as? GemmaQuantizedLinear)
+        #expect(gate.numBits == 4)
+        let qProj = try #require(
+            modules["language_model.model.layers.0.self_attn.q_proj"] as? GemmaQuantizedLinear)
+        #expect(qProj.numBits == 4)
+        let perLayerGate = try #require(
+            modules["language_model.model.layers.0.per_layer_input_gate"]
+                as? GemmaQuantizedLinear)
+        #expect(perLayerGate.numBits == 8)
+        let perLayerProj = try #require(
+            modules["language_model.model.layers.0.per_layer_projection"]
+                as? GemmaQuantizedLinear)
+        #expect(perLayerProj.numBits == 8)
+
+        // per_layer_model_projection stays a plain fp Linear (not converted).
+        let perLayerModelProj = try #require(
+            modules["language_model.model.per_layer_model_projection"] as? Linear)
+        #expect(!(perLayerModelProj is GemmaQuantizedLinear))
+
+        // Forward pass produces finite logits of the right shape.
+        let cache = model.newCache(parameters: nil)
+        let tokens = MLXArray([1, 2, 3]).reshaped([1, 3])
+        let logits = model(tokens, cache: cache)
+        eval(logits)
+        #expect(logits.shape == [1, 3, config.textConfig.vocabSize])
+        let values = logits.asType(.float32).asArray(Float.self)
+        #expect(values.allSatisfy { $0.isFinite }, "logits must be finite, got \(values)")
+    }
+
+    // MARK: - Synthetic checkpoint
+
+    /// Build a checkpoint laid out like the mobile format: packed weights +
+    /// scales for quantizable `Linear`/`Embedding` leaves, plain-fp arrays for
+    /// everything else (norms, `layer_scalar`, `per_layer_model_projection`).
+    private func makeMobileCheckpoint(
+        model: Gemma4Model, quantizationConfig: GemmaMobileQuantizationConfig, numLayers: Int
+    ) -> [String: MLXArray] {
+        var arrays = [String: MLXArray]()
+        var quantizedPaths = Set<String>()
+
+        for (path, module) in model.leafModules().flattened() {
+            let bits = resolveModuleBits(path: path, config: quantizationConfig)
+            if let linear = module as? Linear, let bits = bits {
+                let (out, inDim) = linear.shape
+                let dtype: DType = bits == 8 ? .int8 : .uint8
+                arrays["\(path).weight"] = randomIntArray([out, packedInputDim(inDim, bits)], dtype: dtype)
+                arrays["\(path).weight_scale"] = randomScaleArray([out, 1])
+                arrays["\(path).input_activation_scale"] = MLXArray(Float(0.0))
+                arrays["\(path).output_activation_scale"] = MLXArray(Float(0.0))
+                quantizedPaths.insert(path)
+            } else if let embedding = module as? Embedding,
+                quantizationConfig.quantizeEmbeddings,
+                let bits = bits
+            {
+                let (numEmb, dim) = embedding.shape
+                let dtype: DType = bits == 8 ? .int8 : .uint8
+                let numBlocks = path.contains("embed_tokens_per_layer") ? numLayers : 1
+                arrays["\(path).embedding_quantized"] = randomIntArray(
+                    [numEmb, packedInputDim(dim, bits)], dtype: dtype)
+                arrays["\(path).embedding_scale"] = randomScaleArray([numEmb, numBlocks])
+                quantizedPaths.insert(path)
+            }
+        }
+
+        // Copy the remaining (non-quantized) parameters verbatim.
+        for (key, value) in model.parameters().flattened() {
+            let modulePath = key.split(separator: ".").dropLast().joined(separator: ".")
+            if quantizedPaths.contains(modulePath) { continue }
+            arrays[key] = value
+        }
+        return arrays
+    }
+
+    private func writeCheckpoint(_ arrays: [String: MLXArray]) throws -> URL {
+        let directory = URL(filePath: NSTemporaryDirectory())
+            .appending(component: "gemma4-mobile-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try save(arrays: arrays, url: directory.appending(component: "model.safetensors"))
+        return directory
+    }
+
+    private func packedInputDim(_ inputDims: Int, _ numBits: Int) -> Int {
+        switch numBits {
+        case 2: return (inputDims + 3) / 4
+        case 4: return (inputDims + 1) / 2
+        case 8: return inputDims
+        default: fatalError("Unsupported numBits \(numBits)")
+        }
+    }
+
+    private func randomIntArray(_ shape: [Int], dtype: DType) -> MLXArray {
+        let count = shape.reduce(1, *)
+        if dtype == .int8 {
+            let vals = (0 ..< count).map { _ in Int8.random(in: -128 ... 127) }
+            return MLXArray(vals, shape)
+        } else {
+            let vals = (0 ..< count).map { _ in UInt8.random(in: 0 ... 255) }
+            return MLXArray(vals, shape)
+        }
+    }
+
+    private func randomScaleArray(_ shape: [Int]) -> MLXArray {
+        let count = shape.reduce(1, *)
+        let vals = (0 ..< count).map { _ in Float.random(in: 0.1 ... 1.0) }
+        return MLXArray(vals, shape)
+    }
+
+    // MARK: - Real checkpoint
+
+    /// Path to the real `gemma-4-E2B-it-qat-mobile-mlx-mm` checkpoint. This is
+    /// a local path and may not exist in all environments; the test skips if
+    /// the checkpoint is absent.
+    private static let realCheckpointURL = URL(filePath: "/Users/adrgrondin/Workspace/mlx-vlm/gemma-4-E2B-it-qat-mobile-mlx-mm")
+
+    @Test("Real gemma-4-E2B-it-qat-mobile-mlx-mm loads with quantized layers and runs")
+    func loadsRealMobileCheckpoint() throws {
+        let dir = Self.realCheckpointURL
+        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path) else {
+            // Checkpoint not available — skip this test.
+            return
+        }
+
+        let configData = try Data(contentsOf: dir.appending(component: "config.json"))
+        let decoder = JSONDecoder.json5()
+        decoder.userInfo[.rawConfigData] = configData
+        let config = try decoder.decode(Gemma4Configuration.self, from: configData)
+        #expect(config.quantizationConfig?.isGemmaMobile == true)
+
+        let model = Gemma4Model(config)
+        try loadWeights(modelDirectory: dir, model: model)
+
+        let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
+
+        // lm_head → 2-bit GemmaQuantizedLinear.
+        let lmHead = try #require(modules["language_model.lm_head"] as? GemmaQuantizedLinear)
+        #expect(lmHead.numBits == 2)
+
+        // embed_tokens → 2-bit per-row GemmaQuantizedEmbedding.
+        let embed = try #require(
+            modules["language_model.model.embed_tokens"] as? GemmaQuantizedEmbedding)
+        #expect(embed.numBits == 2)
+        #expect(embed.numBlocks == 1)
+
+        // embed_tokens_per_layer → 4-bit block-wise (one block per layer = 35).
+        let embedPerLayer = try #require(
+            modules["language_model.model.embed_tokens_per_layer"] as? GemmaQuantizedEmbedding)
+        #expect(embedPerLayer.numBits == 4)
+        #expect(embedPerLayer.numBlocks == config.textConfig.numHiddenLayers)
+
+        // Layer 0 mlp → 4-bit (layers 0–14).
+        let gate0 = try #require(
+            modules["language_model.model.layers.0.mlp.gate_proj"] as? GemmaQuantizedLinear)
+        #expect(gate0.numBits == 4)
+
+        // Layer 15 mlp → 2-bit (layers 15–34).
+        let gate15 = try #require(
+            modules["language_model.model.layers.15.mlp.gate_proj"] as? GemmaQuantizedLinear)
+        #expect(gate15.numBits == 2)
+
+        // Layer 0 attention → 4-bit.
+        let qProj0 = try #require(
+            modules["language_model.model.layers.0.self_attn.q_proj"] as? GemmaQuantizedLinear)
+        #expect(qProj0.numBits == 4)
+
+        // PLE gates/projections → 8-bit.
+        let perLayerGate = try #require(
+            modules["language_model.model.layers.0.per_layer_input_gate"]
+                as? GemmaQuantizedLinear)
+        #expect(perLayerGate.numBits == 8)
+
+        // per_layer_model_projection stays a plain fp Linear (not converted).
+        let perLayerModelProj = try #require(
+            modules["language_model.model.per_layer_model_projection"] as? Linear)
+        #expect(!(perLayerModelProj is GemmaQuantizedLinear))
+
+        // Forward pass produces finite logits of the right shape.
+        let cache = model.newCache(parameters: nil)
+        let tokens = MLXArray([1, 2, 3]).reshaped([1, 3])
+        let logits = model(tokens, cache: cache)
+        eval(logits)
+        #expect(logits.shape == [1, 3, config.textConfig.vocabSize])
+        let values = logits.asType(.float32).asArray(Float.self)
+        #expect(values.allSatisfy { $0.isFinite }, "logits must be finite, got first few: \(values.prefix(10))")
+    }
+}
