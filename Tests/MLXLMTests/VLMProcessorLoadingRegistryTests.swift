@@ -117,6 +117,22 @@ final class VLMProcessorLoadingRegistryTests: XCTestCase {
         XCTAssertEqual(resolved.processorType, "ExternalProcessor")
     }
 
+    func testClasslessPreprocessorFallsBackToProcessorConfig() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(#"{"feature_extractor_type":"Gemma4AudioFeatureExtractor"}"#.utf8).write(
+            to: directory.appending(component: "preprocessor_config.json"))
+        let processorData = Data(#"{"processor_class":"Gemma4Processor"}"#.utf8)
+        try processorData.write(to: directory.appending(component: "processor_config.json"))
+        let registry = VLMProcessorLoadingRegistry(resolvers: [ThrowingFallbackResolver()])
+
+        let resolved = try await resolveProcessorConfiguration(
+            from: directory, context: context(modelType: "gemma4"), registry: registry)
+
+        XCTAssertEqual(resolved.data, processorData)
+        XCTAssertEqual(resolved.processorType, "Gemma4Processor")
+    }
+
     func testExistingConfigurationWithoutProcessorClassFailsWhenUnresolved() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
