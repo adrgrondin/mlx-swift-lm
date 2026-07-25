@@ -73,6 +73,10 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     var layerTypes: [String] = []
     var tieWordEmbeddings: Bool = true
 
+    // Gemma 4 QAT mobile (wNa8o8) quantization config (`quant_method: "gemma"`).
+    // Present only for the mobile checkpoints; nil for ordinary fp/4-bit Gemma 4.
+    var quantizationConfig: GemmaMobileQuantizationConfig?
+
     // RoPE parameters (nested dict with full_attention/sliding_attention sub-configs)
     var ropeParameters: [String: [String: StringOrNumber]]?
 
@@ -109,6 +113,7 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         case moeIntermediateSize = "moe_intermediate_size"
         case layerTypes = "layer_types"
         case tieWordEmbeddings = "tie_word_embeddings"
+        case quantizationConfig = "quantization_config"
         case ropeParameters = "rope_parameters"
     }
 
@@ -174,6 +179,8 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         }
         self.tieWordEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? true
+        self.quantizationConfig = try container.decodeIfPresent(
+            GemmaMobileQuantizationConfig.self, forKey: .quantizationConfig)
         self.ropeParameters =
             try container.decodeIfPresent(
                 [String: [String: StringOrNumber]].self, forKey: .ropeParameters)
@@ -937,6 +944,24 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
 
             sanitized[k] = value
+        }
+        return sanitized
+    }
+
+    /// Sanitize with access to safetensor metadata. Wraps the existing MoE
+    /// expert remap (`sanitize(weights:)`) and, for Gemma 4 QAT mobile
+    /// checkpoints (`quant_method: "gemma"`), remaps `embedding_quantized` →
+    /// `weight` and swaps `Linear`/`Embedding` leaves for their Gemma quantized
+    /// counterparts. This is the top-level entry for `gemma4_text` checkpoints;
+    /// for `gemma4` the wrapper `Gemma4Model.sanitize(weights:metadata:)` drives
+    /// the mobile path on the full `language_model.*` namespace instead.
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String])
+        -> [String: MLXArray]
+    {
+        var sanitized = sanitize(weights: weights)
+        if let qc = config.quantizationConfig, qc.isGemmaMobile {
+            sanitized = applyGemmaMobileQuantization(
+                model: self, weights: sanitized, config: qc)
         }
         return sanitized
     }
