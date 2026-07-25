@@ -30,7 +30,7 @@ extension CodingUserInfoKey {
     /// Raw `config.json` data stashed by the model factory so that
     /// `GemmaMobileQuantizationConfig` can recover JSON key insertion order
     /// (which `JSONDecoder` / `JSONSerialization` do not preserve).
-    static let rawConfigData = CodingUserInfoKey(rawValue: "org.mlx.lm.rawConfigData")!
+    public static let rawConfigData = CodingUserInfoKey(rawValue: "org.mlx.lm.rawConfigData")!
 }
 
 /// Re-escape a decoded key so it can be searched for literally in the raw JSON
@@ -99,7 +99,7 @@ private func orderedModuleQuantConfigKeys(from data: Data) -> [String]? {
 /// Unpack int2 from uint8 (4 values/byte, LSB-first) → int8 in [-2, 1].
 ///
 /// `packed` is `[..., packed_in]` uint8; result is `[..., in_features]` int8.
-func unpackInt2(_ packed: MLXArray, inFeatures: Int) -> MLXArray {
+public func unpackInt2(_ packed: MLXArray, inFeatures: Int) -> MLXArray {
     precondition(packed.dtype == .uint8, "int2 weights must be uint8, got \(packed.dtype).")
     let v0 = (packed & 0x03).asType(.int8) - 2
     let v1 = ((packed >> 2) & 0x03).asType(.int8) - 2
@@ -111,7 +111,7 @@ func unpackInt2(_ packed: MLXArray, inFeatures: Int) -> MLXArray {
 }
 
 /// Unpack int4 from uint8 (2 values/byte, low-nibble-first) → int8 in [-8, 7].
-func unpackInt4(_ packed: MLXArray, inFeatures: Int) -> MLXArray {
+public func unpackInt4(_ packed: MLXArray, inFeatures: Int) -> MLXArray {
     precondition(packed.dtype == .uint8, "int4 weights must be uint8, got \(packed.dtype).")
     let low = (packed & 0x0F).asType(.int8) - 8
     let high = (packed >> 4).asType(.int8) - 8
@@ -121,7 +121,7 @@ func unpackInt4(_ packed: MLXArray, inFeatures: Int) -> MLXArray {
 }
 
 /// Dispatch unpacking on the bit width; returns signed int8 values.
-func unpackInt(_ packed: MLXArray, numBits: Int, inFeatures: Int) -> MLXArray {
+public func unpackInt(_ packed: MLXArray, numBits: Int, inFeatures: Int) -> MLXArray {
     switch numBits {
     case 2: return unpackInt2(packed, inFeatures: inFeatures)
     case 4: return unpackInt4(packed, inFeatures: inFeatures)
@@ -139,7 +139,7 @@ func unpackInt(_ packed: MLXArray, numBits: Int, inFeatures: Int) -> MLXArray {
 ///
 /// `scale == 0` means the layer is uncalibrated ⇒ no-op. The guard uses
 /// `MLX.where` (not a scalar `.item()`) so it stays on-device and compile-friendly.
-func applySRQ(_ x: MLXArray, scale: MLXArray, bits: Int = 8) -> MLXArray {
+public func applySRQ(_ x: MLXArray, scale: MLXArray, bits: Int = 8) -> MLXArray {
     let maxValue = (1 << (bits - 1)) - 1  // 127 for bits == 8
     let minValue = -maxValue - 1  // -128
     let scaleF = scale.asType(x.dtype)
@@ -167,7 +167,7 @@ private func channelScale(_ weightScale: MLXArray) -> MLXArray {
 /// `weight` is `[out, packed_in]` (uint8/int8); result is `[out, in]`. When
 /// `dtype` is given the result is cast to it (e.g. the activation dtype so the
 /// matmul runs in that precision), matching the Python pure-MLX fallback.
-func dequantizeWeight(
+public func dequantizeWeight(
     _ weight: MLXArray,
     weightScale: MLXArray,
     numBits: Int,
@@ -186,7 +186,7 @@ func dequantizeWeight(
 /// Per-row scales (`n_blocks == 1`) broadcast over the embedding dim; block-wise
 /// scales reshape the ints into `[..., n_blocks, block_size]` and broadcast the
 /// per-block scale, then flatten back to `[..., embedding_dim]`.
-func dequantizeEmbeddingRows(
+public func dequantizeEmbeddingRows(
     _ rows: MLXArray,
     scales: MLXArray,
     numBits: Int,
@@ -214,15 +214,15 @@ func dequantizeEmbeddingRows(
 /// (e.g. the layer-0–14 4-bit mlp pattern must be tried before the catch-all
 /// 2-bit mlp pattern). Swift `Dictionary` does not preserve order, so this is
 /// decoded into an ordered `[(pattern, numBits)]` list.
-struct GemmaMobileQuantizationConfig: Codable, Sendable {
+public struct GemmaMobileQuantizationConfig: Codable, Sendable {
     /// Ordered list of `(regex pattern, num_bits)` from `module_quant_configs`.
-    var moduleQuantConfigs: [(String, Int)] = []
-    var modulesToNotConvert: [String] = []
-    var numBits: Int = 4
-    var quantMethod: String = ""
-    var quantizeEmbeddings: Bool = false
+    public var moduleQuantConfigs: [(String, Int)] = []
+    public var modulesToNotConvert: [String] = []
+    public var numBits: Int = 4
+    public var quantMethod: String = ""
+    public var quantizeEmbeddings: Bool = false
 
-    var isGemmaMobile: Bool { quantMethod == "gemma" }
+    public var isGemmaMobile: Bool { quantMethod == "gemma" }
 
     /// A single `module_quant_configs` entry: `{"num_bits": N}` (or a bare int).
     private struct ModuleQuantConfig: Codable {
@@ -254,9 +254,9 @@ struct GemmaMobileQuantizationConfig: Codable, Sendable {
         case quantizeEmbeddings = "quantize_embeddings"
     }
 
-    init() {}
+    public init() {}
 
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.quantMethod = try c.decodeIfPresent(String.self, forKey: .quantMethod) ?? ""
         self.numBits = try c.decodeIfPresent(Int.self, forKey: .numBits) ?? 4
@@ -295,7 +295,7 @@ struct GemmaMobileQuantizationConfig: Codable, Sendable {
         self.moduleQuantConfigs = ordered
     }
 
-    func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(quantMethod, forKey: .quantMethod)
         try c.encode(numBits, forKey: .numBits)
@@ -328,7 +328,7 @@ private func pathContainsSegment(_ path: String, _ segment: String) -> Bool {
 /// (`language_model.model.X` / `language_model.lm_head`) and the text-only
 /// `gemma4_text` namespace (`model.X` / `lm_head`) onto the HuggingFace
 /// `module_quant_configs` regex namespace (`language_model.X` / `lm_head`).
-func resolveModuleBits(path: String, config: GemmaMobileQuantizationConfig) -> Int? {
+public func resolveModuleBits(path: String, config: GemmaMobileQuantizationConfig) -> Int? {
     var normalized = path
     if normalized.hasPrefix("language_model.model.") {
         normalized = "language_model." + normalized.dropFirst("language_model.model.".count)
@@ -365,15 +365,15 @@ func resolveModuleBits(path: String, config: GemmaMobileQuantizationConfig) -> I
 /// properties. The packed `weight` (uint8/int8) is inherited from `Linear` and
 /// discovered by reflection under the key `"weight"`; the scales use
 /// `@ParameterInfo` with explicit snake_case keys.
-final class GemmaQuantizedLinear: Linear {
-    let numBits: Int
-    let inputDims: Int
+public final class GemmaQuantizedLinear: Linear {
+    public let numBits: Int
+    public let inputDims: Int
 
-    @ParameterInfo(key: "weight_scale") var weightScale: MLXArray
-    @ParameterInfo(key: "input_activation_scale") var inputActivationScale: MLXArray
-    @ParameterInfo(key: "output_activation_scale") var outputActivationScale: MLXArray
+    @ParameterInfo(key: "weight_scale") public var weightScale: MLXArray
+    @ParameterInfo(key: "input_activation_scale") public var inputActivationScale: MLXArray
+    @ParameterInfo(key: "output_activation_scale") public var outputActivationScale: MLXArray
 
-    init(inputDims: Int, outputDims: Int, numBits: Int, bias: Bool = false) {
+    public init(inputDims: Int, outputDims: Int, numBits: Int, bias: Bool = false) {
         let packedIn: Int
         let wDtype: DType
         switch numBits {
@@ -393,7 +393,7 @@ final class GemmaQuantizedLinear: Linear {
         self.freeze()
     }
 
-    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let xi = applySRQ(x, scale: inputActivationScale)
         let w = dequantizeWeight(
             weight, weightScale: weightScale, numBits: numBits, inputDims: inputDims,
@@ -406,7 +406,7 @@ final class GemmaQuantizedLinear: Linear {
 
     /// Tolerate missing SRQ scales (uncalibrated layers) under `verify: .all`:
     /// the zero placeholder already makes `applySRQ` a no-op.
-    override func updateMissing(
+    public override func updateMissing(
         parameter: String, verify: Module.VerifyUpdate, path: [String], modulePath: [String]
     ) throws {
         if parameter == "input_activation_scale" || parameter == "output_activation_scale" {
@@ -421,14 +421,14 @@ final class GemmaQuantizedLinear: Linear {
 /// The architectural `embed_scale` is applied by the surrounding model (as in
 /// the Gemma 4 text model), so this layer returns the *unscaled* dequantized
 /// rows. Subclasses `Embedding` so it drops into `@ModuleInfo var …: Embedding`.
-final class GemmaQuantizedEmbedding: Embedding {
-    let numBits: Int
-    let embeddingDim: Int
-    let numBlocks: Int
+public final class GemmaQuantizedEmbedding: Embedding {
+    public let numBits: Int
+    public let embeddingDim: Int
+    public let numBlocks: Int
 
-    @ParameterInfo(key: "embedding_scale") var embeddingScale: MLXArray
+    @ParameterInfo(key: "embedding_scale") public var embeddingScale: MLXArray
 
-    init(numEmbeddings: Int, embeddingDim: Int, numBits: Int, numBlocks: Int = 1) {
+    public init(numEmbeddings: Int, embeddingDim: Int, numBits: Int, numBlocks: Int = 1) {
         let packedDim: Int
         let wDtype: DType
         switch numBits {
@@ -445,7 +445,7 @@ final class GemmaQuantizedEmbedding: Embedding {
         self.freeze()
     }
 
-    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let rows = weight[x]
         let scales = embeddingScale[x]
         return dequantizeEmbeddingRows(
@@ -453,7 +453,7 @@ final class GemmaQuantizedEmbedding: Embedding {
             numBlocks: numBlocks)
     }
 
-    override func asLinear(_ x: MLXArray) -> MLXArray {
+    public override func asLinear(_ x: MLXArray) -> MLXArray {
         let w = dequantizeEmbeddingRows(
             weight, scales: embeddingScale, numBits: numBits, embeddingDim: embeddingDim,
             numBlocks: numBlocks)
@@ -462,7 +462,7 @@ final class GemmaQuantizedEmbedding: Embedding {
 
     /// Tolerate a missing embedding_scale under `verify: .all` (the ones
     /// placeholder would otherwise leave the table unquantized-looking).
-    override func updateMissing(
+    public override func updateMissing(
         parameter: String, verify: Module.VerifyUpdate, path: [String], modulePath: [String]
     ) throws {
         if parameter == "embedding_scale" {
@@ -484,7 +484,7 @@ final class GemmaQuantizedEmbedding: Embedding {
 /// their original fp layer. `model` is the module whose `leafModules()` paths
 /// match the (post-sanitize) weight keys — the top-level model for the loaded
 /// checkpoint.
-func replaceWithGemmaQuantLayers(
+public func replaceWithGemmaQuantLayers(
     model: Module,
     quantizationConfig: GemmaMobileQuantizationConfig,
     weights: [String: MLXArray]
@@ -538,7 +538,7 @@ func replaceWithGemmaQuantLayers(
 /// weight keys — the top-level model for the loaded checkpoint (`Gemma4Model`
 /// for `gemma4`, `Gemma4TextModel` for `gemma4_text`). Returns the remapped
 /// weights for `loadWeights` to apply via `update(parameters:)`.
-func applyGemmaMobileQuantization(
+public func applyGemmaMobileQuantization(
     model: Module,
     weights: [String: MLXArray],
     config: GemmaMobileQuantizationConfig
