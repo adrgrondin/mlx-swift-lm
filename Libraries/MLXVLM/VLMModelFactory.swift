@@ -43,7 +43,7 @@ public enum VLMError: LocalizedError, Equatable {
 }
 
 public struct BaseProcessorConfiguration: Codable, Sendable {
-    public let processorClass: String
+    public let processorClass: String?
 
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
@@ -428,6 +428,15 @@ public final class VLMModelFactory: GenericModelFactory {
         ]
         let processorType =
             processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
+        guard let processorType else {
+            throw ModelFactoryError.configurationFileError(
+                "processor_config.json", configuration.name,
+                NSError(
+                    domain: "VLMModelFactory", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "Missing 'processor_class' in processor configuration"])
+            )
+        }
 
         let processor = try await processorRegistry.createModel(
             configuration: processorConfigData,
@@ -468,16 +477,33 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
 ) {
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
-    let url =
-        FileManager.default.fileExists(atPath: preprocessorConfigURL.path)
-        ? preprocessorConfigURL
-        : processorConfigURL
+
+    // Prefer preprocessor_config.json, but fall back to processor_config.json
+    // when preprocessor_config.json lacks `processor_class` — some multimodal
+    // repos ship an audio feature-extractor config as preprocessor_config.json
+    // and the actual image/processor config (with `processor_class`) as
+    // processor_config.json.
+    if FileManager.default.fileExists(atPath: preprocessorConfigURL.path) {
+        do {
+            let data = try Data(contentsOf: preprocessorConfigURL)
+            let config = try JSONDecoder.json5().decode(
+                BaseProcessorConfiguration.self, from: data)
+            if config.processorClass != nil {
+                return (data, config)
+            }
+        } catch {
+            // preprocessor_config.json exists but can't be decoded — try the fallback.
+        }
+    }
+
     do {
-        let data = try Data(contentsOf: url)
-        let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
+        let data = try Data(contentsOf: processorConfigURL)
+        let config = try JSONDecoder.json5().decode(
+            BaseProcessorConfiguration.self, from: data)
         return (data, config)
     } catch {
-        throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
+        throw ProcessorConfigError(
+            filename: processorConfigURL.lastPathComponent, underlying: error)
     }
 }
 
