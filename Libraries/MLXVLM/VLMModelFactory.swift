@@ -43,7 +43,7 @@ public enum VLMError: LocalizedError, Equatable {
 }
 
 public struct BaseProcessorConfiguration: Codable, Sendable {
-    public let processorClass: String
+    public let processorClass: String?
 
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
@@ -538,7 +538,8 @@ struct LoadedVLMProcessorConfiguration {
     let filename: String
 }
 
-/// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
+/// Loads processor configuration, preferring preprocessor_config.json when it declares a processor
+/// or no processor_config.json exists. Malformed files are reported rather than silently ignored.
 /// Marked async to enable parallel scheduling via async let, though the underlying I/O is synchronous.
 /// Throws ProcessorConfigError wrapping any underlying error with the filename.
 func loadProcessorConfig(
@@ -549,7 +550,16 @@ func loadProcessorConfig(
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
 
     if FileManager.default.fileExists(atPath: preprocessorConfigURL.path) {
-        return try readProcessorConfig(from: preprocessorConfigURL)
+        let configuration = try readProcessorConfig(from: preprocessorConfigURL)
+        // Gemma mobile checkpoints may put audio feature-extractor metadata here
+        // and declare the actual image processor in processor_config.json.
+        // Keep class-less configs when no alternate file exists so registered
+        // resolvers can still supply the processor type. Malformed files throw.
+        if configuration.processorType != nil
+            || !FileManager.default.fileExists(atPath: processorConfigURL.path)
+        {
+            return configuration
+        }
     }
     if FileManager.default.fileExists(atPath: processorConfigURL.path) {
         return try readProcessorConfig(from: processorConfigURL)

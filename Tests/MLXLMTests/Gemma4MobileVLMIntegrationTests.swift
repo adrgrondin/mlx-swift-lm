@@ -83,4 +83,25 @@ struct Gemma4MobileVLMIntegrationTests {
         let values = logits.asType(.float32).asArray(Float.self)
         #expect(values.allSatisfy { $0.isFinite }, "logits must be finite, got first few: \(values.prefix(10))")
     }
+
+    @Test("preprocessor_config.json without processor_class falls back to processor_config.json")
+    func processorConfigFallback() throws {
+        let dir = Self.realCheckpointURL
+        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path) else {
+            return  // Checkpoint not available — skip.
+        }
+
+        // The checkpoint ships an audio feature-extractor config as
+        // preprocessor_config.json (no `processor_class`) and the actual
+        // processor config (with `processor_class: Gemma4Processor`) as
+        // processor_config.json. `BaseProcessorConfiguration` must tolerate the
+        // missing field so the factory can fall back.
+        let pre = try Data(contentsOf: dir.appending(component: "preprocessor_config.json"))
+        let preCfg = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: pre)
+        #expect(preCfg.processorClass == nil)
+
+        let proc = try Data(contentsOf: dir.appending(component: "processor_config.json"))
+        let procCfg = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: proc)
+        #expect(procCfg.processorClass == "Gemma4Processor")
+    }
 }
