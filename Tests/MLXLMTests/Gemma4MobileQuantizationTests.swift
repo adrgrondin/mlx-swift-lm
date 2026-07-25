@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 import Testing
 
@@ -19,7 +20,7 @@ struct Gemma4MobileQuantizationTests {
     func unpackInt2() throws {
         // 0b11_10_01_00 → bits [1:0]=00, [3:2]=01, [5:4]=10, [7:6]=11 → [-2, -1, 0, 1]
         let packed = MLXArray([UInt8(0b1110_0100)], [1])
-        let out = MLXLLM.unpackInt2(packed, inFeatures: 4)
+        let out = MLXLMCommon.unpackInt2(packed, inFeatures: 4)
         eval(out)
         #expect(out.shape == [4])
         #expect(out.asArray(Int8.self) == [-2, -1, 0, 1])
@@ -29,7 +30,7 @@ struct Gemma4MobileQuantizationTests {
     func unpackInt2Weight() throws {
         // Two bytes → 8 values; request only 6 (trims the trailing 2).
         let packed = MLXArray([UInt8(0b1110_0100), UInt8(0b0000_0000)], [1, 2])
-        let out = MLXLLM.unpackInt2(packed, inFeatures: 6)
+        let out = MLXLMCommon.unpackInt2(packed, inFeatures: 6)
         eval(out)
         #expect(out.shape == [1, 6])
         #expect(out.asArray(Int8.self) == [-2, -1, 0, 1, -2, -2])
@@ -39,7 +40,7 @@ struct Gemma4MobileQuantizationTests {
     func unpackInt4() throws {
         // 0b1000_0111 → low nibble 0x7=7→-1, high nibble 0x8=8→0 → [-1, 0]
         let packed = MLXArray([UInt8(0b1000_0111)], [1])
-        let out = MLXLLM.unpackInt4(packed, inFeatures: 2)
+        let out = MLXLMCommon.unpackInt4(packed, inFeatures: 2)
         eval(out)
         #expect(out.shape == [2])
         #expect(out.asArray(Int8.self) == [-1, 0])

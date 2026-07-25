@@ -562,6 +562,9 @@ public struct Gemma4Configuration: Codable, Sendable {
     public let visionConfiguration: Gemma4VisionConfiguration
     public let modelType: String
     public let quantization: BaseConfiguration.Quantization?
+    /// Gemma 4 QAT mobile (wNa8o8) quantization config (`quant_method: "gemma"`).
+    /// Present only for the mobile checkpoints; nil for ordinary fp/4-bit Gemma 4.
+    public let quantizationConfig: GemmaMobileQuantizationConfig?
     public let imageTokenId: Int
     public let audioTokenId: Int?
     public let videoTokenId: Int?
@@ -584,6 +587,7 @@ public struct Gemma4Configuration: Codable, Sendable {
         case visionConfiguration = "vision_config"
         case modelType = "model_type"
         case quantization
+        case quantizationConfig = "quantization_config"
         case imageTokenId = "image_token_id"
         case audioTokenId = "audio_token_id"
         case videoTokenId = "video_token_id"
@@ -606,6 +610,8 @@ public struct Gemma4Configuration: Codable, Sendable {
         modelType = try c.decodeIfPresent(String.self, forKey: CodingKeys.modelType) ?? "gemma4"
         quantization = try c.decodeIfPresent(
             BaseConfiguration.Quantization.self, forKey: CodingKeys.quantization)
+        quantizationConfig = try c.decodeIfPresent(
+            GemmaMobileQuantizationConfig.self, forKey: CodingKeys.quantizationConfig)
         imageTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.imageTokenId) ?? 258_880
         audioTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.audioTokenId)
         videoTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.videoTokenId)
@@ -2160,6 +2166,15 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                     && !key.contains("output_min")
                     && !key.contains("output_max")
             }
+        }
+
+        // Gemma mobile (wNa8o8) quantization: replace Linear/Embedding leaves
+        // with their Gemma quantized counterparts. This covers the text model,
+        // vision tower (including Linears nested inside Gemma4ClippableLinear),
+        // and multimodal embedder — any leaf with a checkpoint scale key is
+        // swapped; modules in modules_to_not_convert stay fp.
+        if let qc = config.quantizationConfig, qc.isGemmaMobile {
+            sanitized = applyGemmaMobileQuantization(model: self, weights: sanitized, config: qc)
         }
 
         return sanitized
