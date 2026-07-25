@@ -9,7 +9,13 @@ private func create<C: Codable, M>(
     _ configurationType: C.Type, _ modelInit: @escaping (C) -> M
 ) -> (Data) throws -> M {
     { data in
-        let configuration = try JSONDecoder.json5().decode(C.self, from: data)
+        let decoder = JSONDecoder.json5()
+        // Stash the raw config data so Codable types that need JSON key
+        // insertion order (e.g. GemmaMobileQuantizationConfig's first-match-
+        // wins module_quant_configs) can recover it; ignored by types that
+        // don't opt in.
+        decoder.userInfo[.rawConfigData] = data
+        let configuration = try decoder.decode(C.self, from: data)
         if let validating = configuration as? ModelConfigurationValidating {
             try validating.validateModelConfiguration()
         }
