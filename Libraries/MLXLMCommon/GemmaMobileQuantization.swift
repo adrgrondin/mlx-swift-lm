@@ -24,15 +24,6 @@ import Foundation
 import MLX
 import MLXNN
 
-// MARK: - Temporary profiling (stderr — unbuffered, always visible)
-
-/// Write a diagnostic line to stderr (unbuffered, always visible unlike `print`).
-/// Remove after performance optimisation is verified.
-private func gemmaQuantLog(_ message: String) {
-    let line = message + "\n"
-    FileHandle.standardError.write(Data(line.utf8))
-}
-
 // MARK: - JSON insertion-order recovery
 
 extension CodingUserInfoKey {
@@ -160,8 +151,9 @@ public func applySRQ(_ x: MLXArray, scale: MLXArray, bits: Int = 8) -> MLXArray 
 
 /// Compiled SRQ for calibrated layers (scale != 0). Fuses the divide, round,
 /// clip, and multiply into a single Metal kernel via `MLX.compile`, cutting
-/// per-layer SRQ kernel launches from ~5 to 1. `shapeless: true` lets the same
-/// compiled kernel handle both prefill (batch > 1) and decode (batch = 1).
+/// per-layer SRQ kernel launches from ~5 to 1. Used by the fallback path
+/// (quantizedMM + SRQ) for large prefill (batch > 16) or unaligned dims.
+/// `shapeless: true` lets the same compiled kernel handle both prefill and decode.
 private enum CompiledSRQ {
     nonisolated(unsafe) static let apply: (MLXArray, MLXArray) -> MLXArray = MLX.compile(shapeless: true) {
         (x, s) in
@@ -709,12 +701,6 @@ public final class GemmaQuantizedLinear: Linear {
     private var _needsInputSRQ = true
     private var _needsOutputSRQ = true
 
-    // Temporary profiling counters (remove after optimisation is verified).
-    // nonisolated(unsafe): single-threaded inference context, no data races.
-    private nonisolated(unsafe) static var conversionCount = 0
-    private nonisolated(unsafe) static var totalConversionTime: TimeInterval = 0
-    private nonisolated(unsafe) static var callLogCount = 0
-
     public init(inputDims: Int, outputDims: Int, numBits: Int, bias: Bool = false) {
         let packedIn: Int
         let wDtype: DType
@@ -749,7 +735,6 @@ public final class GemmaQuantizedLinear: Linear {
         // Convert to uint32 format for the fused quantizedMM kernel. Falls back
         // to dequant-on-forward if inputDims is not aligned to group_size=128.
         if inputDims % 128 == 0 {
-            let t0 = Date()
             let (packed, scales, biases) = mobileToMLX(
                 weight: weight, weightScale: weightScale,
                 numBits: numBits, inputDims: inputDims)
@@ -757,21 +742,6 @@ public final class GemmaQuantizedLinear: Linear {
             _mlxWeight = packed
             _mlxScales = scales
             _mlxBiases = biases
-
-            let dt = Date().timeIntervalSince(t0)
-            GemmaQuantizedLinear.conversionCount += 1
-            GemmaQuantizedLinear.totalConversionTime += dt
-            let n = GemmaQuantizedLinear.conversionCount
-            if n <= 10 || n % 100 == 0 {
-                gemmaQuantLog(
-                    "[GemmaQuant] convert #\(n): bits=\(numBits) in=\(inputDims) "
-                    + "out=\(weight.shape[0]) \(String(format: "%.1f", dt * 1000))ms "
-                    + "inSRQ=\(_needsInputSRQ) outSRQ=\(_needsOutputSRQ)"
-                    + (n % 100 == 0 ? " total=\(String(format: "%.2f", GemmaQuantizedLinear.totalConversionTime))s" : ""))
-            }
-        } else {
-            gemmaQuantLog(
-                "[GemmaQuant] FALLBACK (inDims % 128 != 0): bits=\(numBits) in=\(inputDims)")
         }
     }
 
@@ -811,19 +781,14 @@ public final class GemmaQuantizedLinear: Linear {
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let batchSize = x.shape.dropLast().reduce(1, *)
 
-        let shouldLog = GemmaQuantizedLinear.callLogCount < 20
-        if shouldLog { GemmaQuantizedLinear.callLogCount += 1 }
-        let logIdx = GemmaQuantizedLinear.callLogCount
-        let t0 = shouldLog ? Date() : nil
-
         // Fast path: fused qmv kernel for decode/small-batch with aligned dims.
         // Reads packed uint8/int8 weights + per-channel scale directly, fusing
         // SRQ into the kernel — no dequant, no separate SRQ kernel launches.
         let matmulOut: MLXArray
-        let path: String
+        let usedQMV: Bool
         if canUseQMV(batchSize: batchSize) {
             matmulOut = qmvCall(x)
-            path = "qmv"
+            usedQMV = true
         } else {
             // Fallback: quantizedMM + compiled SRQ for prefill (batch > 16) or
             // unaligned dims.
@@ -845,34 +810,23 @@ public final class GemmaQuantizedLinear: Linear {
                 matmulOut = quantizedMM(
                     xi, mw, scales: _mlxScales!, biases: _mlxBiases!,
                     transpose: true, groupSize: 128, bits: numBits, mode: .affine)
-                path = "qmm"
             } else {
                 let w = dequantizeWeight(
                     weight, weightScale: weightScale, numBits: numBits,
                     inputDims: inputDims, dtype: xi.dtype)
                 matmulOut = matmul(xi, w.T)
-                path = "dequant"
             }
+            usedQMV = false
         }
 
         // Output SRQ (skip if uncalibrated). For the qmv path, output SRQ is
         // already fused into the kernel, so skip the separate CompiledSRQ call.
         var out = matmulOut
-        if path != "qmv" && _needsOutputSRQ {
+        if !usedQMV && _needsOutputSRQ {
             out = CompiledSRQ.apply(out, outputActivationScale)
         }
 
         if let bias { out = out + bias }
-
-        if shouldLog, let t0 {
-            // Force evaluation to measure actual GPU compute time for this call.
-            eval(out)
-            let dt = Date().timeIntervalSince(t0)
-            gemmaQuantLog(
-                "[GemmaQuant] call #\(logIdx): \(path) bits=\(numBits) "
-                + "in=\(inputDims) out=\(weight.shape[0]) "
-                + "x=\(x.shape) \(String(format: "%.2f", dt * 1000))ms")
-        }
 
         return out
     }
@@ -934,7 +888,6 @@ public final class GemmaQuantizedEmbedding: Embedding {
         // Per-row scales (numBlocks == 1) and block-wise scales (numBlocks > 1)
         // are both handled by mobileToMLX. Only non-aligned dims fall back.
         if embeddingDim % 128 == 0 {
-            let t0 = Date()
             let (packed, scales, biases) = mobileToMLX(
                 weight: weight, weightScale: embeddingScale,
                 numBits: numBits, inputDims: embeddingDim,
@@ -943,14 +896,6 @@ public final class GemmaQuantizedEmbedding: Embedding {
             _mlxWeight = packed
             _mlxScales = scales
             _mlxBiases = biases
-            gemmaQuantLog(
-                "[GemmaQuant] embed convert: bits=\(numBits) dim=\(embeddingDim) "
-                + "numEmb=\(weight.shape[0]) blocks=\(numBlocks) "
-                + "\(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000))ms")
-        } else {
-            gemmaQuantLog(
-                "[GemmaQuant] embed FALLBACK: bits=\(numBits) dim=\(embeddingDim) "
-                + "numBlocks=\(numBlocks) dim%128=\(embeddingDim % 128)")
         }
     }
 
