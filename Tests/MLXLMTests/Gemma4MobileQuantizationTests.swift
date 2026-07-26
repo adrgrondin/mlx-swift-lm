@@ -102,6 +102,133 @@ struct Gemma4MobileQuantizationTests {
             out.asArray(Float.self), [-1.0, 0.0, -0.5, -0.5], tolerance: 1e-6)
     }
 
+    // MARK: - mobileToMLX conversion (fused quantizedMM path)
+
+    @Test("mobileToMLX int4 conversion is bit-exact vs dequantizeWeight")
+    func mobileToMLXInt4() throws {
+        // int4: 2 rows, 128 input dims → packed [2, 64] uint8.
+        // 0x87 → low nibble 7→-1, high nibble 8→0.
+        let packedBytes = [UInt8](repeating: 0x87, count: 128)
+        let weight = MLXArray(packedBytes, [2, 64])
+        let scale = MLXArray([Float(0.5), Float(0.25)], [2, 1])
+
+        let (packed, scales, biases) = mobileToMLX(
+            weight: weight, weightScale: scale, numBits: 4, inputDims: 128)
+        eval([packed, scales, biases])
+        #expect(packed.dtype == .uint32)
+        #expect(scales.shape == [2, 1])
+        #expect(biases.shape == [2, 1])
+
+        let mlxOut = dequantized(
+            packed, scales: scales, biases: biases,
+            groupSize: 128, bits: 4, mode: .affine)
+        let refOut = dequantizeWeight(
+            weight, weightScale: scale, numBits: 4, inputDims: 128)
+        eval([mlxOut, refOut])
+        #expect(mlxOut.shape == [2, 128])
+        #expect(refOut.shape == [2, 128])
+        Self.assertApproximatelyEqual(
+            mlxOut.asArray(Float.self), refOut.asArray(Float.self), tolerance: 1e-6)
+    }
+
+    @Test("mobileToMLX int2 conversion is bit-exact vs dequantizeWeight")
+    func mobileToMLXInt2() throws {
+        // int2: 2 rows, 128 input dims → packed [2, 32] uint8.
+        let packedBytes = [UInt8](repeating: 0b11_10_01_00, count: 64)
+        let weight = MLXArray(packedBytes, [2, 32])
+        let scale = MLXArray([Float(0.5), Float(1.0)], [2, 1])
+
+        let (packed, scales, biases) = mobileToMLX(
+            weight: weight, weightScale: scale, numBits: 2, inputDims: 128)
+        eval([packed, scales, biases])
+
+        let mlxOut = dequantized(
+            packed, scales: scales, biases: biases,
+            groupSize: 128, bits: 2, mode: .affine)
+        let refOut = dequantizeWeight(
+            weight, weightScale: scale, numBits: 2, inputDims: 128)
+        eval([mlxOut, refOut])
+        #expect(mlxOut.shape == [2, 128])
+        Self.assertApproximatelyEqual(
+            mlxOut.asArray(Float.self), refOut.asArray(Float.self), tolerance: 1e-6)
+    }
+
+    @Test("mobileToMLX int8 conversion is bit-exact vs dequantizeWeight")
+    func mobileToMLXInt8() throws {
+        // int8: 2 rows, 128 input dims → [2, 128] int8.
+        var vals: [Int8] = []
+        for i in 0..<256 {
+            vals.append(Int8(truncatingIfNeeded: i - 128))
+        }
+        let weight = MLXArray(vals, [2, 128])
+        let scale = MLXArray([Float(0.5), Float(0.25)], [2, 1])
+
+        let (packed, scales, biases) = mobileToMLX(
+            weight: weight, weightScale: scale, numBits: 8, inputDims: 128)
+        eval([packed, scales, biases])
+
+        let mlxOut = dequantized(
+            packed, scales: scales, biases: biases,
+            groupSize: 128, bits: 8, mode: .affine)
+        let refOut = dequantizeWeight(
+            weight, weightScale: scale, numBits: 8, inputDims: 128)
+        eval([mlxOut, refOut])
+        #expect(mlxOut.shape == [2, 128])
+        Self.assertApproximatelyEqual(
+            mlxOut.asArray(Float.self), refOut.asArray(Float.self), tolerance: 1e-6)
+    }
+
+    @Test("mobileToMLX with multiple groups broadcasts per-channel scale")
+    func mobileToMLXMultipleGroups() throws {
+        // int4: 1 row, 256 input dims (2 groups of 128) → packed [1, 128] uint8.
+        let packedBytes = [UInt8](repeating: 0x87, count: 128)
+        let weight = MLXArray(packedBytes, [1, 128])
+        let scale = MLXArray([Float(0.5)], [1, 1])
+
+        let (packed, scales, biases) = mobileToMLX(
+            weight: weight, weightScale: scale, numBits: 4, inputDims: 256)
+        eval([packed, scales, biases])
+        #expect(scales.shape == [1, 2])
+        #expect(biases.shape == [1, 2])
+
+        let mlxOut = dequantized(
+            packed, scales: scales, biases: biases,
+            groupSize: 128, bits: 4, mode: .affine)
+        let refOut = dequantizeWeight(
+            weight, weightScale: scale, numBits: 4, inputDims: 256)
+        eval([mlxOut, refOut])
+        #expect(mlxOut.shape == [1, 256])
+        Self.assertApproximatelyEqual(
+            mlxOut.asArray(Float.self), refOut.asArray(Float.self), tolerance: 1e-6)
+    }
+
+    @Test("mobileToMLX with block-wise scales broadcasts per-block scale to groups")
+    func mobileToMLXBlockWise() throws {
+        // int4: 2 rows, 256 input dims (2 blocks of 128, 1 group per block)
+        // → packed [2, 128] uint8. 0x87 → low nibble 7→-1, high nibble 8→0.
+        let packedBytes = [UInt8](repeating: 0x87, count: 256)
+        let weight = MLXArray(packedBytes, [2, 128])
+        // Block-wise scales: [2, 2] — row 0: [0.5, 1.0], row 1: [0.25, 0.75]
+        let scale = MLXArray([Float(0.5), Float(1.0), Float(0.25), Float(0.75)], [2, 2])
+
+        let (packed, scales, biases) = mobileToMLX(
+            weight: weight, weightScale: scale, numBits: 4, inputDims: 256, numBlocks: 2)
+        eval([packed, scales, biases])
+        #expect(scales.shape == [2, 2])
+        #expect(biases.shape == [2, 2])
+
+        let mlxOut = dequantized(
+            packed, scales: scales, biases: biases,
+            groupSize: 128, bits: 4, mode: .affine)
+        // Compare against dequantizeEmbeddingRows which handles block-wise scales.
+        let refOut = dequantizeEmbeddingRows(
+            weight, scales: scale, numBits: 4, embeddingDim: 256, numBlocks: 2)
+        eval([mlxOut, refOut])
+        #expect(mlxOut.shape == [2, 256])
+        Self.assertApproximatelyEqual(
+            mlxOut.asArray(Float.self), refOut.asArray(Float.self), tolerance: 1e-6)
+    }
+
     // MARK: - Per-layer bit resolution
 
     /// The E2B mobile `module_quant_configs` schema (regex patterns in the
