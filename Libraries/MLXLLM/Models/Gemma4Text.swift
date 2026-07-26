@@ -908,7 +908,9 @@ private class Gemma4TextExperts: Module {
     // Native compiled-path cache (Phase 6/7 port). Lazily extracted on the
     // first forward pass; `nil` means the native path is not usable (MoE,
     // non-gemma-quant, unaligned dims, no PLE) and the eager path is used.
-    private struct NativeArgs {
+    // `fileprivate` so `Gemma4TextModelInner.precompileNativeFunctions` can read
+    // the cached args for the load-time direct-compile path (Phase 5).
+    fileprivate struct NativeArgs {
         let isSource: Bool
         let preFn: @Sendable ([MLXArray]) -> [MLXArray]
         let preArgs: [MLXArray]
@@ -973,7 +975,11 @@ private class Gemma4TextExperts: Module {
     /// Lazily extract and cache native compiled-path arguments. Returns `nil` if
     /// the native path is not usable (MoE, non-gemma-quantized, unaligned dims,
     /// or no PLE). Mirrors Python `DecoderLayer._get_native_args`.
-    private func getNativeArgs() -> NativeArgs? {
+    ///
+    /// `fileprivate` so `Gemma4TextModelInner.precompileNativeFunctions` can
+    /// trigger conversion + read the cached args for the load-time direct-compile
+    /// path (Phase 5).
+    fileprivate func getNativeArgs() -> NativeArgs? {
         if _nativeArgsChecked { return _nativeArgs }
         _nativeArgsChecked = true
 
@@ -1061,6 +1067,26 @@ private class Gemma4TextExperts: Module {
             postFn: postFn, postArgs: postArgs)
         _nativeArgs = result
         return result
+    }
+
+    /// Free the mobile-format weights on every `GemmaQuantizedLinear` in this
+    /// layer after native conversion. Called by the load-time precompilation
+    /// (Phase 5) once `getNativeArgs()` has returned non-nil (which means every
+    /// relevant linear was converted to the native `quantizedMM` format). The
+    /// SRQ scales are preserved. Mirrors the per-layer loop in Python
+    /// `precompile_native_functions`.
+    fileprivate func freeMobileWeightsOnLinears() {
+        let attn = selfAttn
+        let mlp = self.mlp
+        if let q = attn.qProj as? GemmaQuantizedLinear { q.freeMobileWeights() }
+        if let k = attn.kProj as? GemmaQuantizedLinear { k.freeMobileWeights() }
+        if let v = attn.vProj as? GemmaQuantizedLinear { v.freeMobileWeights() }
+        if let o = attn.oProj as? GemmaQuantizedLinear { o.freeMobileWeights() }
+        if let g = mlp.gateProj as? GemmaQuantizedLinear { g.freeMobileWeights() }
+        if let u = mlp.upProj as? GemmaQuantizedLinear { u.freeMobileWeights() }
+        if let d = mlp.downProj as? GemmaQuantizedLinear { d.freeMobileWeights() }
+        if let pli = perLayerInputGate as? GemmaQuantizedLinear { pli.freeMobileWeights() }
+        if let plp = perLayerProjection as? GemmaQuantizedLinear { plp.freeMobileWeights() }
     }
 
     /// Run one decoder layer.
@@ -1427,6 +1453,111 @@ private class Gemma4TextExperts: Module {
 
         return norm(h)
     }
+
+    // MARK: - Load-time precompilation (Phase 5)
+
+    /// Precompile native compiled functions for common prompt lengths and free
+    /// mobile-format weights. Called at load time (via `Gemma4TextModel`'s
+    /// `NativePrecompilable` conformance) after weights are loaded and modules
+    /// are replaced. Mirrors Python `precompile_native_functions`.
+    ///
+    /// Three steps:
+    /// 1. **Convert + free mobile weights layer by layer** — call `getNativeArgs()`
+    ///   on each decoder layer (triggering lazy `nativeArgs()` conversion to the
+    ///   native `quantizedMM` format), then replace the mobile `weight`/
+    ///   `weightScale` with dummy arrays. Keeps the conversion peak at roughly
+    ///   half-mobile + half-native per layer (the native weights are `eval`'d
+    ///   inside `convertToMLXFormat`).
+    /// 2. **Precompile `compile` functions** — run dummy forward passes for
+    ///   common prompt lengths with `eval` on the output. Use the hybrid compile
+    ///   strategy: full forward pass for shapes ≤ 32 (negligible activations,
+    ///   warms up MLX built-in ops), direct compiled-function calls for larger
+    ///   shapes (avoids accumulating ~0.8 GB of activations across all layers).
+    /// 3. The compiled functions are shared across layers via the factory caches,
+    ///   so only the first source layer and first KV-shared layer are needed for
+    ///   the direct-compile path.
+    ///
+    /// No-op if no layer uses the native path (e.g. unaligned dims, MoE, no PLE).
+    fileprivate func precompileNativeFunctions(shapes: [Int] = [1, 16, 32, 64, 128, 256]) {
+        let layers = self.layers
+        guard !layers.isEmpty else { return }
+
+        // 1. Convert + free mobile weights layer by layer.
+        var anyNative = false
+        for layer in layers {
+            guard layer.getNativeArgs() != nil else { continue }
+            anyNative = true
+            layer.freeMobileWeightsOnLinears()
+        }
+        guard anyNative else { return }
+
+        // 2. Precompile compile functions for common prompt lengths.
+        let hiddenSize = config.hiddenSize
+        let perLayerDim = config.hiddenSizePerLayerInput
+        let dtype = layers[0].inputLayernorm.weight.dtype
+
+        // Find the first source and first KV-shared layer (different compiled
+        // pre-attention functions). Their compiled functions are shared across
+        // all layers via the factory caches, so only these are needed for the
+        // direct-compile path.
+        var firstSource: Gemma4DecoderLayer?
+        var firstKvshared: Gemma4DecoderLayer?
+        for layer in layers {
+            guard let native = layer.getNativeArgs() else { continue }
+            if native.isSource {
+                if firstSource == nil { firstSource = layer }
+            } else {
+                if firstKvshared == nil { firstKvshared = layer }
+            }
+            if firstSource != nil && firstKvshared != nil { break }
+        }
+        let compileLayers = [firstSource, firstKvshared].compactMap { $0 }
+
+        // offset must be an MLXArray (not a bare Int) so `compile` treats it as a
+        // runtime input, not a compile-time constant (Python Phase 7 bug).
+        let dummyOffset = MLXArray(Int32(0))
+        let fullPassShapes = Set(shapes.filter { $0 <= 32 })
+
+        for seqLen in shapes {
+            if fullPassShapes.contains(seqLen) {
+                // Full forward pass: warms up the compiled functions AND the MLX
+                // built-in ops (RMSNorm, SDPA, RoPE, embeddings, PLE) with
+                // negligible activation memory (~0.1 GB for seq_len=32).
+                let dummyIds = MLXArray(
+                    Array(repeating: Int32(2), count: seqLen)
+                ).reshaped([1, seqLen])
+                let out = self(dummyIds, cache: nil)
+                eval(out)
+            } else {
+                // Direct compile: call the compiled functions with tiny dummy
+                // inputs (~4 MB) to avoid accumulating ~0.8 GB of activations
+                // across all layers for large seq_len.
+                //
+                // `dummyAttnOut` must match the o_proj input dim
+                // (`nHeads * effectiveHeadDim`), which differs from `hiddenSize`
+                // for Gemma 4 (sliding=2048, full=4096 vs hiddenSize=1536). The
+                // Python uses `hidden_size` here and relies on `try/except` to
+                // swallow the resulting `quantized_matmul` shape error, leaving the
+                // post-attention segment un-precompiled for large seq_len. Swift's
+                // `quantized_matmul` aborts on shape mismatch, so we use the
+                // correct per-layer attention output dim and actually precompile it.
+                let dummyX = MLXArray.zeros([1, seqLen, hiddenSize], dtype: dtype)
+                let dummyResidual = MLXArray.zeros([1, seqLen, hiddenSize], dtype: dtype)
+                let dummyPli = MLXArray.zeros([1, seqLen, perLayerDim], dtype: dtype)
+
+                for layer in compileLayers {
+                    guard let native = layer.getNativeArgs() else { continue }
+                    let preOut = native.preFn([dummyX] + native.preArgs + [dummyOffset])
+                    eval(preOut)
+                    let attnDim = layer.selfAttn.nHeads * layer.selfAttn.effectiveHeadDim
+                    let dummyAttnOut = MLXArray.zeros([1, seqLen, attnDim], dtype: dtype)
+                    let postOut = native.postFn(
+                        [dummyResidual, dummyAttnOut, dummyPli] + native.postArgs)
+                    eval(postOut)
+                }
+            }
+        }
+    }
 }
 
 // MARK: - Public Model
@@ -1438,6 +1569,17 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Set to `false` to force the eager (non-compiled) decoder path for A/B
     /// testing. Defaults to `true` (native compiled path enabled).
     nonisolated(unsafe) public static var useNativeCompiledPath = true
+
+    /// Set to `false` to skip load-time precompilation + weight freeing (the
+    /// `NativePrecompilable` hook in `loadWeights`). Defaults to `true`.
+    ///
+    /// The A/B equivalence test sets this to `false` so the eager path (which
+    /// needs the mobile-format weights) still works after `loadWeights` — once
+    /// weights are freed the eager path can no longer dequantize them. In
+    /// production this stays `true` so load converts to the native `quantizedMM`
+    /// format, frees the mobile weights, and warms up the per-shape `compile`
+    /// graphs.
+    nonisolated(unsafe) public static var precompileAtLoad = true
 
     fileprivate let config: Gemma4TextConfiguration
     /// The text backbone, exposed at `@_spi(GemmaEncoder)` scope for client taps.
@@ -1570,6 +1712,20 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 slidingWindow: config.slidingWindow,
                 usesSlidingWindow: config.layerTypes[i] != "full_attention")
         }
+    }
+}
+
+// MARK: - Load-time precompilation (Phase 5)
+
+extension Gemma4TextModel: NativePrecompilable {
+    /// Precompile native compiled functions and free mobile-format weights.
+    ///
+    /// Called by `loadWeights` after weights are loaded and modules are replaced.
+    /// Honors ``precompileAtLoad``: when `false` (e.g. the A/B equivalence test),
+    /// this is a no-op so the eager path keeps the mobile-format weights.
+    public func precompileNativeFunctions() {
+        guard Self.precompileAtLoad else { return }
+        model.precompileNativeFunctions()
     }
 }
 
