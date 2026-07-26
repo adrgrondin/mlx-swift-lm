@@ -80,4 +80,15 @@ public func loadWeights(
     try model.update(parameters: parameters, verify: [.all])
 
     eval(model)
+
+    // Precompile native compiled functions (e.g. the Gemma 4 QAT mobile
+    // compiled path) after weights are loaded and modules are replaced.
+    // This converts weights to the native quantizedMM format, frees the
+    // mobile-format weights, and warms up the per-shape `compile` graphs for
+    // common prompt lengths — eliminating the first-pass JIT cost and reducing
+    // peak memory. No-op for models that don't conform to NativePrecompilable
+    // or whose native path is not usable.
+    if let precompilable = model as? NativePrecompilable {
+        precompilable.precompileNativeFunctions()
+    }
 }
