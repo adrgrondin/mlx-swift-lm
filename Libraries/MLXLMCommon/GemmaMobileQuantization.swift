@@ -578,7 +578,7 @@ private func gemmaQMVUnpackBlock(numBits: Int) -> String {
 
 /// Build the qmv Metal kernel source for a given bit width by substituting the
 /// placeholders in the template.
-private func gemmaQMVSource(numBits: Int) -> String {
+private func gemmaQMVSource(numBits: Int, perRowOutputScale: Bool) -> String {
     let valuesPerByte: Int
     switch numBits {
     case 2: valuesPerByte = 4
@@ -590,29 +590,96 @@ private func gemmaQMVSource(numBits: Int) -> String {
         .replacingOccurrences(of: "VALUES_PER_BYTE", with: "\(valuesPerByte)")
         .replacingOccurrences(of: "OUTPUTS_PER_SIMDGROUP", with: "\(gemmaQMVOutputsPerSimdgroup)")
         .replacingOccurrences(of: "OUTPUTS_PER_THREADGROUP", with: "\(gemmaQMVOutputsPerThreadgroup)")
-        .replacingOccurrences(of: "OUTPUT_SCALE_PER_ROW", with: "false")
+        .replacingOccurrences(of: "OUTPUT_SCALE_PER_ROW", with: perRowOutputScale ? "true" : "false")
         .replacingOccurrences(of: "UNPACK_BLOCK", with: gemmaQMVUnpackBlock(numBits: numBits))
 }
 
-/// Cache of compiled qmv kernels keyed by numBits. Metal kernel compilation is
-/// expensive (~ms), so we compile once and reuse. `nonisolated(unsafe)`:
-/// single-threaded inference context, no data races.
+/// Cache of compiled qmv kernels keyed by (numBits, perRowOutputScale). Metal
+/// kernel compilation is expensive (~ms), so we compile once and reuse.
+/// `nonisolated(unsafe)`: single-threaded inference context, no data races.
 private enum GemmaQMVKernelCache {
-    nonisolated(unsafe) static var cache: [Int: MLXFast.MLXFastKernel] = [:]
+    struct Key: Hashable { let numBits: Int; let perRowOutputScale: Bool }
 
-    static func kernel(numBits: Int) -> MLXFast.MLXFastKernel {
-        if let cached = cache[numBits] {
+    nonisolated(unsafe) static var cache: [Key: MLXFast.MLXFastKernel] = [:]
+
+    static func kernel(numBits: Int, perRowOutputScale: Bool = false) -> MLXFast.MLXFastKernel {
+        let key = Key(numBits: numBits, perRowOutputScale: perRowOutputScale)
+        if let cached = cache[key] {
             return cached
         }
         let kernel = MLXFast.metalKernel(
-            name: "gemma_mobile_qmv_b\(numBits)",
+            name: "gemma_mobile_qmv_b\(numBits)_pr\(perRowOutputScale ? 1 : 0)",
             inputNames: ["x", "weight", "weight_scale", "input_scale", "output_scale"],
             outputNames: ["out"],
-            source: gemmaQMVSource(numBits: numBits),
+            source: gemmaQMVSource(numBits: numBits, perRowOutputScale: perRowOutputScale),
             header: "#include <metal_simdgroup>\nusing namespace metal;")
-        cache[numBits] = kernel
+        cache[key] = kernel
         return kernel
     }
+}
+
+// MARK: - Fused q/k/v projection (plan §9.3)
+
+/// True when the three projections' input SRQ scales are identical (so they
+/// can share a single fused matmul). Mirrors Python `_qkv_input_scales_match`.
+public func gemmaQKVInputScalesMatch(
+    _ q: GemmaQuantizedLinear, _ k: GemmaQuantizedLinear, _ v: GemmaQuantizedLinear
+) -> Bool {
+    // Input SRQ scales are scalars; compare as float32 (bfloat16 → float32 is
+    // lossless). Mirrors Python `array_equal` (exact, not approximate).
+    let qS = q.inputActivationScale.asType(.float32).item(Float.self)
+    let kS = k.inputActivationScale.asType(.float32).item(Float.self)
+    let vS = v.inputActivationScale.asType(.float32).item(Float.self)
+    return qS == kS && qS == vS
+}
+
+/// Build the per-row [q_out + k_out + v_out] output SRQ scale for the fused
+/// matmul. Each projection's scalar output scale is broadcast to its output
+/// dim; uncalibrated (zero) scales produce zeros. Mirrors Python
+/// `_build_per_row_output_scale`.
+public func gemmaBuildPerRowOutputScale(
+    _ q: GemmaQuantizedLinear, _ k: GemmaQuantizedLinear, _ v: GemmaQuantizedLinear,
+    dtype: DType
+) -> MLXArray {
+    let parts = [q, k, v].map { proj -> MLXArray in
+        broadcast(proj.outputActivationScale.asType(dtype), to: [proj.weight.shape[0]])
+    }
+    return concatenated(parts, axis: 0)
+}
+
+/// Fused q/k/v quantized matmul: concatenates the packed q/k/v weights and runs
+/// a single qmv kernel with per-row output SRQ, replacing three kernel launches
+/// with one. The caller caches the concatenated weights and per-row output
+/// scale; this function just dispatches the kernel. Mirrors Python
+/// `gemma_fused_qkv_matmul` (the dispatch part).
+public func gemmaFusedQKVMatmul(
+    x: MLXArray,
+    weight: MLXArray,
+    weightScale: MLXArray,
+    inputScale: MLXArray,
+    outputScale: MLXArray,
+    numBits: Int,
+    inputDims: Int
+) -> MLXArray {
+    let kernel = GemmaQMVKernelCache.kernel(numBits: numBits, perRowOutputScale: true)
+    let totalOutDims = weight.shape[0]
+    let outputShape = Array(x.shape.dropLast()) + [totalOutDims]
+    let x2d = x.reshaped([-1, inputDims])
+    let batch = x2d.shape[0]
+
+    let inS = inputScale.reshaped([1]).asType(x.dtype)
+    let outS = outputScale.asType(x.dtype)
+
+    let out = kernel(
+        [x2d, weight, weightScale, inS, outS],
+        template: [("T", x.dtype)],
+        grid: (64, (totalOutDims + gemmaQMVOutputsPerThreadgroup - 1) / gemmaQMVOutputsPerThreadgroup, batch),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[batch * totalOutDims]],
+        outputDTypes: [x.dtype]
+    )[0]
+
+    return out.reshaped(outputShape)
 }
 
 // MARK: - Quantized layers
@@ -710,7 +777,7 @@ public final class GemmaQuantizedLinear: Linear {
 
     /// Whether the fused qmv kernel can be used for this layer and batch size.
     /// Requires batch ≤ 16 and aligned input dims (÷512 for int2/int4, ÷16 for int8).
-    private func canUseQMV(batchSize: Int) -> Bool {
+    public func canUseQMV(batchSize: Int) -> Bool {
         guard batchSize <= 16 else { return false }
         if numBits == 8 { return inputDims % 16 == 0 }
         return inputDims % 512 == 0  // int2, int4
