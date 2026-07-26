@@ -17,6 +17,12 @@ import Testing
 /// `GemmaQuantizedLinear`/`GemmaQuantizedEmbedding` with the right per-layer
 /// bits and that a forward pass produces finite logits
 /// (see GEMMA4_QAT_MOBILE_SWIFT_PORT_PLAN.md §5.11).
+///
+/// Serialized because several tests mutate the process-wide
+/// `Gemma4TextModel.useNativeCompiledPath` / `precompileAtLoad` flags and
+/// load the same real checkpoint; running them concurrently would let one
+/// test's flag changes leak into another's forward passes.
+@Suite(.serialized)
 struct Gemma4MobileIntegrationTests {
 
     private func tinyConfigJSON() -> String {
@@ -316,6 +322,14 @@ struct Gemma4MobileIntegrationTests {
         decoder.userInfo[.rawConfigData] = configData
         let config = try decoder.decode(Gemma4Configuration.self, from: configData)
 
+        // Disable load-time precompilation + weight freeing for this A/B test:
+        // once `loadWeights` frees the mobile-format weights, the eager path
+        // (which dequantizes them) can no longer run. The native path still
+        // works (it converts lazily on the first forward pass), so disabling
+        // precompilation keeps both paths runnable on the same model instance.
+        Gemma4TextModel.precompileAtLoad = false
+        defer { Gemma4TextModel.precompileAtLoad = true }
+
         let model = Gemma4Model(config)
         try loadWeights(modelDirectory: dir, model: model)
 
@@ -372,5 +386,131 @@ struct Gemma4MobileIntegrationTests {
         print("\(nPositions)-token prompt: mean abs diff = \(meanDiff), max abs diff = \(maxDiff), argmax mismatches = \(argmaxMismatches)/\(nPositions)")
         #expect(meanDiff < 0.5, "mean abs diff too large: \(meanDiff)")
         #expect(argmaxMismatches <= 4, "too many argmax mismatches: \(argmaxMismatches)")
+    }
+
+    // MARK: - Phase 5: load-time precompilation + weight freeing
+
+    /// Verify the load-time precompilation hook (Phase 5) frees the mobile-format
+    /// decoder-layer weights, keeps `lm_head`/embeddings, and produces stable
+    /// (deterministic) prefill across runs.
+    @Test("Load-time precompilation frees mobile weights and stabilizes prefill (real model)")
+    func precompileFreesWeightsAndStabilizesPrefill() throws {
+        let dir = Self.realCheckpointURL
+        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path) else {
+            return  // Checkpoint not available — skip.
+        }
+
+        let configData = try Data(contentsOf: dir.appending(component: "config.json"))
+        let decoder = JSONDecoder.json5()
+        decoder.userInfo[.rawConfigData] = configData
+        let config = try decoder.decode(Gemma4Configuration.self, from: configData)
+
+        // precompileAtLoad defaults to true; make it explicit. The load hook
+        // converts to native quantizedMM format, frees mobile weights, and warms
+        // up the per-shape compile graphs.
+        Gemma4TextModel.precompileAtLoad = true
+        Gemma4TextModel.useNativeCompiledPath = true
+        defer {
+            Gemma4TextModel.precompileAtLoad = true
+            Gemma4TextModel.useNativeCompiledPath = true
+        }
+
+        let model = Gemma4Model(config)
+        try loadWeights(modelDirectory: dir, model: model)
+
+        let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
+
+        // Decoder-layer mobile weights are freed: `weight`/`weightScale` replaced
+        // with a dummy [1] array. The native path uses the converted _mlxWeight.
+        let gate0 = try #require(
+            modules["language_model.model.layers.0.mlp.gate_proj"] as? GemmaQuantizedLinear)
+        #expect(gate0.weight.shape == [1],
+            "decoder layer mobile weight should be freed, got \(gate0.weight.shape)")
+        #expect(gate0.weightScale.shape == [1],
+            "decoder layer mobile weightScale should be freed, got \(gate0.weightScale.shape)")
+
+        // A KV-shared layer (15) is also freed.
+        let gate15 = try #require(
+            modules["language_model.model.layers.15.mlp.gate_proj"] as? GemmaQuantizedLinear)
+        #expect(gate15.weight.shape == [1],
+            "KV-shared layer mobile weight should be freed, got \(gate15.weight.shape)")
+
+        // lm_head (2-bit, not a decoder layer) keeps its mobile weights — it
+        // stays on the qmv/eager path.
+        let lmHead = try #require(modules["language_model.lm_head"] as? GemmaQuantizedLinear)
+        #expect(lmHead.weight.ndim == 2,
+            "lm_head mobile weight should NOT be freed, got shape \(lmHead.weight.shape)")
+
+        // Embeddings keep their packed tables (dequant-on-forward, not converted).
+        let embed = try #require(
+            modules["language_model.model.embed_tokens"] as? GemmaQuantizedEmbedding)
+        #expect(embed.weight.ndim == 2,
+            "embed_tokens weight should NOT be freed, got shape \(embed.weight.shape)")
+
+        // Forward pass produces finite logits of the right shape (native path).
+        let cache = model.newCache(parameters: nil)
+        let tokens = MLXArray((0..<32).map { Int32($0 % 1000 + 1) }).reshaped([1, 32])
+        let logits1 = model(tokens, cache: cache)
+        eval(logits1)
+        #expect(logits1.shape == [1, 32, config.textConfig.vocabSize])
+        let values1 = logits1.asType(.float32).asArray(Float.self)
+        #expect(values1.allSatisfy { $0.isFinite }, "logits must be finite")
+
+        // Prefill is stable: a second run with the same input produces the
+        // exact same output (the precompiled graphs are deterministic).
+        let cache2 = model.newCache(parameters: nil)
+        let logits2 = model(tokens, cache: cache2)
+        eval(logits2)
+        let values2 = logits2.asType(.float32).asArray(Float.self)
+        #expect(values2.allSatisfy { $0.isFinite }, "logits must be finite")
+        var maxDiff: Float = 0
+        for i in 0..<values1.count {
+            maxDiff = max(maxDiff, abs(values1[i] - values2[i]))
+        }
+        #expect(maxDiff == 0, "prefill should be stable across runs, max diff = \(maxDiff)")
+    }
+
+    /// Verify the load-time precompilation is a no-op when the native path is
+    /// not usable (unaligned dims). The tiny model has hidden_size=16 (16 % 128 != 0),
+    /// so `getNativeArgs()` returns nil for every layer and the mobile weights are
+    /// kept (the eager/qmv path still needs them).
+    @Test("Load-time precompilation is a no-op for unaligned dims (tiny model)")
+    func precompileNoOpForUnalignedDims() throws {
+        MLXRandom.seed(0)
+        let configData = Data(tinyConfigJSON().utf8)
+        let decoder = JSONDecoder()
+        decoder.userInfo[.rawConfigData] = configData
+        let config = try decoder.decode(Gemma4Configuration.self, from: configData)
+        let model = Gemma4Model(config)
+        eval(model)
+
+        let numLayers = config.textConfig.numHiddenLayers
+        let arrays = makeMobileCheckpoint(
+            model: model, quantizationConfig: config.quantizationConfig!, numLayers: numLayers)
+        let directory = try writeCheckpoint(arrays)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // precompileAtLoad defaults to true, but the tiny model's dims are not
+        // divisible by 128, so the native path is not usable → no-op.
+        Gemma4TextModel.precompileAtLoad = true
+        defer { Gemma4TextModel.precompileAtLoad = true }
+
+        try loadWeights(modelDirectory: directory, model: model)
+
+        let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
+        let gate = try #require(
+            modules["language_model.model.layers.0.mlp.gate_proj"] as? GemmaQuantizedLinear)
+        // Weights are NOT freed (unaligned dims → native path not usable → no-op).
+        #expect(gate.weight.ndim == 2,
+            "tiny model weights should NOT be freed (unaligned dims), got \(gate.weight.shape)")
+
+        // Forward pass still works (eager path).
+        let cache = model.newCache(parameters: nil)
+        let tokens = MLXArray([1, 2, 3]).reshaped([1, 3])
+        let logits = model(tokens, cache: cache)
+        eval(logits)
+        #expect(logits.shape == [1, 3, config.textConfig.vocabSize])
+        let values = logits.asType(.float32).asArray(Float.self)
+        #expect(values.allSatisfy { $0.isFinite }, "logits must be finite")
     }
 }
