@@ -241,6 +241,16 @@ private class Gemma4Attention: Module {
 
     @ModuleInfo var rope: RoPELayer
 
+    // Fused q/k/v cache (plan §9.3): concatenates packed q/k/v weights once and
+    // runs a single qmv kernel with per-row output SRQ, replacing three kernel
+    // launches with one. Built lazily on the first decode/small-batch call.
+    private var _fusedQKVWeight: MLXArray?
+    private var _fusedQKVWeightScale: MLXArray?
+    private var _fusedQKVInS: MLXArray?
+    private var _fusedQKVOutS: MLXArray?
+    private var _fusedQKVReady = false
+    private var _fusedQKVDisabled = false
+
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         self.config = config
         self.layerIdx = layerIdx
@@ -305,6 +315,42 @@ private class Gemma4Attention: Module {
         super.init()
     }
 
+    /// Try fused q/k/v projection (single Metal kernel for all three). Returns
+    /// the concatenated `[..., q_out + k_out + v_out]` output, or `nil` when
+    /// fusion is not possible (batch too large, unaligned dims, mismatched input
+    /// SRQ scales, or projections are not all Gemma-quantized). The caller splits
+    /// the output and applies norms separately. Mirrors Python
+    /// `gemma_fused_qkv_matmul`.
+    private func tryFusedQKV(
+        q: GemmaQuantizedLinear, k: GemmaQuantizedLinear, v: GemmaQuantizedLinear,
+        x: MLXArray
+    ) -> MLXArray? {
+        if _fusedQKVDisabled { return nil }
+        let batchSize = x.shape.dropLast().reduce(1, *)
+        guard q.canUseQMV(batchSize: batchSize) else { return nil }
+        guard q.numBits == k.numBits && q.numBits == v.numBits else { return nil }
+        guard q.inputDims == k.inputDims && q.inputDims == v.inputDims else { return nil }
+
+        if !_fusedQKVReady {
+            guard gemmaQKVInputScalesMatch(q, k, v) else {
+                _fusedQKVDisabled = true
+                return nil
+            }
+            _fusedQKVWeight = MLX.concatenated([q.weight, k.weight, v.weight], axis: 0)
+            _fusedQKVWeightScale = MLX.concatenated(
+                [q.weightScale, k.weightScale, v.weightScale], axis: 0)
+            _fusedQKVInS = q.inputActivationScale
+            _fusedQKVOutS = gemmaBuildPerRowOutputScale(q, k, v, dtype: x.dtype)
+            eval([_fusedQKVWeight!, _fusedQKVWeightScale!, _fusedQKVOutS!])
+            _fusedQKVReady = true
+        }
+
+        return gemmaFusedQKVMatmul(
+            x: x, weight: _fusedQKVWeight!, weightScale: _fusedQKVWeightScale!,
+            inputScale: _fusedQKVInS!, outputScale: _fusedQKVOutS!,
+            numBits: q.numBits, inputDims: q.inputDims)
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
@@ -313,15 +359,15 @@ private class Gemma4Attention: Module {
         positionOffset: RoPEOffset? = nil
     ) -> (MLXArray, Gemma4SharedKVState, RoPEOffset?) {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
-
-        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
-        queries = qNorm(queries)
-
         let activePositionOffset = positionOffset ?? cache?.ropeOffset
+
+        var queries: MLXArray
         let kvState: Gemma4SharedKVState
 
         if let sharedKV {
             // KV-shared layers use pre-computed KV from an earlier layer.
+            queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
+            queries = qNorm(queries)
             kvState = sharedKV
         } else {
             // Only KV-owning layers fall here (KV-shared layers always receive `sharedKV`),
@@ -331,21 +377,45 @@ private class Gemma4Attention: Module {
                     "Gemma4Attention layer \(layerIdx) computed its own K/V but has no k_proj/k_norm; "
                         + "KV-shared layers must be passed `sharedKV`.")
             }
-            // Keep `kRaw` (pre-norm) — the no-vProj fallback below reuses it for `vNorm(kRaw)`.
-            let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+
+            // Try fused q/k/v projection (single Metal kernel for all three).
+            // Only when v_proj exists (!useKeqV) and all three are Gemma-quantized
+            // with matching input SRQ scales and aligned dims for the qmv kernel.
+            let kRaw: MLXArray
+            let vRaw: MLXArray
+
+            if !useKeqV,
+               let q = qProj as? GemmaQuantizedLinear,
+               let k = kProj as? GemmaQuantizedLinear,
+               let vQ = vProj as? GemmaQuantizedLinear,
+               let fused = tryFusedQKV(q: q, k: k, v: vQ, x: x) {
+                let qd = nHeads * effectiveHeadDim
+                let kvd = nKvHeads * effectiveHeadDim
+                queries = fused[.ellipsis, 0..<qd].reshaped(B, L, nHeads, effectiveHeadDim)
+                kRaw = fused[.ellipsis, qd..<qd + kvd].reshaped(B, L, nKvHeads, effectiveHeadDim)
+                vRaw = fused[.ellipsis, (qd + kvd)..<fused.dim(-1)].reshaped(B, L, nKvHeads, effectiveHeadDim)
+            } else {
+                queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
+                kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+                if let vProj {
+                    vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+                } else {
+                    vRaw = kRaw
+                }
+            }
+
+            queries = qNorm(queries)
             var k = kNorm(kRaw)
             k = k.transposed(0, 2, 1, 3)
             k = applyRotaryPosition(rope, to: k, offset: activePositionOffset)
 
             var v: MLXArray
-            if let vProj {
-                v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-                v = vNorm(v)
-                v = v.transposed(0, 2, 1, 3)
-            } else {
+            if useKeqV {
                 v = vNorm(kRaw)
-                v = v.transposed(0, 2, 1, 3)
+            } else {
+                v = vNorm(vRaw)
             }
+            v = v.transposed(0, 2, 1, 3)
 
             if let quantizedCache = cache as? QuantizedKVCacheProtocol {
                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
