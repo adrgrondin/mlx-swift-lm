@@ -406,6 +406,11 @@ public func loadWeights(
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
     materializeModelForInference(model)
+
+    // Warm native graphs and release converted mobile-format weights before publication.
+    if let precompilable = model as? NativePrecompilable {
+        precompilable.precompileNativeFunctions()
+    }
 }
 
 /// Async variant of

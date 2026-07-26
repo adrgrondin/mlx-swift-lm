@@ -794,6 +794,25 @@ public final class GemmaQuantizedLinear: Linear {
         return (packed, scales, biases, inputActivationScale, outputActivationScale)
     }
 
+    /// Free the mobile-format weights after native conversion.
+    ///
+    /// Replaces the packed mobile `weight` and per-channel `weightScale` with
+    /// tiny dummy arrays to recover memory (the native compiled path uses the
+    /// converted `_mlxWeight`/`_mlxScales`/`_mlxBiases`, not the mobile weights).
+    /// The SRQ scales (`inputActivationScale`, `outputActivationScale`) are
+    /// preserved because the native path still reads them.
+    ///
+    /// No-op if native conversion has not succeeded (`nativeArgs()` returned
+    /// `nil`), so the eager / qmv fallback path keeps its mobile weights. Mirrors
+    /// Python `_free_mobile_weights` (the per-module part).
+    public func freeMobileWeights() {
+        guard _conversionDone, _mlxWeight != nil else { return }
+        let wDtype = weight.dtype
+        let sDtype = weightScale.dtype
+        weight._updateInternal(MLXArray.zeros([1], dtype: wDtype))
+        weightScale._updateInternal(MLXArray.zeros([1], dtype: sDtype))
+    }
+
     /// Whether the fused qmv kernel can be used for this layer and batch size.
     /// Requires batch ≤ 16 and aligned input dims (÷512 for int2/int4, ÷16 for int8).
     public func canUseQMV(batchSize: Int) -> Bool {
