@@ -149,17 +149,43 @@ public func applySRQ(_ x: MLXArray, scale: MLXArray, bits: Int = 8) -> MLXArray 
     return MLX.where(calibrated, q, x)
 }
 
-/// Compiled SRQ for calibrated layers (scale != 0). Fuses the divide, round,
-/// clip, and multiply into a single Metal kernel via `MLX.compile`, cutting
-/// per-layer SRQ kernel launches from ~5 to 1. Used by the fallback path
-/// (quantizedMM + SRQ) for large prefill (batch > 16) or unaligned dims.
-/// `shapeless: true` lets the same compiled kernel handle both prefill and decode.
+/// Compiled SRQ in float32 for calibrated layers (scale != 0). Fuses the
+/// divide, round, clip, and multiply into a single Metal kernel via
+/// `MLX.compile`, cutting per-layer SRQ kernel launches from ~5 to 1. Used by
+/// the fallback path (quantizedMM + SRQ) for large prefill (batch > 16) or
+/// unaligned dims. `shapeless: true` lets the same compiled kernel handle both
+/// prefill and decode.
+///
+/// All SRQ math is in float32 (matching `srqF32`, the Python `_srq`, and the
+/// native compiled path). The previous bfloat16 SRQ rounded differently from
+/// the float32 SRQ, causing significant divergence from the native compiled
+/// path (the `quantizedMM` output differed by up to 4.4% relative, compounding
+/// across 35 layers to a 1.16 mean abs diff in logits).
 private enum CompiledSRQ {
     nonisolated(unsafe) static let apply: (MLXArray, MLXArray) -> MLXArray = MLX.compile(shapeless: true) {
         (x, s) in
-        let st = s.asType(x.dtype)
-        return MLX.clip(MLX.round(x / st), min: -128, max: 127) * st
+        let st = s.asType(.float32)
+        return MLX.clip(MLX.round(x.asType(.float32) / st), min: -128, max: 127) * st
     }
+}
+
+// MARK: - Compile-friendly float32 SRQ (for native quantizedMM compiled segments)
+
+/// Compile-friendly SRQ in float32 (matches Python `_srq` and the qmv kernel).
+///
+/// All SRQ math is done in float32 (`round` / `clip` / `multiply`), matching the
+/// custom qmv kernel's internal precision. When `scale == 0` the SRQ is a no-op
+/// (returns `x` unchanged). `scale` may be a scalar or per-row array.
+///
+/// Use this inside `compile` graphs (not `applySRQ`, which uses the input dtype).
+/// The `compile` system fuses the `where` / `round` / `clip` / `multiply` with
+/// adjacent norms and the `quantizedMM` into a single Metal graph.
+public func srqF32(_ x: MLXArray, _ s: MLXArray) -> MLXArray {
+    let s32 = s.asType(.float32)
+    let isZero = s32 .== 0
+    let safe = MLX.where(isZero, MLXArray.ones(like: s32), s32)
+    let q = MLX.clip(MLX.round(x.asType(.float32) / safe), min: -128, max: 127) * safe
+    return MLX.where(isZero, x, q)
 }
 
 // MARK: - Weight / embedding dequantization
@@ -745,6 +771,29 @@ public final class GemmaQuantizedLinear: Linear {
         }
     }
 
+    /// Returns `(packed, scales, biases, inScale, outScale)` for `quantizedMM`,
+    /// converting lazily on first call. Returns `nil` when `inputDims` is not
+    /// divisible by 128 (the MLX group_size constraint) — the caller should fall
+    /// back to the eager / qmv path. Mirrors Python `_qlinear_native_args`.
+    ///
+    /// The SRQ scales (`inputActivationScale`, `outputActivationScale`) are always
+    /// returned (even when zero / uncalibrated) — the compiled segment's `srqF32`
+    /// handles the zero-scale no-op.
+    public func nativeArgs()
+        -> (packed: MLXArray, scales: MLXArray, biases: MLXArray, inScale: MLXArray,
+            outScale: MLXArray)?
+    {
+        if !_conversionDone {
+            convertToMLXFormat()
+            _conversionDone = true
+        }
+        guard let packed = _mlxWeight, let scales = _mlxScales, let biases = _mlxBiases
+        else {
+            return nil  // inputDims not divisible by 128
+        }
+        return (packed, scales, biases, inputActivationScale, outputActivationScale)
+    }
+
     /// Whether the fused qmv kernel can be used for this layer and batch size.
     /// Requires batch ≤ 16 and aligned input dims (÷512 for int2/int4, ÷16 for int8).
     public func canUseQMV(batchSize: Int) -> Bool {
@@ -791,15 +840,19 @@ public final class GemmaQuantizedLinear: Linear {
             usedQMV = true
         } else {
             // Fallback: quantizedMM + compiled SRQ for prefill (batch > 16) or
-            // unaligned dims.
+            // unaligned dims. SRQ + matmul are done in float32 to match the native
+            // compiled path (srqF32 + quantizedMM) and Python `_srq`. The bfloat16
+            // SRQ used previously rounded differently from the float32 SRQ, causing
+            // significant divergence from the native path (up to 4.4% relative
+            // error per matmul, compounding across 35 layers).
             if !_conversionDone {
                 convertToMLXFormat()
                 _conversionDone = true
             }
 
-            // Input SRQ (skip entirely if uncalibrated — avoids building a no-op graph).
-            // Uses the compiled (fused) SRQ kernel for calibrated layers.
-            var xi = x
+            // Input SRQ in float32 (skip entirely if uncalibrated). Uses the
+            // compiled (fused) SRQ kernel for calibrated layers.
+            var xi = x.asType(.float32)
             if _needsInputSRQ {
                 xi = CompiledSRQ.apply(xi, inputActivationScale)
             }
@@ -813,17 +866,22 @@ public final class GemmaQuantizedLinear: Linear {
             } else {
                 let w = dequantizeWeight(
                     weight, weightScale: weightScale, numBits: numBits,
-                    inputDims: inputDims, dtype: xi.dtype)
+                    inputDims: inputDims, dtype: .float32)
                 matmulOut = matmul(xi, w.T)
             }
             usedQMV = false
         }
 
-        // Output SRQ (skip if uncalibrated). For the qmv path, output SRQ is
-        // already fused into the kernel, so skip the separate CompiledSRQ call.
+        // Output SRQ in float32 (matches native compiled path). For the qmv
+        // path, output SRQ is already fused into the kernel, so skip.
         var out = matmulOut
         if !usedQMV && _needsOutputSRQ {
             out = CompiledSRQ.apply(out, outputActivationScale)
+        }
+        // Cast back to the original input dtype to preserve the model's dtype
+        // flow (the native path does .asType(x.dtype) after the output SRQ).
+        if !usedQMV {
+            out = out.asType(x.dtype)
         }
 
         if let bias { out = out + bias }
