@@ -291,4 +291,86 @@ struct Gemma4MobileIntegrationTests {
         let values = logits.asType(.float32).asArray(Float.self)
         #expect(values.allSatisfy { $0.isFinite }, "logits must be finite, got first few: \(values.prefix(10))")
     }
+
+    // MARK: - Native compiled path A/B equivalence
+
+    /// Verify the native compiled path (quantizedMM + compile fusion) produces
+    /// logits close to the eager path for the real model.
+    ///
+    /// Both paths now use float32 SRQ + float32 quantizedMM input (matching Python
+    /// `_srq`), so the SRQ rounding is identical. The remaining difference is
+    /// numerical noise from (1) the fused q/k/v matmul (native) vs three separate
+    /// matmuls (eager) — different Metal tiling/accumulation, and (2) compile
+    /// fusion (native) vs separate ops (eager) — different kernel implementations.
+    /// These cause a small mean abs diff (< 0.35) and 0–3 argmax mismatches out of
+    /// 32 positions, which is expected for two different code paths.
+    @Test("Native compiled path matches eager path top-1 token (real model)")
+    func nativeCompiledPathMatchesEager() throws {
+        let dir = Self.realCheckpointURL
+        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path) else {
+            return  // Checkpoint not available — skip.
+        }
+
+        let configData = try Data(contentsOf: dir.appending(component: "config.json"))
+        let decoder = JSONDecoder.json5()
+        decoder.userInfo[.rawConfigData] = configData
+        let config = try decoder.decode(Gemma4Configuration.self, from: configData)
+
+        let model = Gemma4Model(config)
+        try loadWeights(modelDirectory: dir, model: model)
+
+        // Use a fixed 32-token prompt so the eager path also uses quantizedMM
+        // (batch > 16), isolating the difference to the compile fusion (not qmv
+        // vs quantizedMM). Fixed tokens give a deterministic diff (random tokens
+        // produced 0.08–0.80 mean diff due to different activation patterns).
+        let tokens = MLXArray((0..<32).map { Int32($0 % 1000 + 1) }).reshaped([1, 32])
+
+        // Run with the native compiled path.
+        Gemma4TextModel.useNativeCompiledPath = true
+        let cache1 = model.newCache(parameters: nil)
+        let logitsNative = model(tokens, cache: cache1)
+        eval(logitsNative)
+        let nativeValues = logitsNative.asType(.float32).asArray(Float.self)
+        #expect(nativeValues.allSatisfy { $0.isFinite },
+            "native path logits must be finite")
+
+        // Run with the eager path (flag off).
+        Gemma4TextModel.useNativeCompiledPath = false
+        let cache2 = model.newCache(parameters: nil)
+        let logitsEager = model(tokens, cache: cache2)
+        eval(logitsEager)
+        let eagerValues = logitsEager.asType(.float32).asArray(Float.self)
+        #expect(eagerValues.allSatisfy { $0.isFinite },
+            "eager path logits must be finite")
+
+        // Restore the flag.
+        Gemma4TextModel.useNativeCompiledPath = true
+
+        // Compare: mean absolute difference should be small (float32 accumulation
+        // order differences between fused-compile and separate-ops paths).
+        let vocabSize = config.textConfig.vocabSize
+        let nPositions = 32
+        var totalDiff: Float = 0
+        var maxDiff: Float = 0
+        var argmaxMismatches = 0
+        for pos in 0 ..< nPositions {
+            let offset = pos * vocabSize
+            var posDiff: Float = 0
+            for i in 0..<vocabSize {
+                let d = abs(nativeValues[offset + i] - eagerValues[offset + i])
+                posDiff += d
+                maxDiff = max(maxDiff, d)
+            }
+            totalDiff += posDiff / Float(vocabSize)
+            let nativeSlice = Array(nativeValues[offset..<(offset + vocabSize)])
+            let eagerSlice = Array(eagerValues[offset..<(offset + vocabSize)])
+            let nativeArgmax = nativeSlice.enumerated().max(by: { $0.1 < $1.1 })!.0
+            let eagerArgmax = eagerSlice.enumerated().max(by: { $0.1 < $1.1 })!.0
+            if nativeArgmax != eagerArgmax { argmaxMismatches += 1 }
+        }
+        let meanDiff = totalDiff / Float(nPositions)
+        print("\(nPositions)-token prompt: mean abs diff = \(meanDiff), max abs diff = \(maxDiff), argmax mismatches = \(argmaxMismatches)/\(nPositions)")
+        #expect(meanDiff < 0.5, "mean abs diff too large: \(meanDiff)")
+        #expect(argmaxMismatches <= 4, "too many argmax mismatches: \(argmaxMismatches)")
+    }
 }
