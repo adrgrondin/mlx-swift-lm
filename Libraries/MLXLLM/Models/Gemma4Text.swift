@@ -29,6 +29,16 @@ import MLXNN
 
 private let kRMSEps: Float = 1e-6
 
+/// Convert a `RoPEOffset` to an `MLXArray` for the compiled pre-attention segment.
+/// The compiled function requires `MLXArray` offset (not a bare `Int`) so that
+/// `compile` treats it as a runtime input, not a compile-time constant.
+private func ropeOffsetToArray(_ offset: RoPEOffset) -> MLXArray {
+    switch offset {
+    case .scalar(let i): return MLXArray(Int32(i))
+    case .batch(let arr): return arr
+    }
+}
+
 private let _addRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
     shapeless: true
 ) { residual, x, weight in
@@ -39,6 +49,207 @@ private let _geluMul: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
     shapeless: true
 ) { gate, other in
     geluApproximate(gate) * other
+}
+
+// MARK: - Native compiled pre-attention segments (Phase 6/7 port)
+//
+// These compile the entire pre-attention chain (input_layernorm → SRQ →
+// quantizedMM(fused_qkv or q_proj) → SRQ → q/k/v norms → transpose → RoPE) into
+// a single Metal graph. `quantizedMM` is compile-friendly (unlike the custom
+// metalKernel), so `compile` fuses the element-wise ops (norms, SRQ, RoPE) with
+// the matmul. KV cache + SDPA stay eager between the pre/post compiled segments.
+//
+// `shapeless: true` is NOT used: the pre-attention functions read `.shape` for
+// tensor slicing/reshaping — MLX cannot infer slice output shapes with unknown
+// dimensions (confirmed in Python Phase 7). Per-shape compile (default) is used;
+// load-time precompilation (Phase 5) eliminates the per-shape JIT cost.
+
+/// Factory + cache for the compiled pre-attention segment of **source layers**
+/// (own K/V). Keyed by `(nHeads, headDim, nKvHeads)` — the constants captured in
+/// the compiled graph for tensor slicing/reshaping. One compiled function is
+/// shared across all source layers with the same head configuration (15 layers
+/// for E2B). Mirrors Python `_get_compiled_pre_attn_source`.
+private enum CompiledPreAttnSource {
+    struct Key: Hashable { let nHeads: Int; let headDim: Int; let nKvHeads: Int }
+    nonisolated(unsafe) static var cache: [Key: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+
+    static func fn(nHeads: Int, headDim: Int, nKvHeads: Int) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        let key = Key(nHeads: nHeads, headDim: headDim, nKvHeads: nKvHeads)
+        if let cached = cache[key] { return cached }
+        let qd = nHeads * headDim
+        let kvd = nKvHeads * headDim
+        let f: @Sendable ([MLXArray]) -> [MLXArray] = compile { args in
+            let x = args[0]
+            let inputNormW = args[1]
+            let qkvWq = args[2]
+            let qkvScales = args[3]
+            let qkvBiases = args[4]
+            let qkvInS = args[5]
+            let qkvOutS = args[6]
+            let qNormW = args[7]
+            let kNormW = args[8]
+            let vNormW = args[9]
+            let ropeFreqs = args[10]
+            let offset = args[11]
+
+            var h = MLXFast.rmsNorm(x, weight: inputNormW, eps: kRMSEps).asType(.float32)
+            h = srqF32(h, qkvInS)
+            var qkv = quantizedMM(
+                h, qkvWq, scales: qkvScales, biases: qkvBiases,
+                transpose: true, groupSize: 128, bits: 4, mode: .affine)
+            qkv = srqF32(qkv, qkvOutS).asType(x.dtype)
+
+            let B = qkv.dim(0)
+            let L = qkv.dim(1)
+            var queries = qkv[.ellipsis, 0..<qd].reshaped(B, L, nHeads, headDim)
+            var keys = qkv[.ellipsis, qd..<(qd + kvd)].reshaped(B, L, nKvHeads, headDim)
+            var values = qkv[.ellipsis, (qd + kvd)..<qkv.dim(-1)].reshaped(B, L, nKvHeads, headDim)
+
+            queries = MLXFast.rmsNorm(queries, weight: qNormW, eps: kRMSEps)
+            keys = MLXFast.rmsNorm(keys, weight: kNormW, eps: kRMSEps)
+            values = MLXFast.rmsNorm(values, weight: vNormW, eps: kRMSEps)
+
+            keys = keys.transposed(0, 2, 1, 3)
+            keys = MLXFast.RoPE(keys, dimensions: headDim, traditional: false, base: nil, scale: 1.0, offset: offset, freqs: ropeFreqs)
+            values = values.transposed(0, 2, 1, 3)
+            queries = queries.transposed(0, 2, 1, 3)
+            queries = MLXFast.RoPE(queries, dimensions: headDim, traditional: false, base: nil, scale: 1.0, offset: offset, freqs: ropeFreqs)
+
+            return [queries, keys, values]
+        }
+        cache[key] = f
+        return f
+    }
+}
+
+/// Factory + cache for the compiled pre-attention segment of **KV-shared layers**
+/// (reuse earlier K/V, own only q_proj). Keyed by `(nHeads, headDim)`. Mirrors
+/// Python `_get_compiled_pre_attn_kvshared`.
+private enum CompiledPreAttnKvshared {
+    struct Key: Hashable { let nHeads: Int; let headDim: Int }
+    nonisolated(unsafe) static var cache: [Key: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+
+    static func fn(nHeads: Int, headDim: Int) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        let key = Key(nHeads: nHeads, headDim: headDim)
+        if let cached = cache[key] { return cached }
+        let f: @Sendable ([MLXArray]) -> [MLXArray] = compile { args in
+            let x = args[0]
+            let inputNormW = args[1]
+            let qWq = args[2]
+            let qScales = args[3]
+            let qBiases = args[4]
+            let qInS = args[5]
+            let qOutS = args[6]
+            let qNormW = args[7]
+            let ropeFreqs = args[8]
+            let offset = args[9]
+
+            var h = MLXFast.rmsNorm(x, weight: inputNormW, eps: kRMSEps).asType(.float32)
+            h = srqF32(h, qInS)
+            var q = quantizedMM(
+                h, qWq, scales: qScales, biases: qBiases,
+                transpose: true, groupSize: 128, bits: 4, mode: .affine)
+            q = srqF32(q, qOutS).asType(x.dtype)
+
+            let B = q.dim(0)
+            let L = q.dim(1)
+            var queries = q.reshaped(B, L, nHeads, headDim)
+            queries = MLXFast.rmsNorm(queries, weight: qNormW, eps: kRMSEps)
+            queries = queries.transposed(0, 2, 1, 3)
+            queries = MLXFast.RoPE(queries, dimensions: headDim, traditional: false, base: nil, scale: 1.0, offset: offset, freqs: ropeFreqs)
+
+            return [queries]
+        }
+        cache[key] = f
+        return f
+    }
+}
+
+/// Factory + cache for the compiled post-attention + MLP + PLE segment (all
+/// layers). Keyed by `(mlpBits, pleBits)` — the `quantizedMM` bit-width
+/// constants captured in the compiled graph. o_proj is always 4-bit (hardcoded).
+/// One compiled function is shared across all layers with the same bit combo.
+/// Mirrors Python `_get_compiled_post_attn_mlp_ple`.
+///
+/// Input array (38 elements): `[residual, attnOutput, perLayerInput,
+/// postAttnW, preFfW, postFfW, pleNormW, layerScalar,
+/// oWq, oScales, oBiases, oInS, oOutS,
+/// gateWq, gateScales, gateBiases, gateInS, gateOutS,
+/// upWq, upScales, upBiases, upInS, upOutS,
+/// downWq, downScales, downBiases, downInS, downOutS,
+/// pleGWq, pleGScales, pleGBiases, pleGInS, pleGOutS,
+/// plePWq, plePScales, plePBiases, plePInS, plePOutS]`.
+private enum CompiledPostAttn {
+    struct Key: Hashable { let mlpBits: Int; let pleBits: Int }
+    nonisolated(unsafe) static var cache: [Key: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+
+    static func fn(mlpBits: Int, pleBits: Int) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        let key = Key(mlpBits: mlpBits, pleBits: pleBits)
+        if let cached = cache[key] { return cached }
+        let f: @Sendable ([MLXArray]) -> [MLXArray] = compile { args in
+            let residual = args[0]
+            let attnOutput = args[1]
+            let perLayerInput = args[2]
+            let postAttnW = args[3]
+            let preFfW = args[4]
+            let postFfW = args[5]
+            let pleNormW = args[6]
+            let layerScalar = args[7]
+            let oWq = args[8], oScales = args[9], oBiases = args[10], oInS = args[11], oOutS = args[12]
+            let gateWq = args[13], gateScales = args[14], gateBiases = args[15], gateInS = args[16], gateOutS = args[17]
+            let upWq = args[18], upScales = args[19], upBiases = args[20], upInS = args[21], upOutS = args[22]
+            let downWq = args[23], downScales = args[24], downBiases = args[25], downInS = args[26], downOutS = args[27]
+            let pleGWq = args[28], pleGScales = args[29], pleGBiases = args[30], pleGInS = args[31], pleGOutS = args[32]
+            let plePWq = args[33], plePScales = args[34], plePBiases = args[35], plePInS = args[36], plePOutS = args[37]
+
+            let dt = attnOutput.dtype
+
+            // Post-attention: o_proj → norm → residual
+            var h = srqF32(attnOutput.asType(.float32), oInS)
+            h = quantizedMM(h, oWq, scales: oScales, biases: oBiases,
+                transpose: true, groupSize: 128, bits: 4, mode: .affine)
+            h = srqF32(h, oOutS).asType(dt)
+            h = MLXFast.rmsNorm(h, weight: postAttnW, eps: kRMSEps)
+            h = residual + h
+
+            // MLP: pre_ff_norm → gate/up → gelu → down → post_ff_norm → residual
+            var residual2 = h
+            h = MLXFast.rmsNorm(h, weight: preFfW, eps: kRMSEps).asType(.float32)
+            var gate = quantizedMM(srqF32(h, gateInS), gateWq, scales: gateScales, biases: gateBiases,
+                transpose: true, groupSize: 128, bits: mlpBits, mode: .affine)
+            gate = srqF32(gate, gateOutS).asType(dt)
+            var up = quantizedMM(srqF32(h, upInS), upWq, scales: upScales, biases: upBiases,
+                transpose: true, groupSize: 128, bits: mlpBits, mode: .affine)
+            up = srqF32(up, upOutS).asType(dt)
+            h = geluApproximate(gate) * up
+            h = h.asType(.float32)
+            var down = quantizedMM(srqF32(h, downInS), downWq, scales: downScales, biases: downBiases,
+                transpose: true, groupSize: 128, bits: mlpBits, mode: .affine)
+            down = srqF32(down, downOutS).asType(dt)
+            h = MLXFast.rmsNorm(down, weight: postFfW, eps: kRMSEps)
+            h = residual2 + h
+
+            // PLE: gate → gelu → multiply → proj → norm → residual
+            residual2 = h
+            h = h.asType(.float32)
+            var pleGate = quantizedMM(srqF32(h, pleGInS), pleGWq, scales: pleGScales, biases: pleGBiases,
+                transpose: true, groupSize: 128, bits: pleBits, mode: .affine)
+            pleGate = srqF32(pleGate, pleGOutS).asType(dt)
+            pleGate = geluApproximate(pleGate)
+            pleGate = pleGate * perLayerInput
+            pleGate = pleGate.asType(.float32)
+            var pleProj = quantizedMM(srqF32(pleGate, plePInS), plePWq, scales: plePScales, biases: plePBiases,
+                transpose: true, groupSize: 128, bits: pleBits, mode: .affine)
+            pleProj = srqF32(pleProj, plePOutS).asType(dt)
+            pleProj = MLXFast.rmsNorm(pleProj, weight: pleNormW, eps: kRMSEps)
+            h = residual2 + pleProj
+
+            h = h * layerScalar
+            return [h]
+        }
+        cache[key] = f
+        return f
+    }
 }
 
 // MARK: - Configuration
@@ -251,6 +462,22 @@ private class Gemma4Attention: Module {
     private var _fusedQKVReady = false
     private var _fusedQKVDisabled = false
 
+    // Precomputed RoPE frequencies for the native compiled path. Shape [headDim/2]
+    // with `inf` for non-rotated dims (full attention / ProportionalRoPE). Passed
+    // as an input to `MLXFast.RoPE` inside the compiled pre-attention segment.
+    // The Metal rope kernel computes `inv_freq = 1/freqs`, so `inf` → 0 → theta=0
+    // → identity (no rotation), matching the Python ProportionalRoPE._freqs approach.
+    private var _compiledRopeFreqs: MLXArray
+
+    // Fused native q/k/v weights for the compiled pre-attention segment (source
+    // layers only). Built lazily; concatenates q/k/v native (uint32) weights +
+    // per-row output SRQ scale. Mirrors Python `_build_fused_qkv_native`.
+    private var _fusedQKVNative: (
+        wq: MLXArray, scales: MLXArray, biases: MLXArray,
+        inS: MLXArray, outS: MLXArray
+    )?
+    private var _fusedQKVNativeReady = false
+
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         self.config = config
         self.layerIdx = layerIdx
@@ -312,7 +539,66 @@ private class Gemma4Attention: Module {
                 maxPositionEmbeddings: nil)
         }
 
+        // Precompute RoPE frequencies for the native compiled path.
+        // Sliding: base^(arange(0, dims, 2) / dims), shape [dims/2].
+        // Full (ProportionalRoPE): factor * base^(arange(0, rotatedDims, 2) / dims)
+        // padded with `inf` for non-rotated dims, shape [dims/2]. The `inf` freqs
+        // produce identity (no rotation) in the Metal rope kernel (inv_freq = 1/inf = 0).
+        if isSliding {
+            let exponents = MLXArray(
+                stride(from: 0, to: effectiveHeadDim, by: 2)
+            ).asType(.float32) / Float(effectiveHeadDim)
+            self._compiledRopeFreqs = MLX.pow(config.slidingRopeTheta, exponents)
+        } else {
+            let dims = effectiveHeadDim
+            let rotatedDims = 2 * Int(config.fullPartialRotaryFactor * Float(dims) / 2)
+            let ropeAngles = rotatedDims / 2
+            let nopeAngles = dims / 2 - ropeAngles
+            let exponents = MLXArray(
+                stride(from: 0, to: rotatedDims, by: 2)
+            ).asType(.float32) / Float(dims)
+            var freqs = MLX.pow(config.fullRopeTheta, exponents)
+            if nopeAngles > 0 {
+                let infPad = MLXArray.ones([nopeAngles], dtype: .float32) * Float.infinity
+                freqs = MLX.concatenated([freqs, infPad], axis: 0)
+            }
+            self._compiledRopeFreqs = freqs
+        }
+
         super.init()
+    }
+
+    /// Precomputed RoPE frequencies for the native compiled path.
+    var compiledRopeFreqs: MLXArray { _compiledRopeFreqs }
+
+    /// Build concatenated native-format q/k/v weights for the compiled pre-attention
+    /// segment (source layers only). Returns `(wq, scales, biases, inS, outS)`
+    /// where the weights are concatenated along the output dim and `outS` is a
+    /// per-row array (q/k/v rows may have different output SRQ scales). Mirrors
+    /// Python `_build_fused_qkv_native`.
+    func buildFusedQKVNative()
+        -> (wq: MLXArray, scales: MLXArray, biases: MLXArray,
+            inS: MLXArray, outS: MLXArray)?
+    {
+        if _fusedQKVNativeReady { return _fusedQKVNative }
+        guard let q = qProj as? GemmaQuantizedLinear,
+            let k = kProj as? GemmaQuantizedLinear,
+            let v = vProj as? GemmaQuantizedLinear,
+            let qArgs = q.nativeArgs(),
+            let kArgs = k.nativeArgs(),
+            let vArgs = v.nativeArgs()
+        else {
+            return nil
+        }
+        let wq = MLX.concatenated([qArgs.packed, kArgs.packed, vArgs.packed], axis: 0)
+        let scales = MLX.concatenated([qArgs.scales, kArgs.scales, vArgs.scales], axis: 0)
+        let biases = MLX.concatenated([qArgs.biases, kArgs.biases, vArgs.biases], axis: 0)
+        let inS = qArgs.inScale  // shared input SRQ scale
+        let outS = gemmaBuildPerRowOutputScale(q, k, v, dtype: .float32)
+        eval([wq, scales, biases, outS])
+        _fusedQKVNative = (wq, scales, biases, inS, outS)
+        _fusedQKVNativeReady = true
+        return _fusedQKVNative
     }
 
     /// Try fused q/k/v projection (single Metal kernel for all three). Returns
@@ -619,6 +905,19 @@ private class Gemma4TextExperts: Module {
     // Per-layer scalar
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
+    // Native compiled-path cache (Phase 6/7 port). Lazily extracted on the
+    // first forward pass; `nil` means the native path is not usable (MoE,
+    // non-gemma-quant, unaligned dims, no PLE) and the eager path is used.
+    private struct NativeArgs {
+        let isSource: Bool
+        let preFn: @Sendable ([MLXArray]) -> [MLXArray]
+        let preArgs: [MLXArray]
+        let postFn: @Sendable ([MLXArray]) -> [MLXArray]
+        let postArgs: [MLXArray]
+    }
+    private var _nativeArgs: NativeArgs?
+    private var _nativeArgsChecked = false
+
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         // _addRMSNorm bakes kRMSEps into its compiled graph. Catch a future
         // checkpoint that ships a different rms_norm_eps before it reaches
@@ -671,6 +970,99 @@ private class Gemma4TextExperts: Module {
         super.init()
     }
 
+    /// Lazily extract and cache native compiled-path arguments. Returns `nil` if
+    /// the native path is not usable (MoE, non-gemma-quantized, unaligned dims,
+    /// or no PLE). Mirrors Python `DecoderLayer._get_native_args`.
+    private func getNativeArgs() -> NativeArgs? {
+        if _nativeArgsChecked { return _nativeArgs }
+        _nativeArgsChecked = true
+
+        // Guard: no MoE, PLE present.
+        guard !enableMoE,
+            let pleGate = perLayerInputGate as? GemmaQuantizedLinear,
+            let pleProj = perLayerProjection as? GemmaQuantizedLinear,
+            let pleNorm = postPerLayerInputNorm
+        else { return nil }
+
+        let attn = selfAttn
+        let mlp = self.mlp
+
+        // Check all post-attention linears are gemma-quantized with aligned dims.
+        guard let oProj = attn.oProj as? GemmaQuantizedLinear,
+            let gateProj = mlp.gateProj as? GemmaQuantizedLinear,
+            let upProj = mlp.upProj as? GemmaQuantizedLinear,
+            let downProj = mlp.downProj as? GemmaQuantizedLinear,
+            let oArgs = oProj.nativeArgs(),
+            let gateArgs = gateProj.nativeArgs(),
+            let upArgs = upProj.nativeArgs(),
+            let downArgs = downProj.nativeArgs(),
+            let pleGArgs = pleGate.nativeArgs(),
+            let plePArgs = pleProj.nativeArgs()
+        else { return nil }
+
+        let isSource = attn.kProj != nil
+
+        // Pre-attention compiled function + args.
+        let preFn: @Sendable ([MLXArray]) -> [MLXArray]
+        let preArgs: [MLXArray]
+        if isSource {
+            guard let fused = attn.buildFusedQKVNative(),
+                let kNorm = attn.kNorm
+            else { return nil }
+            preFn = CompiledPreAttnSource.fn(
+                nHeads: attn.nHeads, headDim: attn.effectiveHeadDim,
+                nKvHeads: attn.nKvHeads)
+            // vNorm is RMSNormNoScale (no weight) — use ones.
+            let vNormW = MLXArray.ones(
+                [attn.effectiveHeadDim], dtype: attn.qNorm.weight.dtype)
+            preArgs = [
+                inputLayernorm.weight,
+                fused.wq, fused.scales, fused.biases, fused.inS, fused.outS,
+                attn.qNorm.weight, kNorm.weight, vNormW,
+                attn.compiledRopeFreqs,
+            ]
+        } else {
+            guard let qProj = attn.qProj as? GemmaQuantizedLinear,
+                let qArgs = qProj.nativeArgs()
+            else { return nil }
+            preFn = CompiledPreAttnKvshared.fn(
+                nHeads: attn.nHeads, headDim: attn.effectiveHeadDim)
+            preArgs = [
+                inputLayernorm.weight,
+                qArgs.packed, qArgs.scales, qArgs.biases, qArgs.inScale, qArgs.outScale,
+                attn.qNorm.weight,
+                attn.compiledRopeFreqs,
+            ]
+        }
+
+        // Post-attention compiled function + args.
+        let mlpBits = gateProj.numBits
+        let pleBits = pleGate.numBits
+        let postFn = CompiledPostAttn.fn(mlpBits: mlpBits, pleBits: pleBits)
+        let postArgs: [MLXArray] = [
+            postAttentionLayernorm.weight,
+            preFeedforwardLayernorm.weight,
+            postFeedforwardLayernorm.weight,
+            pleNorm.weight,
+            layerScalar,
+            // o_proj (always 4-bit)
+            oArgs.packed, oArgs.scales, oArgs.biases, oArgs.inScale, oArgs.outScale,
+            // MLP gate/up/down
+            gateArgs.packed, gateArgs.scales, gateArgs.biases, gateArgs.inScale, gateArgs.outScale,
+            upArgs.packed, upArgs.scales, upArgs.biases, upArgs.inScale, upArgs.outScale,
+            downArgs.packed, downArgs.scales, downArgs.biases, downArgs.inScale, downArgs.outScale,
+            // PLE gate/proj
+            pleGArgs.packed, pleGArgs.scales, pleGArgs.biases, pleGArgs.inScale, pleGArgs.outScale,
+            plePArgs.packed, plePArgs.scales, plePArgs.biases, plePArgs.inScale, plePArgs.outScale,
+        ]
+
+        let result = NativeArgs(
+            isSource: isSource, preFn: preFn, preArgs: preArgs,
+            postFn: postFn, postArgs: postArgs)
+        _nativeArgs = result
+        return result
+    }
+
     /// Run one decoder layer.
     ///
     /// Exposed at `@_spi(GemmaEncoder)` scope. Callers that do not use per-layer inputs,
@@ -684,6 +1076,128 @@ private class Gemma4TextExperts: Module {
         perLayerInput: MLXArray? = nil,
         sharedKV: Gemma4SharedKVState? = nil,
         positionOffset: RoPEOffset? = nil
+    ) -> (MLXArray, Gemma4SharedKVState, RoPEOffset?) {
+        let residual = x
+
+        // Native compiled path (Phase 6/7 port): compile the entire pre-attention
+        // and post-attention segments with native quantizedMM. KV cache + SDPA stay
+        // eager between the two compiled segments. Falls back to the eager path
+        // when the native path is not usable (MoE, non-gemma-quant, no PLE).
+        if Gemma4TextModel.useNativeCompiledPath,
+           let native = getNativeArgs(), let perLayerInput {
+            let (isSource, preFn, preArgs, postFn, postArgs) = (
+                native.isSource, native.preFn, native.preArgs,
+                native.postFn, native.postArgs)
+            let attn = selfAttn
+
+            // offset must be an MLXArray (not a bare Int) so `compile` treats it as
+            // a runtime input, not a compile-time constant. Otherwise precompilation
+            // (cache=nil → 0) and real generation (cache → N) compile different
+            // versions (Python Phase 7 bug).
+            //
+            // Capture the RoPEOffset BEFORE the cache update (the eager path reads
+            // `cache.ropeOffset` before `cache.update`, and returns it as
+            // `attnPositionOffset`). Reading after the update would give the
+            // post-update offset (e.g. 3 after a 3-token prefill) instead of the
+            // pre-update offset (0), corrupting RoPE for KV-shared layers.
+            let ropeOffset: RoPEOffset
+            if let cache = cache {
+                ropeOffset = cache.ropeOffset
+            } else if let positionOffset {
+                ropeOffset = positionOffset
+            } else {
+                ropeOffset = .scalar(0)
+            }
+            let offset = ropeOffsetToArray(ropeOffset)
+
+            let (B, L) = (x.dim(0), x.dim(1))
+            let attnOutput: MLXArray
+            let kvState: Gemma4SharedKVState
+
+            if isSource {
+                let preOut = preFn([x] + preArgs + [offset])
+                let queries = preOut[0]
+                let keys = preOut[1]
+                let values = preOut[2]
+
+                // KV cache update (eager — outside the compiled graph).
+                let updatedK: MLXArray
+                let updatedV: MLXArray
+                if let cache = cache {
+                    let (k, v) = cache.update(keys: keys, values: values)
+                    updatedK = k
+                    updatedV = v
+                } else {
+                    updatedK = keys
+                    updatedV = values
+                }
+                kvState = .regular(keys: updatedK, values: updatedV)
+
+                // Adjust mask if cache size differs from mask size.
+                var adjustedMask = mask
+                if case .array(let maskArray) = mask {
+                    let keysSeqLen = updatedK.dim(2)
+                    if maskArray.dim(-1) != keysSeqLen {
+                        adjustedMask = .array(maskArray[.ellipsis, 0 ..< keysSeqLen])
+                    }
+                }
+
+                let attnOut = MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: updatedK,
+                    values: updatedV,
+                    scale: attn.scale,
+                    mask: adjustedMask ?? .none
+                )
+                attnOutput = attnOut.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            } else {
+                let queries = preFn([x] + preArgs + [offset])[0]
+
+                // Use shared KV from the source layer.
+                guard let sharedKV else {
+                    // KV-shared layer without shared KV — shouldn't happen in normal
+                    // generation, but handle gracefully by falling back.
+                    return eagerCall(
+                        x, mask: mask, cache: cache, perLayerInput: perLayerInput,
+                        sharedKV: sharedKV, positionOffset: positionOffset)
+                }
+
+                switch sharedKV {
+                case .regular(let keys, let values):
+                    let attnOut = MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: keys, values: values,
+                        scale: attn.scale, mask: mask ?? .none)
+                    attnOutput = attnOut.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                    kvState = sharedKV
+                case .quantized:
+                    // Quantized shared KV — fall back to eager for now.
+                    return eagerCall(
+                        x, mask: mask, cache: cache, perLayerInput: perLayerInput,
+                        sharedKV: sharedKV, positionOffset: positionOffset)
+                }
+            }
+
+            // Post-attention compiled segment (o_proj + norms + MLP + PLE + layer_scalar).
+            let h = postFn([residual, attnOutput, perLayerInput] + postArgs)[0]
+
+            // Return the RoPEOffset captured BEFORE the cache update (matches the
+            // eager path's `attnPositionOffset`).
+            return (h, kvState, ropeOffset)
+        }
+
+        return eagerCall(x, mask: mask, cache: cache, perLayerInput: perLayerInput,
+            sharedKV: sharedKV, positionOffset: positionOffset)
+    }
+
+    /// The existing eager (non-compiled) forward path. Used as a fallback when
+    /// the native compiled path is not usable.
+    private func eagerCall(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode?,
+        cache: KVCache?,
+        perLayerInput: MLXArray?,
+        sharedKV: Gemma4SharedKVState?,
+        positionOffset: RoPEOffset?
     ) -> (MLXArray, Gemma4SharedKVState, RoPEOffset?) {
         let residual = x
 
@@ -920,6 +1434,10 @@ private class Gemma4TextExperts: Module {
 public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
+
+    /// Set to `false` to force the eager (non-compiled) decoder path for A/B
+    /// testing. Defaults to `true` (native compiled path enabled).
+    nonisolated(unsafe) public static var useNativeCompiledPath = true
 
     fileprivate let config: Gemma4TextConfiguration
     /// The text backbone, exposed at `@_spi(GemmaEncoder)` scope for client taps.
