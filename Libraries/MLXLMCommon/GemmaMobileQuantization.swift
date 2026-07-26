@@ -24,6 +24,15 @@ import Foundation
 import MLX
 import MLXNN
 
+// MARK: - Temporary profiling (stderr — unbuffered, always visible)
+
+/// Write a diagnostic line to stderr (unbuffered, always visible unlike `print`).
+/// Remove after performance optimisation is verified.
+private func gemmaQuantLog(_ message: String) {
+    let line = message + "\n"
+    FileHandle.standardError.write(Data(line.utf8))
+}
+
 // MARK: - JSON insertion-order recovery
 
 extension CodingUserInfoKey {
@@ -149,6 +158,18 @@ public func applySRQ(_ x: MLXArray, scale: MLXArray, bits: Int = 8) -> MLXArray 
     return MLX.where(calibrated, q, x)
 }
 
+/// Compiled SRQ for calibrated layers (scale != 0). Fuses the divide, round,
+/// clip, and multiply into a single Metal kernel via `MLX.compile`, cutting
+/// per-layer SRQ kernel launches from ~5 to 1. `shapeless: true` lets the same
+/// compiled kernel handle both prefill (batch > 1) and decode (batch = 1).
+private enum CompiledSRQ {
+    nonisolated(unsafe) static let apply: (MLXArray, MLXArray) -> MLXArray = MLX.compile(shapeless: true) {
+        (x, s) in
+        let st = s.asType(x.dtype)
+        return MLX.clip(MLX.round(x / st), min: -128, max: 127) * st
+    }
+}
+
 // MARK: - Weight / embedding dequantization
 
 /// Coerce a per-channel scale to a broadcastable `[..., 1]` shape.
@@ -203,6 +224,96 @@ public func dequantizeEmbeddingRows(
     let intsR = ints.reshaped(leadingShape + [numBlocks, blockSize])
     let scaled = intsR.asType(outDtype) * scales[.ellipsis, .newAxis].asType(outDtype)
     return scaled.reshaped(leadingShape + [-1])
+}
+
+// MARK: - Mobile → MLX uint32 conversion (fused quantizedMM path)
+
+/// Convert mobile packed weights to MLX's uint32 quantized format (group_size=128).
+///
+/// Returns `(packed, scales, biases)` for `quantizedMM`. The conversion is
+/// bit-exact: `dequantized(packed, scales: scales, biases: biases, groupSize: 128,
+/// bits: numBits)` equals `dequantizeWeight(weight, weightScale, numBits, inputDims)`.
+///
+/// Per-channel (one scale per output row) symmetric quantization maps to
+/// group_size=128 with the per-channel scale broadcast across all groups in a
+/// row and a constant bias of `-shift * scale` (where `shift` re-centers the
+/// signed int range to unsigned).
+///
+/// Requires `inputDims % 128 == 0` (MLX's smallest supported group_size).
+/// For int2/int4 the packed uint8 bytes already contain the shifted unsigned
+/// values (LSB-first within each byte), so 4 consecutive bytes map directly to
+/// 1 uint32 (little-endian) without unpacking.
+public func mobileToMLX(
+    weight: MLXArray,
+    weightScale: MLXArray,
+    numBits: Int,
+    inputDims: Int,
+    numBlocks: Int = 1
+) -> (packed: MLXArray, scales: MLXArray, biases: MLXArray) {
+    precondition(
+        inputDims % 128 == 0,
+        "inputDims must be divisible by 128 for group_size=128, got \(inputDims)")
+
+    let shift: Int
+    switch numBits {
+    case 2: shift = 2
+    case 4: shift = 8
+    case 8: shift = 128
+    default: fatalError("Unsupported numBits \(numBits); expected 2, 4, or 8.")
+    }
+
+    let nGroups = inputDims / 128
+    let outDims = weight.shape[0]
+
+    let packed: MLXArray
+    if numBits == 2 || numBits == 4 {
+        // Mobile uint8 bytes already hold the shifted unsigned values (LSB-first
+        // within each byte). MLX packs the same values LSB-first into uint32, so
+        // 4 consecutive bytes map directly to 1 uint32 (little-endian). Reshape
+        // to [out, n_uint32, 4] and combine with little-endian byte weights.
+        let nUint32 = weight.shape[1] / 4
+        let reshaped = weight.reshaped([outDims, nUint32, 4]).asType(.uint32)
+        let b0 = reshaped[.ellipsis, 0]
+        let b1 = reshaped[.ellipsis, 1]
+        let b2 = reshaped[.ellipsis, 2]
+        let b3 = reshaped[.ellipsis, 3]
+        packed = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+    } else {
+        // int8: shift signed to unsigned (+128), then pack 4 values per uint32.
+        let q = (weight.asType(.int32) + MLXArray(shift, dtype: .int32)).asType(.uint32)
+        let nUint32 = q.shape[1] / 4
+        let reshaped = q.reshaped([outDims, nUint32, 4])
+        let b0 = reshaped[.ellipsis, 0]
+        let b1 = reshaped[.ellipsis, 1]
+        let b2 = reshaped[.ellipsis, 2]
+        let b3 = reshaped[.ellipsis, 3]
+        packed = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+    }
+
+    // Per-group scales/biases.
+    let ws = weightScale.asType(.float32)
+    let scales: MLXArray
+    let biases: MLXArray
+    if numBlocks > 1 && ws.ndim >= 2 && ws.dim(-1) > 1 {
+        // Block-wise scales: [out, n_blocks] → broadcast each block to its groups.
+        let groupsPerBlock = inputDims / (numBlocks * 128)
+        precondition(
+            inputDims % (numBlocks * 128) == 0,
+            "inputDims must be divisible by numBlocks * 128 for block-wise scales")
+        let wsR = ws.reshaped([outDims, numBlocks, 1])
+        scales = broadcast(wsR, to: [outDims, numBlocks, groupsPerBlock])
+            .reshaped([outDims, nGroups])
+        let biasesR = (-Float(shift) * ws).reshaped([outDims, numBlocks, 1])
+        biases = broadcast(biasesR, to: [outDims, numBlocks, groupsPerBlock])
+            .reshaped([outDims, nGroups])
+    } else {
+        // Per-channel / per-row scales: [out, 1] or [out] or scalar.
+        let wsC = channelScale(ws)
+        scales = broadcast(wsC, to: [outDims, nGroups])
+        biases = broadcast(-Float(shift) * wsC, to: [outDims, nGroups])
+    }
+
+    return (packed, scales, biases)
 }
 
 // MARK: - Configuration
@@ -357,6 +468,153 @@ public func resolveModuleBits(path: String, config: GemmaMobileQuantizationConfi
     return config.numBits
 }
 
+// MARK: - Fused qmv Metal kernel (decode / small-batch)
+
+/// Two simdgroups (64 lanes) per threadgroup; each simdgroup computes
+/// `OUTPUTS_PER_SIMDGROUP` output rows, sharing the activation reads.
+private let gemmaQMVOutputsPerSimdgroup = 4
+private let gemmaQMVOutputsPerThreadgroup = 8  // 2 simdgroups × 4
+
+/// Metal source for the fused qmv (quantized matrix-vector) kernel.
+///
+/// Reads packed uint8/int8 weights + per-channel scale directly (never
+/// materializing the full fp weight) and fuses SRQ (input + output) into the
+/// kernel — eliminating separate SRQ kernel launches. Ported from the
+/// Python `_GEMMA_QMV_SOURCE` in gemma_mobile.py.
+///
+/// Placeholders (substituted at build time):
+/// - `VALUES_PER_BYTE` — 4 (int2), 2 (int4), 1 (int8)
+/// - `OUTPUTS_PER_SIMDGROUP` — 4
+/// - `OUTPUTS_PER_THREADGROUP` — 8
+/// - `OUTPUT_SCALE_PER_ROW` — false (standalone layers; true is for fused q/k/v)
+/// - `UNPACK_BLOCK` — bit-width-specific unpack + MAC snippet
+private let gemmaQMVSourceTemplate = """
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint input_row = threadgroup_position_in_grid.z;
+    uint input_dims = x_shape[1];
+    uint output_dims = weight_shape[0];
+    uint packed_in = weight_shape[1];
+    uint output_start = threadgroup_position_in_grid.y * OUTPUTS_PER_THREADGROUP
+        + simd_group * OUTPUTS_PER_SIMDGROUP;
+
+    // Input SRQ scale is scalar (shared across all output rows); 0.0 means
+    // uncalibrated → no-op. Output SRQ scale is scalar for standalone layers.
+    float in_s = static_cast<float>(input_scale[0]);
+
+    float accumulators[OUTPUTS_PER_SIMDGROUP] = {0.0f};
+    constexpr uint VALUES_PER_THREAD = 16;
+    constexpr uint BYTES_PER_THREAD = VALUES_PER_THREAD / VALUES_PER_BYTE;
+    constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
+
+    for (uint block_start = lane * VALUES_PER_THREAD;
+         block_start < input_dims;
+         block_start += BLOCK_SIZE) {
+        // Read + input-SRQ x values ONCE, shared across OUTPUTS_PER_SIMDGROUP rows.
+        float x_thread[VALUES_PER_THREAD];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+            float x_val = static_cast<float>(
+                x[input_row * input_dims + block_start + i]);
+            if (in_s != 0.0f) {
+                x_val = clamp(round(x_val / in_s), -128.0f, 127.0f) * in_s;
+            }
+            x_thread[i] = x_val;
+        }
+        uint packed_start = block_start / VALUES_PER_BYTE;
+        for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
+            uint output_row = output_start + row;
+            if (output_row >= output_dims) break;
+            float row_sum = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint b = 0; b < BYTES_PER_THREAD; ++b) {
+                UNPACK_BLOCK
+            }
+            accumulators[row] += row_sum;
+        }
+    }
+
+    for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
+        accumulators[row] = simd_sum(accumulators[row]);
+        uint output_row = output_start + row;
+        if (lane == 0 && output_row < output_dims) {
+            float result = accumulators[row] * static_cast<float>(weight_scale[output_row]);
+            float out_s = static_cast<float>(output_scale[0]);
+            if (out_s != 0.0f) {
+                result = clamp(round(result / out_s), -128.0f, 127.0f) * out_s;
+            }
+            out[input_row * output_dims + output_row] = static_cast<T>(result);
+        }
+    }
+"""
+
+/// Bit-width-specific Metal snippet that unpacks BYTES_PER_THREAD packed bytes
+/// and MACs into `row_sum`. Ported from Python `_gemma_unpack_block`.
+private func gemmaQMVUnpackBlock(numBits: Int) -> String {
+    switch numBits {
+    case 2:
+        return """
+                    uint byte = uint(weight[output_row * packed_in + packed_start + b]);
+                    row_sum += (float(byte & 0x3) - 2.0f) * x_thread[b * 4 + 0]
+                             + (float((byte >> 2) & 0x3) - 2.0f) * x_thread[b * 4 + 1]
+                             + (float((byte >> 4) & 0x3) - 2.0f) * x_thread[b * 4 + 2]
+                             + (float(byte >> 6) - 2.0f) * x_thread[b * 4 + 3];
+        """
+    case 4:
+        return """
+                    uint byte = uint(weight[output_row * packed_in + packed_start + b]);
+                    row_sum += (float(byte & 0xF) - 8.0f) * x_thread[b * 2 + 0]
+                             + (float(byte >> 4) - 8.0f) * x_thread[b * 2 + 1];
+        """
+    case 8:
+        return """
+                    int v = int(weight[output_row * packed_in + packed_start + b]);
+                    row_sum += float(v) * x_thread[b];
+        """
+    default:
+        fatalError("Unsupported numBits \(numBits); expected 2, 4, or 8.")
+    }
+}
+
+/// Build the qmv Metal kernel source for a given bit width by substituting the
+/// placeholders in the template.
+private func gemmaQMVSource(numBits: Int) -> String {
+    let valuesPerByte: Int
+    switch numBits {
+    case 2: valuesPerByte = 4
+    case 4: valuesPerByte = 2
+    case 8: valuesPerByte = 1
+    default: fatalError("Unsupported numBits \(numBits); expected 2, 4, or 8.")
+    }
+    return gemmaQMVSourceTemplate
+        .replacingOccurrences(of: "VALUES_PER_BYTE", with: "\(valuesPerByte)")
+        .replacingOccurrences(of: "OUTPUTS_PER_SIMDGROUP", with: "\(gemmaQMVOutputsPerSimdgroup)")
+        .replacingOccurrences(of: "OUTPUTS_PER_THREADGROUP", with: "\(gemmaQMVOutputsPerThreadgroup)")
+        .replacingOccurrences(of: "OUTPUT_SCALE_PER_ROW", with: "false")
+        .replacingOccurrences(of: "UNPACK_BLOCK", with: gemmaQMVUnpackBlock(numBits: numBits))
+}
+
+/// Cache of compiled qmv kernels keyed by numBits. Metal kernel compilation is
+/// expensive (~ms), so we compile once and reuse. `nonisolated(unsafe)`:
+/// single-threaded inference context, no data races.
+private enum GemmaQMVKernelCache {
+    nonisolated(unsafe) static var cache: [Int: MLXFast.MLXFastKernel] = [:]
+
+    static func kernel(numBits: Int) -> MLXFast.MLXFastKernel {
+        if let cached = cache[numBits] {
+            return cached
+        }
+        let kernel = MLXFast.metalKernel(
+            name: "gemma_mobile_qmv_b\(numBits)",
+            inputNames: ["x", "weight", "weight_scale", "input_scale", "output_scale"],
+            outputNames: ["out"],
+            source: gemmaQMVSource(numBits: numBits),
+            header: "#include <metal_simdgroup>\nusing namespace metal;")
+        cache[numBits] = kernel
+        return kernel
+    }
+}
+
 // MARK: - Quantized layers
 
 /// Linear with packed int2/4/8 per-channel weights and SRQ activations.
@@ -372,6 +630,23 @@ public final class GemmaQuantizedLinear: Linear {
     @ParameterInfo(key: "weight_scale") public var weightScale: MLXArray
     @ParameterInfo(key: "input_activation_scale") public var inputActivationScale: MLXArray
     @ParameterInfo(key: "output_activation_scale") public var outputActivationScale: MLXArray
+
+    // Converted MLX uint32 format (lazily computed on first forward pass so the
+    // fused quantizedMM Metal kernel can be used instead of dequant-on-forward).
+    // Prefixed with `_` so MLX's Module reflection does not discover them as
+    // parameters (parameterIsValid filters keys starting with `_`).
+    private var _mlxWeight: MLXArray?
+    private var _mlxScales: MLXArray?
+    private var _mlxBiases: MLXArray?
+    private var _conversionDone = false
+    private var _needsInputSRQ = true
+    private var _needsOutputSRQ = true
+
+    // Temporary profiling counters (remove after optimisation is verified).
+    // nonisolated(unsafe): single-threaded inference context, no data races.
+    private nonisolated(unsafe) static var conversionCount = 0
+    private nonisolated(unsafe) static var totalConversionTime: TimeInterval = 0
+    private nonisolated(unsafe) static var callLogCount = 0
 
     public init(inputDims: Int, outputDims: Int, numBits: Int, bias: Bool = false) {
         let packedIn: Int
@@ -393,14 +668,145 @@ public final class GemmaQuantizedLinear: Linear {
         self.freeze()
     }
 
+    /// Lazily convert packed mobile weights to MLX uint32 format on the first
+    /// forward pass, and cache whether SRQ scales are non-zero (skip the no-op
+    /// `applySRQ` graph construction entirely for uncalibrated layers).
+    private func convertToMLXFormat() {
+        // SRQ scales are scalar (shape []); read the value to decide whether to
+        // skip the SRQ pass entirely. Only lm_head has zero scales (uncalibrated).
+        let inScale = inputActivationScale.asType(.float32).item(Float.self)
+        let outScale = outputActivationScale.asType(.float32).item(Float.self)
+        _needsInputSRQ = inScale != 0
+        _needsOutputSRQ = outScale != 0
+
+        // Convert to uint32 format for the fused quantizedMM kernel. Falls back
+        // to dequant-on-forward if inputDims is not aligned to group_size=128.
+        if inputDims % 128 == 0 {
+            let t0 = Date()
+            let (packed, scales, biases) = mobileToMLX(
+                weight: weight, weightScale: weightScale,
+                numBits: numBits, inputDims: inputDims)
+            eval([packed, scales, biases])
+            _mlxWeight = packed
+            _mlxScales = scales
+            _mlxBiases = biases
+
+            let dt = Date().timeIntervalSince(t0)
+            GemmaQuantizedLinear.conversionCount += 1
+            GemmaQuantizedLinear.totalConversionTime += dt
+            let n = GemmaQuantizedLinear.conversionCount
+            if n <= 10 || n % 100 == 0 {
+                gemmaQuantLog(
+                    "[GemmaQuant] convert #\(n): bits=\(numBits) in=\(inputDims) "
+                    + "out=\(weight.shape[0]) \(String(format: "%.1f", dt * 1000))ms "
+                    + "inSRQ=\(_needsInputSRQ) outSRQ=\(_needsOutputSRQ)"
+                    + (n % 100 == 0 ? " total=\(String(format: "%.2f", GemmaQuantizedLinear.totalConversionTime))s" : ""))
+            }
+        } else {
+            gemmaQuantLog(
+                "[GemmaQuant] FALLBACK (inDims % 128 != 0): bits=\(numBits) in=\(inputDims)")
+        }
+    }
+
+    /// Whether the fused qmv kernel can be used for this layer and batch size.
+    /// Requires batch ≤ 16 and aligned input dims (÷512 for int2/int4, ÷16 for int8).
+    private func canUseQMV(batchSize: Int) -> Bool {
+        guard batchSize <= 16 else { return false }
+        if numBits == 8 { return inputDims % 16 == 0 }
+        return inputDims % 512 == 0  // int2, int4
+    }
+
+    /// Fused qmv matmul: reads packed weights + per-channel scale directly,
+    /// fusing SRQ into the kernel. No dequant, no separate SRQ kernel launches.
+    private func qmvCall(_ x: MLXArray) -> MLXArray {
+        let kernel = GemmaQMVKernelCache.kernel(numBits: numBits)
+        let outputDims = weight.shape[0]
+        let outputShape = Array(x.shape.dropLast()) + [outputDims]
+        let x2d = x.reshaped([-1, inputDims])
+        let batch = x2d.shape[0]
+
+        // SRQ scales are scalar (shape []); reshape to [1] for the kernel.
+        let inS = inputActivationScale.reshaped([1]).asType(x.dtype)
+        let outS = outputActivationScale.reshaped([1]).asType(x.dtype)
+
+        let out = kernel(
+            [x2d, weight, weightScale, inS, outS],
+            template: [("T", x.dtype)],
+            grid: (64, (outputDims + gemmaQMVOutputsPerThreadgroup - 1) / gemmaQMVOutputsPerThreadgroup, batch),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[batch * outputDims]],
+            outputDTypes: [x.dtype]
+        )[0]
+
+        return out.reshaped(outputShape)
+    }
+
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let xi = applySRQ(x, scale: inputActivationScale)
-        let w = dequantizeWeight(
-            weight, weightScale: weightScale, numBits: numBits, inputDims: inputDims,
-            dtype: xi.dtype)
-        var out = matmul(xi, w.T)
-        out = applySRQ(out, scale: outputActivationScale)
+        let batchSize = x.shape.dropLast().reduce(1, *)
+
+        let shouldLog = GemmaQuantizedLinear.callLogCount < 20
+        if shouldLog { GemmaQuantizedLinear.callLogCount += 1 }
+        let logIdx = GemmaQuantizedLinear.callLogCount
+        let t0 = shouldLog ? Date() : nil
+
+        // Fast path: fused qmv kernel for decode/small-batch with aligned dims.
+        // Reads packed uint8/int8 weights + per-channel scale directly, fusing
+        // SRQ into the kernel — no dequant, no separate SRQ kernel launches.
+        let matmulOut: MLXArray
+        let path: String
+        if canUseQMV(batchSize: batchSize) {
+            matmulOut = qmvCall(x)
+            path = "qmv"
+        } else {
+            // Fallback: quantizedMM + compiled SRQ for prefill (batch > 16) or
+            // unaligned dims.
+            if !_conversionDone {
+                convertToMLXFormat()
+                _conversionDone = true
+            }
+
+            // Input SRQ (skip entirely if uncalibrated — avoids building a no-op graph).
+            // Uses the compiled (fused) SRQ kernel for calibrated layers.
+            var xi = x
+            if _needsInputSRQ {
+                xi = CompiledSRQ.apply(xi, inputActivationScale)
+            }
+
+            // Fused quantized matmul (Metal kernel) when conversion succeeded;
+            // otherwise fall back to dequant-on-forward.
+            if let mw = _mlxWeight {
+                matmulOut = quantizedMM(
+                    xi, mw, scales: _mlxScales!, biases: _mlxBiases!,
+                    transpose: true, groupSize: 128, bits: numBits, mode: .affine)
+                path = "qmm"
+            } else {
+                let w = dequantizeWeight(
+                    weight, weightScale: weightScale, numBits: numBits,
+                    inputDims: inputDims, dtype: xi.dtype)
+                matmulOut = matmul(xi, w.T)
+                path = "dequant"
+            }
+        }
+
+        // Output SRQ (skip if uncalibrated). For the qmv path, output SRQ is
+        // already fused into the kernel, so skip the separate CompiledSRQ call.
+        var out = matmulOut
+        if path != "qmv" && _needsOutputSRQ {
+            out = CompiledSRQ.apply(out, outputActivationScale)
+        }
+
         if let bias { out = out + bias }
+
+        if shouldLog, let t0 {
+            // Force evaluation to measure actual GPU compute time for this call.
+            eval(out)
+            let dt = Date().timeIntervalSince(t0)
+            gemmaQuantLog(
+                "[GemmaQuant] call #\(logIdx): \(path) bits=\(numBits) "
+                + "in=\(inputDims) out=\(weight.shape[0]) "
+                + "x=\(x.shape) \(String(format: "%.2f", dt * 1000))ms")
+        }
+
         return out
     }
 
@@ -428,6 +834,14 @@ public final class GemmaQuantizedEmbedding: Embedding {
 
     @ParameterInfo(key: "embedding_scale") public var embeddingScale: MLXArray
 
+    // Converted MLX uint32 format (lazily computed on first forward pass so the
+    // fused dequantized/quantizedMM Metal kernels can be used). Prefixed with
+    // `_` so MLX's Module reflection does not discover them as parameters.
+    private var _mlxWeight: MLXArray?
+    private var _mlxScales: MLXArray?
+    private var _mlxBiases: MLXArray?
+    private var _conversionDone = false
+
     public init(numEmbeddings: Int, embeddingDim: Int, numBits: Int, numBlocks: Int = 1) {
         let packedDim: Int
         let wDtype: DType
@@ -445,7 +859,54 @@ public final class GemmaQuantizedEmbedding: Embedding {
         self.freeze()
     }
 
+    /// Lazily convert packed mobile table to MLX uint32 format on the first
+    /// forward pass. Both per-row (numBlocks == 1) and block-wise (numBlocks > 1)
+    /// scales are supported; only non-aligned dims (embeddingDim % 128 != 0)
+    /// fall back to the dequant-on-forward path.
+    private func convertToMLXFormat() {
+        // Per-row scales (numBlocks == 1) and block-wise scales (numBlocks > 1)
+        // are both handled by mobileToMLX. Only non-aligned dims fall back.
+        if embeddingDim % 128 == 0 {
+            let t0 = Date()
+            let (packed, scales, biases) = mobileToMLX(
+                weight: weight, weightScale: embeddingScale,
+                numBits: numBits, inputDims: embeddingDim,
+                numBlocks: numBlocks)
+            eval([packed, scales, biases])
+            _mlxWeight = packed
+            _mlxScales = scales
+            _mlxBiases = biases
+            gemmaQuantLog(
+                "[GemmaQuant] embed convert: bits=\(numBits) dim=\(embeddingDim) "
+                + "numEmb=\(weight.shape[0]) blocks=\(numBlocks) "
+                + "\(String(format: "%.1f", Date().timeIntervalSince(t0) * 1000))ms")
+        } else {
+            gemmaQuantLog(
+                "[GemmaQuant] embed FALLBACK: bits=\(numBits) dim=\(embeddingDim) "
+                + "numBlocks=\(numBlocks) dim%128=\(embeddingDim % 128)")
+        }
+    }
+
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if !_conversionDone {
+            convertToMLXFormat()
+            _conversionDone = true
+        }
+
+        if let mw = _mlxWeight {
+            // Fast path: fused dequantized kernel on gathered uint32 rows.
+            // Cast to the original scale dtype (e.g. bfloat16) to match the
+            // dequant-on-forward path's output precision.
+            let s = x.shape
+            let xFlat = x.flattened()
+            let out = dequantized(
+                mw[xFlat], scales: _mlxScales![xFlat], biases: _mlxBiases![xFlat],
+                groupSize: 128, bits: numBits, mode: .affine,
+                dtype: embeddingScale.dtype)
+            return out.reshaped(s + [-1])
+        }
+
+        // Fallback: dequant-on-forward for block-wise scales or non-aligned dims.
         let rows = weight[x]
         let scales = embeddingScale[x]
         return dequantizeEmbeddingRows(
@@ -454,6 +915,19 @@ public final class GemmaQuantizedEmbedding: Embedding {
     }
 
     public override func asLinear(_ x: MLXArray) -> MLXArray {
+        if !_conversionDone {
+            convertToMLXFormat()
+            _conversionDone = true
+        }
+
+        if let mw = _mlxWeight {
+            // Fast path: fused quantizedMM kernel.
+            return quantizedMM(
+                x, mw, scales: _mlxScales!, biases: _mlxBiases!,
+                transpose: true, groupSize: 128, bits: numBits, mode: .affine)
+        }
+
+        // Fallback: dequant-on-forward for block-wise scales or non-aligned dims.
         let w = dequantizeEmbeddingRows(
             weight, scales: embeddingScale, numBits: numBits, embeddingDim: embeddingDim,
             numBlocks: numBlocks)
