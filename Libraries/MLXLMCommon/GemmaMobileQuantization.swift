@@ -855,14 +855,6 @@ public final class GemmaQuantizedEmbedding: Embedding {
 
     @ParameterInfo(key: "embedding_scale") public var embeddingScale: MLXArray
 
-    // Converted MLX uint32 format (lazily computed on first forward pass so the
-    // fused dequantized/quantizedMM Metal kernels can be used). Prefixed with
-    // `_` so MLX's Module reflection does not discover them as parameters.
-    private var _mlxWeight: MLXArray?
-    private var _mlxScales: MLXArray?
-    private var _mlxBiases: MLXArray?
-    private var _conversionDone = false
-
     public init(numEmbeddings: Int, embeddingDim: Int, numBits: Int, numBlocks: Int = 1) {
         let packedDim: Int
         let wDtype: DType
@@ -880,45 +872,14 @@ public final class GemmaQuantizedEmbedding: Embedding {
         self.freeze()
     }
 
-    /// Lazily convert packed mobile table to MLX uint32 format on the first
-    /// forward pass. Both per-row (numBlocks == 1) and block-wise (numBlocks > 1)
-    /// scales are supported; only non-aligned dims (embeddingDim % 128 != 0)
-    /// fall back to the dequant-on-forward path.
-    private func convertToMLXFormat() {
-        // Per-row scales (numBlocks == 1) and block-wise scales (numBlocks > 1)
-        // are both handled by mobileToMLX. Only non-aligned dims fall back.
-        if embeddingDim % 128 == 0 {
-            let (packed, scales, biases) = mobileToMLX(
-                weight: weight, weightScale: embeddingScale,
-                numBits: numBits, inputDims: embeddingDim,
-                numBlocks: numBlocks)
-            eval([packed, scales, biases])
-            _mlxWeight = packed
-            _mlxScales = scales
-            _mlxBiases = biases
-        }
-    }
+    // Embeddings use dequantize-on-forward (gather + unpack + scale) rather than
+    // mobileToMLX conversion. The conversion would create a 4× uint32 copy of the
+    // full table (~4.5 GB for embed_tokens_per_layer at 262144×8960 int4), causing
+    // a large memory spike on the first prompt. Dequant-on-forward only gathers
+    // and unpacks the requested rows (batch ≤ seq_len), which is tiny by
+    // comparison and fast enough since embeddings are looked up per-token.
 
     public override func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if !_conversionDone {
-            convertToMLXFormat()
-            _conversionDone = true
-        }
-
-        if let mw = _mlxWeight {
-            // Fast path: fused dequantized kernel on gathered uint32 rows.
-            // Cast to the original scale dtype (e.g. bfloat16) to match the
-            // dequant-on-forward path's output precision.
-            let s = x.shape
-            let xFlat = x.flattened()
-            let out = dequantized(
-                mw[xFlat], scales: _mlxScales![xFlat], biases: _mlxBiases![xFlat],
-                groupSize: 128, bits: numBits, mode: .affine,
-                dtype: embeddingScale.dtype)
-            return out.reshaped(s + [-1])
-        }
-
-        // Fallback: dequant-on-forward for block-wise scales or non-aligned dims.
         let rows = weight[x]
         let scales = embeddingScale[x]
         return dequantizeEmbeddingRows(
@@ -927,19 +888,6 @@ public final class GemmaQuantizedEmbedding: Embedding {
     }
 
     public override func asLinear(_ x: MLXArray) -> MLXArray {
-        if !_conversionDone {
-            convertToMLXFormat()
-            _conversionDone = true
-        }
-
-        if let mw = _mlxWeight {
-            // Fast path: fused quantizedMM kernel.
-            return quantizedMM(
-                x, mw, scales: _mlxScales!, biases: _mlxBiases!,
-                transpose: true, groupSize: 128, bits: numBits, mode: .affine)
-        }
-
-        // Fallback: dequant-on-forward for block-wise scales or non-aligned dims.
         let w = dequantizeEmbeddingRows(
             weight, scales: embeddingScale, numBits: numBits, embeddingDim: embeddingDim,
             numBlocks: numBlocks)
