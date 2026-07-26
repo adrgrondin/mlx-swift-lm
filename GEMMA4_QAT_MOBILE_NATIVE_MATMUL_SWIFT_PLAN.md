@@ -27,7 +27,7 @@ SDPA, one compiled post-attention graph).
 | Phase 2 — Compiled pre-attention | ✅ DONE | `CompiledPreAttnSource`, `CompiledPreAttnKvshared` factory + cache. |
 | Phase 3 — Compiled post-attention | ✅ DONE | `CompiledPostAttn` factory + cache (38-element input). |
 | Phase 4 — Wire into decoder layer | ✅ DONE | `getNativeArgs()`, native compiled path, `eagerCall` fallback, `useNativeCompiledPath` A/B flag. **A/B equivalence test PASSES** (mean abs diff 0.30, 2/32 argmax mismatches). |
-| Phase 5 — Load-time precompilation | ⬜ Not started | Weight freeing + hybrid compile strategy. |
+| Phase 5 — Load-time precompilation | ✅ DONE | `NativePrecompilable` protocol + `loadWeights` hook; `precompileNativeFunctions` (layer-by-layer convert + free + hybrid compile: full pass ≤ 32, direct call > 32); `freeMobileWeights`; `precompileAtLoad` A/B flag. **2 new tests pass**: weight freeing + prefill stability (real model), no-op for unaligned dims (tiny model). |
 | Phase 6 — Benchmark | ⬜ Not started | Decode/prefill tok/s, peak memory. |
 
 ### Root cause of the A/B test failure (resolved)
@@ -628,7 +628,7 @@ averages, note variance, and don't claim improvements without evidence.
 3. ✅ **Phase 2** — Compiled pre-attention (source + KV-shared) factory + cache.
 4. ✅ **Phase 3** — Compiled post-attention factory + cache.
 5. ✅ **Phase 4** — `getNativeArgs()` + native path in `Gemma4DecoderLayer.callAsFunction` + A/B fix (float32 SRQ).
-6. ⬜ **Phase 5** — Load-time precompilation + weight freeing + load hook.
+6. ✅ **Phase 5** — Load-time precompilation + weight freeing + load hook (`NativePrecompilable` protocol, `precompileNativeFunctions`, `freeMobileWeights`, `precompileAtLoad` A/B flag).
 7. ⬜ **Phase 6** — Benchmark, validate, cross-check with Python.
 
 ---

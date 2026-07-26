@@ -144,6 +144,19 @@ extension Gemma4Model: ModelComponentsProviding {
     }
 }
 
+// MARK: - Load-time precompilation (Phase 5)
+
+extension Gemma4Model: NativePrecompilable {
+    /// Precompile native compiled functions and free mobile-format weights.
+    ///
+    /// Forwards to the wrapped `Gemma4TextModel`, which honors
+    /// `Gemma4TextModel.precompileAtLoad`. Called by `loadWeights` after weights
+    /// are loaded and modules are replaced.
+    public func precompileNativeFunctions() {
+        languageModel.precompileNativeFunctions()
+    }
+}
+
 // MARK: - LoRA
 
 extension Gemma4Model: LoRAModel {
