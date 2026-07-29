@@ -106,6 +106,133 @@ struct Gemma4UnifiedTests {
         #expect(config.visionConfiguration?.modelPatchSize == 48)
     }
 
+    @Test("Public 12B QAT config decodes as unified Gemma 4")
+    func public12BQATConfigCompatibility() throws {
+        // Architecture-critical fields from mlx-community/gemma-4-12B-it-qat-4bit.
+        let json =
+            """
+            {
+              "model_type": "gemma4_unified",
+              "image_token_id": 258880,
+              "audio_token_id": 258881,
+              "video_token_id": 258884,
+              "boi_token_id": 255999,
+              "eoi_token_id": 258882,
+              "eoa_token_index": 258883,
+              "tie_word_embeddings": true,
+              "quantization": {
+                "group_size": 64,
+                "bits": 4,
+                "mode": "affine",
+                "language_model.model.layers.0.mlp.gate_proj": {
+                  "group_size": 64,
+                  "bits": 8
+                }
+              },
+              "text_config": {
+                "model_type": "gemma4_unified_text",
+                "hidden_size": 3840,
+                "num_hidden_layers": 48,
+                "intermediate_size": 15360,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "num_global_key_value_heads": 1,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "vocab_size": 262144,
+                "vocab_size_per_layer_input": 0,
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+                "sliding_window": 1024,
+                "max_position_embeddings": 262144,
+                "final_logit_softcapping": 30.0,
+                "attention_k_eq_v": true,
+                "use_bidirectional_attention": "vision",
+                "rope_parameters": {
+                  "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional"
+                  },
+                  "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "rope_type": "default"
+                  }
+                },
+                "use_double_wide_mlp": false,
+                "enable_moe_block": false,
+                "tie_word_embeddings": true
+              },
+              "vision_config": {
+                "model_type": "gemma4_unified_vision",
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "mm_embed_dim": 3840,
+                "mm_posemb_size": 1120,
+                "output_proj_dims": 3840
+              },
+              "audio_config": {
+                "model_type": "gemma4_unified_audio",
+                "audio_embed_dim": 640,
+                "rms_norm_eps": 0.000001
+              }
+            }
+            """
+        let config = try decodeConfig(json)
+        let baseConfig = try JSONDecoder.json5().decode(
+            BaseConfiguration.self, from: Data(json.utf8))
+
+        let text = config.textConfiguration
+        #expect(config.modelType == "gemma4_unified")
+        #expect(config.quantization?.groupSize == 64)
+        #expect(config.quantization?.bits == 4)
+        #expect(config.quantization?.mode == .affine)
+        #expect(
+            baseConfig.perLayerQuantization?.quantization(
+                layer: "language_model.model.layers.0.mlp.gate_proj")?.bits == 8)
+        #expect(
+            baseConfig.perLayerQuantization?.quantization(
+                layer: "language_model.model.layers.0.self_attn.q_proj")?.bits == 4)
+        #expect(config.tieWordEmbeddings && text.tieWordEmbeddings)
+        #expect(text.modelType == "gemma4_unified_text")
+        #expect(text.hiddenSize == 3840)
+        #expect(text.hiddenLayers == 48)
+        #expect(text.intermediateSize == 15_360)
+        #expect(text.attentionHeads == 16)
+        #expect(text.kvHeads == 8)
+        #expect(text.globalKVHeads == 1)
+        #expect(text.attentionKEqV)
+        #expect(text.numKVSharedLayers == 0)
+        #expect(text.hiddenSizePerLayerInput == 0)
+        #expect(text.maxPositionEmbeddings == 262_144)
+        #expect(text.finalLogitSoftcapping == 30.0)
+        #expect(text.useBidirectionalAttention == "vision")
+        #expect(
+            text.ropeParameters["full_attention"]?["partial_rotary_factor"]?.asFloat() == 0.25)
+        #expect(!text.useDoubleWideMLP)
+        #expect(!text.enableMoEBlock)
+        #expect(text.layerTypes.count == 48)
+        #expect(
+            text.layerTypes.enumerated().compactMap { index, type in
+                type == "full_attention" ? index : nil
+            } == [5, 11, 17, 23, 29, 35, 41, 47])
+    }
+
+    @Test("Unified topology is driven by K=V, PLE, and MoE configuration")
+    func unifiedUsesConfiguredTopology() throws {
+        let model = Gemma4Unified(try tinyTextConfig())
+        let layer = try #require(
+            model.loraLayers.compactMap { $0 as? Gemma4TextDecoderLayer }.first)
+
+        #expect(layer.selfAttention.useKEqV)
+        #expect(layer.selfAttention.vProj == nil)
+        #expect(!layer.enableMoE)
+        #expect(layer.router == nil)
+        #expect(layer.experts == nil)
+        #expect(layer.perLayerInputGate == nil)
+        #expect(layer.perLayerProjection == nil)
+    }
+
     @Test("Gemma4 Unified text-only prepare chunks prefill")
     func textOnlyPrepareChunksPrefill() throws {
         let model = Gemma4Unified(try tinyTextConfig())
