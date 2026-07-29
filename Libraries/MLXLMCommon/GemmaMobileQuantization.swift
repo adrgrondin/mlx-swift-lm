@@ -557,7 +557,8 @@ private let gemmaQMVSourceTemplate = """
         uint output_row = output_start + row;
         if (lane == 0 && output_row < output_dims) {
             float result = accumulators[row] * static_cast<float>(weight_scale[output_row]);
-            float out_s = static_cast<float>(output_scale[0]);
+            uint output_scale_row = OUTPUT_SCALE_PER_ROW ? output_row : 0;
+            float out_s = static_cast<float>(output_scale[output_scale_row]);
             if (out_s != 0.0f) {
                 result = clamp(round(result / out_s), -128.0f, 127.0f) * out_s;
             }
