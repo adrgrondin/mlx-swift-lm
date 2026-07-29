@@ -74,6 +74,44 @@ struct Gemma4MobileIntegrationTests {
         """
     }
 
+    @Test("Native precompile covers E2B source/shared and sliding/full signatures")
+    func nativePrecompileCoverage() {
+        typealias Signature = Gemma4NativePrecompile.LayerSignature
+
+        // Official E2B: source layers 0-14 use 4-bit MLPs, shared layers
+        // 15-34 use 2-bit MLPs, and both groups contain 256-dim sliding and
+        // 512-dim full attention.
+        let signatures: [Signature] = [
+            .init(
+                preAttention: .source(nHeads: 8, headDim: 256, nKvHeads: 1),
+                postAttention: .init(
+                    mlpBits: 4, pleBits: 8, attentionOutputDimension: 2048)),
+            // Duplicate source/sliding layer must not trigger another warm-up.
+            .init(
+                preAttention: .source(nHeads: 8, headDim: 256, nKvHeads: 1),
+                postAttention: .init(
+                    mlpBits: 4, pleBits: 8, attentionOutputDimension: 2048)),
+            .init(
+                preAttention: .source(nHeads: 8, headDim: 512, nKvHeads: 1),
+                postAttention: .init(
+                    mlpBits: 4, pleBits: 8, attentionOutputDimension: 4096)),
+            .init(
+                preAttention: .kvShared(nHeads: 8, headDim: 256),
+                postAttention: .init(
+                    mlpBits: 2, pleBits: 8, attentionOutputDimension: 2048)),
+            .init(
+                preAttention: .kvShared(nHeads: 8, headDim: 512),
+                postAttention: .init(
+                    mlpBits: 2, pleBits: 8, attentionOutputDimension: 4096)),
+        ]
+
+        let representatives = Gemma4NativePrecompile.representativeIndices(
+            for: signatures)
+        #expect(representatives.preAttention == [0, 2, 3, 4])
+        #expect(representatives.postAttention == [0, 2, 3, 4])
+        #expect(Gemma4NativePrecompile.defaultSequenceLengths == [1, 16, 32, 64, 128, 256, 512])
+    }
+
     @Test("Gemma 4 mobile checkpoint loads with quantized layers and runs")
     func loadsAndRunsMobileCheckpoint() throws {
         MLXRandom.seed(0)
