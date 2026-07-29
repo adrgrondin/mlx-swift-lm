@@ -229,6 +229,66 @@ struct Gemma4MobileQuantizationTests {
             mlxOut.asArray(Float.self), refOut.asArray(Float.self), tolerance: 1e-6)
     }
 
+    // MARK: - Fused QKV projection
+
+    @Test("Fused QKV applies each projection's output scale")
+    func fusedQKVUsesPerRowOutputScale() throws {
+        // The official E2B attention projections are int4 and use distinct Q
+        // versus K/V output SRQ scales. Batch 1 forces the same QMV kernel used
+        // by the default VLM decode path.
+        let inputDims = 512
+        let outputDims = 8
+
+        func makeProjection(outputScale: Float) -> GemmaQuantizedLinear {
+            let projection = GemmaQuantizedLinear(
+                inputDims: inputDims, outputDims: outputDims, numBits: 4)
+            // 0x99 unpacks to two int4 values of +1. With every input equal to
+            // 5.3 / 512, each unrounded output is approximately 5.3.
+            projection.weight._updateInternal(
+                MLXArray(
+                    [UInt8](repeating: 0x99, count: outputDims * inputDims / 2),
+                    [outputDims, inputDims / 2]
+                )
+            )
+            projection.weightScale._updateInternal(
+                MLXArray([Float](repeating: 1, count: outputDims), [outputDims, 1]))
+            projection.inputActivationScale._updateInternal(MLXArray(Float(0)))
+            projection.outputActivationScale._updateInternal(MLXArray(outputScale))
+            eval(projection)
+            return projection
+        }
+
+        let q = makeProjection(outputScale: 0.25)
+        let k = makeProjection(outputScale: 0.5)
+        let v = makeProjection(outputScale: 1.0)
+        let x = MLXArray(
+            [Float](repeating: 5.3 / Float(inputDims), count: inputDims),
+            [1, 1, inputDims]
+        ).asType(.bfloat16)
+
+        let fused = gemmaFusedQKVMatmul(
+            x: x,
+            weight: concatenated([q.weight, k.weight, v.weight], axis: 0),
+            weightScale: concatenated([q.weightScale, k.weightScale, v.weightScale], axis: 0),
+            inputScale: q.inputActivationScale,
+            outputScale: gemmaBuildPerRowOutputScale(q, k, v, dtype: x.dtype),
+            numBits: 4,
+            inputDims: inputDims)
+        let separate = concatenated([q(x), k(x), v(x)], axis: -1)
+        eval([fused, separate])
+
+        #expect(fused.shape == [1, 1, outputDims * 3])
+        Self.assertApproximatelyEqual(
+            fused.asArray(Float.self), separate.asArray(Float.self), tolerance: 1e-6)
+
+        // Ensure the fixture actually distinguishes the three output scales;
+        // otherwise the old output_scale[0] bug could pass accidentally.
+        let values = fused.asArray(Float.self)
+        #expect(values[0] == 5.25)
+        #expect(values[outputDims] == 5.5)
+        #expect(values[outputDims * 2] == 5.0)
+    }
+
     // MARK: - Per-layer bit resolution
 
     /// The E2B mobile `module_quant_configs` schema (regex patterns in the
