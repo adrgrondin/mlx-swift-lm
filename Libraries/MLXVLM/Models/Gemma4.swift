@@ -475,6 +475,22 @@ typealias Gemma4RMSNormNoScale = MLXLMCommon.Gemma4RMSNormNoScale
 /// Module-internal — also consumed by `Gemma4Assistant.swift`.
 typealias Gemma4RMSNormZeroShift = MLXLMCommon.Gemma4RMSNormZeroShift
 
+private let gemma4AddRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { residual, x, weight in
+        residual + MLXFast.rmsNorm(x, weight: weight, eps: 1e-6)
+    }
+
+private let gemma4AddRMSNormAndScale:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { residual, x, weight, scale in
+            (residual + MLXFast.rmsNorm(x, weight: weight, eps: 1e-6)) * scale
+        }
+
+private let gemma4GeluMul: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { gate, other in
+        geluApproximate(gate) * other
+    }
+
 final class Gemma4TextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
@@ -493,7 +509,7 @@ final class Gemma4TextMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        downProj(gemma4GeluMul(gateProj(x), upProj(x)))
     }
 }
 
@@ -831,6 +847,7 @@ final class Gemma4TextAttention: Module {
 final class Gemma4TextDecoderLayer: Module {
     let layerType: String
     let enableMoE: Bool
+    private let useCompiledHelpers: Bool
 
     @ModuleInfo(key: "self_attn") var selfAttention: Gemma4TextAttention
     @ModuleInfo var mlp: Gemma4TextMLP
@@ -853,9 +870,14 @@ final class Gemma4TextDecoderLayer: Module {
     @ModuleInfo(key: "post_per_layer_input_norm") var postPerLayerInputNorm: Gemma4RMSNormZeroShift?
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
-    init(config: Gemma4TextConfiguration, layerIdx: Int, kvSharedOnly: Bool = false) {
+    init(
+        config: Gemma4TextConfiguration,
+        layerIdx: Int,
+        kvSharedOnly: Bool = false
+    ) {
         self.layerType = config.layerTypes[layerIdx]
         self.enableMoE = config.enableMoEBlock
+        self.useCompiledHelpers = config.rmsNormEps == 1e-6
         self._selfAttention.wrappedValue = Gemma4TextAttention(
             config: config, layerIdx: layerIdx, kvSharedOnly: kvSharedOnly)
         self._mlp.wrappedValue = Gemma4TextMLP(config: config, layerIdx: layerIdx)
@@ -901,10 +923,12 @@ final class Gemma4TextDecoderLayer: Module {
         var h = inputLayerNorm(x)
         let (attentionOutput, kvState, attentionOffset) = selfAttention(
             h, mask: mask, cache: cache, sharedKV: sharedKV, offset: offset)
-        h = attentionOutput
-        h = postAttentionLayerNorm(h)
-        h = residual + h
 
+        if useCompiledHelpers {
+            h = gemma4AddRMSNorm(residual, attentionOutput, postAttentionLayerNorm.weight)
+        } else {
+            h = residual + postAttentionLayerNorm(attentionOutput)
+        }
         residual = h
         if enableMoE,
             let router,
@@ -927,19 +951,28 @@ final class Gemma4TextDecoderLayer: Module {
             h = preFeedforwardLayerNorm(h)
             h = mlp(h)
         }
-        h = postFeedforwardLayerNorm(h)
-        h = residual + h
+        if useCompiledHelpers {
+            h = gemma4AddRMSNorm(residual, h, postFeedforwardLayerNorm.weight)
+        } else {
+            h = residual + postFeedforwardLayerNorm(h)
+        }
 
         if let perLayerInputGate, let perLayerProjection, let postPerLayerInputNorm,
             let perLayerInput
         {
             residual = h
             var gated = perLayerInputGate(h)
-            gated = geluApproximate(gated)
-            gated = gated * perLayerInput
+            gated =
+                useCompiledHelpers
+                ? gemma4GeluMul(gated, perLayerInput)
+                : geluApproximate(gated) * perLayerInput
             gated = perLayerProjection(gated)
-            gated = postPerLayerInputNorm(gated)
-            h = residual + gated
+            if useCompiledHelpers {
+                h = gemma4AddRMSNormAndScale(
+                    residual, gated, postPerLayerInputNorm.weight, layerScalar)
+                return (h, kvState, attentionOffset)
+            }
+            h = residual + postPerLayerInputNorm(gated)
         }
 
         return (h * layerScalar, kvState, attentionOffset)
@@ -1004,7 +1037,8 @@ final class Gemma4TextBackbone: Module {
         let firstKVSharedLayer = config.hiddenLayers - config.numKVSharedLayers
         self._layers.wrappedValue = (0 ..< config.hiddenLayers).map { idx in
             Gemma4TextDecoderLayer(
-                config: config, layerIdx: idx,
+                config: config,
+                layerIdx: idx,
                 kvSharedOnly: firstKVSharedLayer > 0 && idx >= firstKVSharedLayer)
         }
         self._norm.wrappedValue = Gemma4RMSNormZeroShift(
