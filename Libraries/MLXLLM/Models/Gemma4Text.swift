@@ -51,6 +51,50 @@ private let _geluMul: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
     geluApproximate(gate) * other
 }
 
+/// Signatures used to select the minimum set of decoder layers needed to warm
+/// every shape-specialized native graph. Kept internal for focused test coverage.
+enum Gemma4NativePrecompile {
+    static let defaultSequenceLengths = [1, 16, 32, 64, 128, 256, 512]
+
+    enum PreAttentionSignature: Hashable {
+        case source(nHeads: Int, headDim: Int, nKvHeads: Int)
+        case kvShared(nHeads: Int, headDim: Int)
+    }
+
+    struct PostAttentionSignature: Hashable {
+        let mlpBits: Int
+        let pleBits: Int
+        let attentionOutputDimension: Int
+    }
+
+    struct LayerSignature: Hashable {
+        let preAttention: PreAttentionSignature
+        let postAttention: PostAttentionSignature
+    }
+
+    /// Return first-occurrence representatives independently for pre- and
+    /// post-attention. A pre-attention graph can be shared while post-attention
+    /// still needs another specialization (or vice versa).
+    static func representativeIndices(
+        for signatures: [LayerSignature]
+    ) -> (preAttention: [Int], postAttention: [Int]) {
+        var seenPre = Set<PreAttentionSignature>()
+        var seenPost = Set<PostAttentionSignature>()
+        var preAttention: [Int] = []
+        var postAttention: [Int] = []
+
+        for (index, signature) in signatures.enumerated() {
+            if seenPre.insert(signature.preAttention).inserted {
+                preAttention.append(index)
+            }
+            if seenPost.insert(signature.postAttention).inserted {
+                postAttention.append(index)
+            }
+        }
+        return (preAttention, postAttention)
+    }
+}
+
 // MARK: - Native compiled pre-attention segments (Phase 6/7 port)
 //
 // These compile the entire pre-attention chain (input_layernorm → SRQ →
@@ -916,6 +960,7 @@ private class Gemma4TextExperts: Module {
         let preArgs: [MLXArray]
         let postFn: @Sendable ([MLXArray]) -> [MLXArray]
         let postArgs: [MLXArray]
+        let precompileSignature: Gemma4NativePrecompile.LayerSignature
     }
     private var _nativeArgs: NativeArgs?
     private var _nativeArgsChecked = false
@@ -1062,9 +1107,24 @@ private class Gemma4TextExperts: Module {
             plePArgs.packed, plePArgs.scales, plePArgs.biases, plePArgs.inScale, plePArgs.outScale,
         ]
 
+        let preAttentionSignature: Gemma4NativePrecompile.PreAttentionSignature =
+            if isSource {
+                .source(
+                    nHeads: attn.nHeads, headDim: attn.effectiveHeadDim,
+                    nKvHeads: attn.nKvHeads)
+            } else {
+                .kvShared(nHeads: attn.nHeads, headDim: attn.effectiveHeadDim)
+            }
+        let precompileSignature = Gemma4NativePrecompile.LayerSignature(
+            preAttention: preAttentionSignature,
+            postAttention: .init(
+                mlpBits: mlpBits,
+                pleBits: pleBits,
+                attentionOutputDimension: attn.nHeads * attn.effectiveHeadDim))
         let result = NativeArgs(
             isSource: isSource, preFn: preFn, preArgs: preArgs,
-            postFn: postFn, postArgs: postArgs)
+            postFn: postFn, postArgs: postArgs,
+            precompileSignature: precompileSignature)
         _nativeArgs = result
         return result
     }
@@ -1473,45 +1533,38 @@ private class Gemma4TextExperts: Module {
     ///   strategy: full forward pass for shapes ≤ 32 (negligible activations,
     ///   warms up MLX built-in ops), direct compiled-function calls for larger
     ///   shapes (avoids accumulating ~0.8 GB of activations across all layers).
-    /// 3. The compiled functions are shared across layers via the factory caches,
-    ///   so only the first source layer and first KV-shared layer are needed for
-    ///   the direct-compile path.
+    /// 3. The compiled functions are shared across layers via factory caches.
+    ///   For direct compilation, select one representative for every unique
+    ///   pre-attention signature and every unique post-attention signature. This
+    ///   covers source/KV-shared and sliding/full-attention graphs without running
+    ///   all 35 layers for every large shape.
     ///
     /// No-op if no layer uses the native path (e.g. unaligned dims, MoE, no PLE).
-    fileprivate func precompileNativeFunctions(shapes: [Int] = [1, 16, 32, 64, 128, 256]) {
+    fileprivate func precompileNativeFunctions(
+        shapes: [Int] = Gemma4NativePrecompile.defaultSequenceLengths
+    ) {
         let layers = self.layers
         guard !layers.isEmpty else { return }
 
         // 1. Convert + free mobile weights layer by layer.
-        var anyNative = false
+        var nativeLayers: [Gemma4DecoderLayer] = []
+        nativeLayers.reserveCapacity(layers.count)
         for layer in layers {
             guard layer.getNativeArgs() != nil else { continue }
-            anyNative = true
+            nativeLayers.append(layer)
             layer.freeMobileWeightsOnLinears()
         }
-        guard anyNative else { return }
+        guard !nativeLayers.isEmpty else { return }
 
         // 2. Precompile compile functions for common prompt lengths.
         let hiddenSize = config.hiddenSize
         let perLayerDim = config.hiddenSizePerLayerInput
         let dtype = layers[0].inputLayernorm.weight.dtype
-
-        // Find the first source and first KV-shared layer (different compiled
-        // pre-attention functions). Their compiled functions are shared across
-        // all layers via the factory caches, so only these are needed for the
-        // direct-compile path.
-        var firstSource: Gemma4DecoderLayer?
-        var firstKvshared: Gemma4DecoderLayer?
-        for layer in layers {
-            guard let native = layer.getNativeArgs() else { continue }
-            if native.isSource {
-                if firstSource == nil { firstSource = layer }
-            } else {
-                if firstKvshared == nil { firstKvshared = layer }
-            }
-            if firstSource != nil && firstKvshared != nil { break }
-        }
-        let compileLayers = [firstSource, firstKvshared].compactMap { $0 }
+        let signatures = nativeLayers.compactMap { $0.getNativeArgs()?.precompileSignature }
+        precondition(
+            signatures.count == nativeLayers.count,
+            "native precompile arguments disappeared after weight conversion")
+        let representatives = Gemma4NativePrecompile.representativeIndices(for: signatures)
 
         // offset must be an MLXArray (not a bare Int) so `compile` treats it as a
         // runtime input, not a compile-time constant (Python Phase 7 bug).
@@ -1545,11 +1598,18 @@ private class Gemma4TextExperts: Module {
                 let dummyResidual = MLXArray.zeros([1, seqLen, hiddenSize], dtype: dtype)
                 let dummyPli = MLXArray.zeros([1, seqLen, perLayerDim], dtype: dtype)
 
-                for layer in compileLayers {
+                for index in representatives.preAttention {
+                    let layer = nativeLayers[index]
                     guard let native = layer.getNativeArgs() else { continue }
                     let preOut = native.preFn([dummyX] + native.preArgs + [dummyOffset])
                     eval(preOut)
-                    let attnDim = layer.selfAttn.nHeads * layer.selfAttn.effectiveHeadDim
+                }
+
+                for index in representatives.postAttention {
+                    let layer = nativeLayers[index]
+                    guard let native = layer.getNativeArgs() else { continue }
+                    let attnDim = native.precompileSignature.postAttention
+                        .attentionOutputDimension
                     let dummyAttnOut = MLXArray.zeros([1, seqLen, attnDim], dtype: dtype)
                     let postOut = native.postFn(
                         [dummyResidual, dummyAttnOut, dummyPli] + native.postArgs)
