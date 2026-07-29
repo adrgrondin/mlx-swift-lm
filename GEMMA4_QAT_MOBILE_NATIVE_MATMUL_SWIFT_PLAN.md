@@ -27,7 +27,7 @@ SDPA, one compiled post-attention graph).
 | Phase 2 — Compiled pre-attention | ✅ DONE | `CompiledPreAttnSource`, `CompiledPreAttnKvshared` factory + cache. |
 | Phase 3 — Compiled post-attention | ✅ DONE | `CompiledPostAttn` factory + cache (38-element input). |
 | Phase 4 — Wire into decoder layer | ✅ DONE | `getNativeArgs()`, native compiled path, `eagerCall` fallback, `useNativeCompiledPath` A/B flag. **A/B equivalence test PASSES** (mean abs diff 0.30, 2/32 argmax mismatches). |
-| Phase 5 — Load-time precompilation | ✅ DONE | `NativePrecompilable` protocol + `loadWeights` hook; `precompileNativeFunctions` (layer-by-layer convert + free + hybrid compile: full pass ≤ 32, direct call > 32); `freeMobileWeights`; `precompileAtLoad` A/B flag. **2 new tests pass**: weight freeing + prefill stability (real model), no-op for unaligned dims (tiny model). |
+| Phase 5 — Load-time precompilation | ✅ DONE | `NativePrecompilable` protocol + `loadWeights` hook; `precompileNativeFunctions` (layer-by-layer convert + free + hybrid compile: full pass ≤ 32, direct call > 32); all source/shared + sliding/full signatures and 512-token chunks are covered; `freeMobileWeights`; `precompileAtLoad` A/B flag. **3 tests pass**: E2B signature selection, weight freeing + prefill stability (real model), and no-op for unaligned dims (tiny model). |
 | Phase 6 — Benchmark | ⬜ Not started | Decode/prefill tok/s, peak memory. |
 
 ### Root cause of the A/B test failure (resolved)
@@ -341,11 +341,13 @@ and modules are replaced. Three steps:
    conversion peak at ~half-mobile + half-native.
 
 2. **Precompile `compile` functions** — run dummy forward passes for common
-   prompt lengths `(1, 16, 32, 64, 128, 256)` with `eval` on the output. Use
-   the **hybrid compile strategy** (from the Python Phase 7 peak-memory fix):
+   prompt lengths `(1, 16, 32, 64, 128, 256, 512)` with `eval` on the output.
+   Use the **hybrid compile strategy** (from the Python Phase 7 peak-memory fix):
    full forward pass for shapes ≤ 32 (negligible activations, warms up MLX
    built-in ops), direct compiled-function calls for larger shapes (avoids
-   ~0.8 GB activation spike).
+   ~0.8 GB activation spike). Direct compilation selects one representative
+   for each unique pre- and post-attention signature, covering source/KV-shared
+   and sliding/full-attention variants without running all 35 layers.
 
 3. **Set flags** — pre-set `_weightsConverted`/`_mobileWeightsFreed` so the
    fallback weight-freeing path in the model is skipped.
@@ -531,13 +533,16 @@ residual → mlp → norm → residual → PLE → norm → residual → layerSc
 ### Phase 5 — Load-time precompilation + weight freeing
 
 1. Add `precompileNativeFunctions(model:)` — layer-by-layer weight conversion +
-   freeing + hybrid compile strategy (full pass ≤ 32, direct call > 32).
+   freeing + hybrid compile strategy (full pass ≤ 32, direct call > 32), warming
+   `(1, 16, 32, 64, 128, 256, 512)` and every unique E2B source/shared +
+   sliding/full pre- and post-attention signature.
 2. Hook into the loading flow (after `update(parameters:)`). Use a
    `Gemma4NativePrecompilable` protocol or type check in `Load.swift`.
 3. Free mobile weights after conversion (replace `weight`/`weightScale` with
    dummy arrays). Preserve SRQ scales (still needed).
 
-**Test:** Verify peak memory is reduced (mobile weights freed). Verify first-run
+**Test:** Verify representative selection covers all four E2B attention
+combinations, peak memory is reduced (mobile weights freed), and first-run
 prefill is stable (not variable like the no-precompile path).
 
 ### Phase 6 — Benchmark & validate
@@ -600,7 +605,7 @@ averages, note variance, and don't claim improvements without evidence.
 | Post-attn arg count exceeds `compile` limits | None | N/A | Use the `[MLXArray]` array form (no arg limit). |
 | `quantizedMM` `bits` not captured as constant | Low | Medium | If `compile` can't capture `Int` params, bake via a factory closure (one fn per bit combo). |
 | Memory spike during precompilation | Medium | Medium | Hybrid compile strategy (full pass ≤ 32, direct call > 32) + layer-by-layer freeing (proven in Python). |
-| Decode regression from per-shape recompile | Medium | Medium | Load-time precompilation for common shapes (1, 16, 32, 64, 128, 256). |
+| Decode regression from per-shape recompile | Medium | Medium | Load-time precompilation for common shapes (1, 16, 32, 64, 128, 256, 512) and every E2B source/shared + sliding/full signature. |
 | `shapeless: true` temptation | None | N/A | Don't use it (Python confirmed it causes decode regression + can't slice). |
 | `offset` Int vs MLXArray mismatch | Medium | High (garbage output) | Always use `MLXArray` for offset (Python Phase 7 bug). |
 | MoE layers (E-series) | None | N/A | Guard: native path only for non-MoE. MoE falls back to eager. |
