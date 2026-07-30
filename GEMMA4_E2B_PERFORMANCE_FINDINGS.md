@@ -26,6 +26,89 @@ The RMSNorm helpers are used when the decoded `rms_norm_eps` equals the compiled
 
 Gemma mobile quantization remains independently format-driven. `GemmaQuantizedLinear` and `GemmaQuantizedEmbedding` replacement occurs only when `quantization_config.quant_method == "gemma"`, and only for modules supported by the checkpoint regexes and scale tensors. Ordinary affine quantization continues through the generic loader.
 
+The retained memory correction is also format-driven. It reuses the mobile checkpoint's already-compatible 2/4-bit packed storage as the MLX `uint32` quantizedMM input and makes fused decode Q/K/V read the three source projections directly. It does not dispatch on E2B/E4B architecture or model identity.
+
+## Mobile-QAT first-prompt memory correction
+
+### Root cause
+
+The official checkpoint loaded at 2,274,029,922 active MLX bytes, then retained 3,082,574,718 bytes after its first prompt: an 808,544,796-byte increase. KV cache and short-prompt activations were not large enough to explain it.
+
+The increase came from two persistent conversions:
+
+1. `mobileToMLX` rebuilt every aligned 2/4-bit mobile linear into a second packed `uint32` tensor for prefill `quantizedMM`. The mobile byte layout is already the same little-endian LSB-first bit layout expected by MLX; arithmetic byte recombination duplicated the packed weights without changing their bits. The original weights had to remain resident because decode QMV reads the mobile representation directly.
+2. Fused Q/K/V decode concatenated Q, K, and V packed weights for every KV-owning layer and retained those concatenations after the first decoded token.
+
+The checkpoint contains about 916.5 MiB of packed linear weights. The first conversion duplicated most of that storage; temporary conversion buffers also enlarged MLX's reusable buffer cache.
+
+### Retained implementation
+
+- For 2-bit and 4-bit aligned linears, `mobileToMLX` uses `weight.view(dtype: .uint32)` and reshape rather than arithmetic byte reconstruction. The quantizedMM input and decode QMV input now share the original packed allocation.
+- Int8 conversion remains explicit because signed two's-complement bytes cannot be represented by one affine bias in MLX's unsigned 8-bit quantizedMM format.
+- Fused Q/K/V remains one Metal kernel launch, but the kernel selects Q, K, or V from the three original buffers per output row. It also selects each projection's scalar output SRQ scale directly, preserving the per-projection scale correctness fix without a per-row concatenated scale tensor.
+- The same generic quantization primitives are used by LLM and VLM Gemma-mobile paths. Ordinary affine Gemma 4 and non-Gemma models never enter these functions.
+
+This follows the useful LiteRT-LM patterns rather than copying a backend-specific implementation: external/source quantized weights are supplied to compilation without unconditional host duplication, source-quantized FC/conv operations can remain enabled, constants can be shared, and weight/program conversion caches are managed separately. Relevant references are:
+
+```text
+/Users/adrgrondin/Workspace/LiteRT-LM/runtime/executor/llm_executor_settings_utils.cc
+/Users/adrgrondin/Workspace/LiteRT-LM/runtime/executor/llm_litert_compiled_model_executor.cc
+/Users/adrgrondin/Workspace/LiteRT-LM/runtime/executor/litert_compiled_model_executor_utils.cc
+```
+
+In particular, LiteRT-LM enables source-quantized FC/conv operations and constant sharing, optionally converts weights on GPU, and passes external weight sections by file descriptor into compilation. The MLX correction applies the same ownership principle locally: do not retain an identical packed constant solely to satisfy a different tensor dtype.
+
+### Memory benchmark
+
+All memory comparisons used the release harness in [BENCHMARKING.md](BENCHMARKING.md), the production auto/VLM path, 64 output tokens, one excluded shape warmup, and the official local mobile checkpoint. Values are MLX active/peak allocation, not process RSS.
+
+| Workload | Previous peak | Selected peak | Reduction |
+|---:|---:|---:|---:|
+| 128 prompt tokens | 3,281,345,309 B | 2,510,404,891 B | **770,940,418 B (735.2 MiB, 23.49%)** |
+| 512 prompt tokens | 3,852,171,849 B | 3,081,246,471 B | **770,925,378 B (735.2 MiB, 20.01%)** |
+| 2048 prompt tokens | 3,910,299,403 B | 3,139,391,753 B | **770,907,650 B (735.2 MiB, 19.71%)** |
+
+Steady active allocation before a measured 128-token run fell from 3,082,574,718 to 2,311,674,750 bytes, only 37,644,828 bytes above the 2,274,029,922-byte post-load state. The packed view accounts for 735.3 MB of the reduction and direct-buffer fused Q/K/V saves another 35.6 MB.
+
+An app-like natural 40-token prompt with a 20 MiB MLX cache limit peaked at 2,384,931,662 bytes (2.221 GiB). The ordinary affine `mlx-community/gemma-4-E2B-it-qat-4bit` reference peaked at 3,846,606,871 bytes for the 128-token workload, so selected mobile QAT is 1,336,201,980 bytes (1,274.3 MiB, 34.74%) lower instead of converging on the same peak.
+
+### Performance and correctness gate
+
+The packed view is bit-exact and changes only conversion/ownership; the evaluated quantizedMM tensor has the same shape, dtype, and bytes as before. Existing int2/int4 conversion tests pass against dequantized reference values.
+
+A controlled 512-token A/B compared the old concatenated fused-QKV cache with the direct-buffer fused kernel:
+
+| Variant | Prefill | Decode | 512-token peak |
+|---|---:|---:|---:|
+| Concatenated Q/K/V control | 10,256.20 tok/s | 116.13 tok/s | 3,116,827,110 B |
+| Direct-buffer Q/K/V | 10,240.01 tok/s | 115.92 tok/s | 3,081,241,062 B |
+| Delta | -0.16% | **-0.18%** | **-35,586,048 B** |
+
+The throughput difference is below the observed frequency/run variance, so the direct-buffer kernel is retained. The temporary control function and dispatch flag were removed.
+
+A final post-cleanup Release confirmation used one warmup and three measured runs per shape. Every measured run generated 64 tokens and stopped at the requested length; low-power mode was off and the reported thermal state was nominal.
+
+| Prompt | Final median prefill | Final median decode | Final median peak | Active before measured runs |
+|---:|---:|---:|---:|---:|
+| 128 | 3,850.68 tok/s | 119.65 tok/s | 2,510,404,891 B | 2,311,674,750 B |
+| 512 | 10,281.12 tok/s | 115.89 tok/s | 3,081,245,751 B | 2,311,676,286 B |
+| 2048 | 15,632.26 tok/s | 115.21 tok/s | 3,139,391,753 B | 2,311,686,526 B |
+
+The final peaks reproduce the selected candidate within 720 bytes. These absolute throughput values were collected after the preceding test/build workload and are confirmation data, not a replacement for the adjacent controlled Q/K/V performance A/B.
+
+Benchmark reports:
+
+```text
+.../scratchpads/dm1/mobile-memory-baseline.json
+.../scratchpads/dm1/mobile-memory-packed-view.json
+.../scratchpads/dm1/mobile-memory-split-qkv.json
+.../scratchpads/dm1/mobile-memory-app-like.json
+.../scratchpads/dm1/mobile-memory-final-confirmation.json
+.../scratchpads/dm1/affine-qat-memory-reference.json
+.../scratchpads/dm1/qkv-concatenated-control.json
+.../scratchpads/dm1/qkv-split-candidate.json
+```
+
 ## Why the earlier E2B-only implementation was rejected
 
 The earlier candidate selected an exact E2B architecture and enabled a native `quantizedMM` post-attention graph only for decoder layers 30–34. That was not a legitimate architecture capability:
@@ -382,9 +465,10 @@ A release factory/generation smoke on the real cached `mlx-community/gemma-4-E2B
 7. **MTP/speculative decoding.** This is a separate checkpoint/runtime feature and should not be disguised as an E2B base-model optimization.
 8. **Modality pruning as an explicit deployment mode.** Text-only deployment can save memory, but the official target here remains multimodal; modalities must not be silently removed.
 
-## Changed files
+## Current memory-correction worktree files
 
+- [GEMMA4_E2B_PERFORMANCE_FINDINGS.md](GEMMA4_E2B_PERFORMANCE_FINDINGS.md)
+- [Libraries/MLXLMCommon/GemmaMobileQuantization.swift](Libraries/MLXLMCommon/GemmaMobileQuantization.swift)
 - [Libraries/MLXVLM/Models/Gemma4.swift](Libraries/MLXVLM/Models/Gemma4.swift)
-- [Tests/MLXLMTests/Gemma4MobileVLMIntegrationTests.swift](Tests/MLXLMTests/Gemma4MobileVLMIntegrationTests.swift)
-- [Tests/MLXLMTests/Gemma4UnifiedTests.swift](Tests/MLXLMTests/Gemma4UnifiedTests.swift)
-- [Tests/MLXLMTests/Gemma4ModelFamilyTests.swift](Tests/MLXLMTests/Gemma4ModelFamilyTests.swift)
+- [Libraries/MLXLLM/Models/Gemma4Text.swift](Libraries/MLXLLM/Models/Gemma4Text.swift)
+- [Tests/MLXLMTests/Gemma4MobileQuantizationTests.swift](Tests/MLXLMTests/Gemma4MobileQuantizationTests.swift)

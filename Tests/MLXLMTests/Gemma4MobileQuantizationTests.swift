@@ -266,14 +266,7 @@ struct Gemma4MobileQuantizationTests {
             [1, 1, inputDims]
         ).asType(.bfloat16)
 
-        let fused = gemmaFusedQKVMatmul(
-            x: x,
-            weight: concatenated([q.weight, k.weight, v.weight], axis: 0),
-            weightScale: concatenated([q.weightScale, k.weightScale, v.weightScale], axis: 0),
-            inputScale: q.inputActivationScale,
-            outputScale: gemmaBuildPerRowOutputScale(q, k, v, dtype: x.dtype),
-            numBits: 4,
-            inputDims: inputDims)
+        let fused = gemmaFusedQKVMatmul(x: x, q: q, k: k, v: v)
         let separate = concatenated([q(x), k(x), v(x)], axis: -1)
         eval([fused, separate])
 
