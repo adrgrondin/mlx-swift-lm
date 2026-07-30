@@ -817,13 +817,8 @@ final class Gemma4TextAttention: Module {
     @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale?
     @ModuleInfo var rope: OffsetLayer
 
-    // Fused q/k/v cache (plan §9.3): concatenates packed q/k/v weights once and
-    // runs a single qmv kernel with per-row output SRQ, replacing three kernel
-    // launches with one. Built lazily on the first decode/small-batch call.
-    private var _fusedQKVWeight: MLXArray?
-    private var _fusedQKVWeightScale: MLXArray?
-    private var _fusedQKVInS: MLXArray?
-    private var _fusedQKVOutS: MLXArray?
+    // Fused q/k/v validation state. The kernel reads the three original packed
+    // projections directly, so no concatenated weight cache is retained.
     private var _fusedQKVReady = false
     private var _fusedQKVDisabled = false
 
@@ -901,19 +896,10 @@ final class Gemma4TextAttention: Module {
                 _fusedQKVDisabled = true
                 return nil
             }
-            _fusedQKVWeight = MLX.concatenated([q.weight, k.weight, v.weight], axis: 0)
-            _fusedQKVWeightScale = MLX.concatenated(
-                [q.weightScale, k.weightScale, v.weightScale], axis: 0)
-            _fusedQKVInS = q.inputActivationScale
-            _fusedQKVOutS = gemmaBuildPerRowOutputScale(q, k, v, dtype: x.dtype)
-            eval([_fusedQKVWeight!, _fusedQKVWeightScale!, _fusedQKVOutS!])
             _fusedQKVReady = true
         }
 
-        return gemmaFusedQKVMatmul(
-            x: x, weight: _fusedQKVWeight!, weightScale: _fusedQKVWeightScale!,
-            inputScale: _fusedQKVInS!, outputScale: _fusedQKVOutS!,
-            numBits: q.numBits, inputDims: q.inputDims)
+        return gemmaFusedQKVMatmul(x: x, q: q, k: k, v: v)
     }
 
     func callAsFunction(
