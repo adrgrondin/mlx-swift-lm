@@ -287,15 +287,10 @@ public func mobileToMLX(
     if numBits == 2 || numBits == 4 {
         // Mobile uint8 bytes already hold the shifted unsigned values (LSB-first
         // within each byte). MLX packs the same values LSB-first into uint32, so
-        // 4 consecutive bytes map directly to 1 uint32 (little-endian). Reshape
-        // to [out, n_uint32, 4] and combine with little-endian byte weights.
+        // reinterpret the contiguous bytes instead of materializing an identical
+        // second packed-weight allocation.
         let nUint32 = weight.shape[1] / 4
-        let reshaped = weight.reshaped([outDims, nUint32, 4]).asType(.uint32)
-        let b0 = reshaped[.ellipsis, 0]
-        let b1 = reshaped[.ellipsis, 1]
-        let b2 = reshaped[.ellipsis, 2]
-        let b3 = reshaped[.ellipsis, 3]
-        packed = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+        packed = weight.view(dtype: .uint32).reshaped([outDims, nUint32])
     } else {
         // int8: shift signed to unsigned (+128), then pack 4 values per uint32.
         let q = (weight.asType(.int32) + MLXArray(shift, dtype: .int32)).asType(.uint32)
@@ -504,7 +499,6 @@ private let gemmaQMVOutputsPerThreadgroup = 8  // 2 simdgroups × 4
 /// - `VALUES_PER_BYTE` — 4 (int2), 2 (int4), 1 (int8)
 /// - `OUTPUTS_PER_SIMDGROUP` — 4
 /// - `OUTPUTS_PER_THREADGROUP` — 8
-/// - `OUTPUT_SCALE_PER_ROW` — false (standalone layers; true is for fused q/k/v)
 /// - `UNPACK_BLOCK` — bit-width-specific unpack + MAC snippet
 private let gemmaQMVSourceTemplate = """
     uint lane = thread_index_in_simdgroup;
@@ -557,8 +551,7 @@ private let gemmaQMVSourceTemplate = """
         uint output_row = output_start + row;
         if (lane == 0 && output_row < output_dims) {
             float result = accumulators[row] * static_cast<float>(weight_scale[output_row]);
-            uint output_scale_row = OUTPUT_SCALE_PER_ROW ? output_row : 0;
-            float out_s = static_cast<float>(output_scale[output_scale_row]);
+            float out_s = static_cast<float>(output_scale[0]);
             if (out_s != 0.0f) {
                 result = clamp(round(result / out_s), -128.0f, 127.0f) * out_s;
             }
@@ -597,7 +590,7 @@ private func gemmaQMVUnpackBlock(numBits: Int) -> String {
 
 /// Build the qmv Metal kernel source for a given bit width by substituting the
 /// placeholders in the template.
-private func gemmaQMVSource(numBits: Int, perRowOutputScale: Bool) -> String {
+private func gemmaQMVSource(numBits: Int) -> String {
     let valuesPerByte: Int
     switch numBits {
     case 2: valuesPerByte = 4
@@ -609,30 +602,23 @@ private func gemmaQMVSource(numBits: Int, perRowOutputScale: Bool) -> String {
         .replacingOccurrences(of: "VALUES_PER_BYTE", with: "\(valuesPerByte)")
         .replacingOccurrences(of: "OUTPUTS_PER_SIMDGROUP", with: "\(gemmaQMVOutputsPerSimdgroup)")
         .replacingOccurrences(of: "OUTPUTS_PER_THREADGROUP", with: "\(gemmaQMVOutputsPerThreadgroup)")
-        .replacingOccurrences(of: "OUTPUT_SCALE_PER_ROW", with: perRowOutputScale ? "true" : "false")
         .replacingOccurrences(of: "UNPACK_BLOCK", with: gemmaQMVUnpackBlock(numBits: numBits))
 }
 
-/// Cache of compiled qmv kernels keyed by (numBits, perRowOutputScale). Metal
-/// kernel compilation is expensive (~ms), so we compile once and reuse.
-/// `nonisolated(unsafe)`: single-threaded inference context, no data races.
+/// Cache of compiled qmv kernels keyed by bit width. Metal kernel compilation
+/// is expensive, so each specialization is compiled once and reused.
 private enum GemmaQMVKernelCache {
-    struct Key: Hashable { let numBits: Int; let perRowOutputScale: Bool }
+    nonisolated(unsafe) static var cache: [Int: MLXFast.MLXFastKernel] = [:]
 
-    nonisolated(unsafe) static var cache: [Key: MLXFast.MLXFastKernel] = [:]
-
-    static func kernel(numBits: Int, perRowOutputScale: Bool = false) -> MLXFast.MLXFastKernel {
-        let key = Key(numBits: numBits, perRowOutputScale: perRowOutputScale)
-        if let cached = cache[key] {
-            return cached
-        }
+    static func kernel(numBits: Int) -> MLXFast.MLXFastKernel {
+        if let cached = cache[numBits] { return cached }
         let kernel = MLXFast.metalKernel(
-            name: "gemma_mobile_qmv_b\(numBits)_pr\(perRowOutputScale ? 1 : 0)",
+            name: "gemma_mobile_qmv_b\(numBits)",
             inputNames: ["x", "weight", "weight_scale", "input_scale", "output_scale"],
             outputNames: ["out"],
-            source: gemmaQMVSource(numBits: numBits, perRowOutputScale: perRowOutputScale),
+            source: gemmaQMVSource(numBits: numBits),
             header: "#include <metal_simdgroup>\nusing namespace metal;")
-        cache[key] = kernel
+        cache[numBits] = kernel
         return kernel
     }
 }
@@ -652,47 +638,181 @@ public func gemmaQKVInputScalesMatch(
     return qS == kS && qS == vS
 }
 
-/// Build the per-row [q_out + k_out + v_out] output SRQ scale for the fused
-/// matmul. Each projection's scalar output scale is broadcast to its output
-/// dim; uncalibrated (zero) scales produce zeros. Mirrors Python
-/// `_build_per_row_output_scale`.
+/// Build the per-row [q_out + k_out + v_out] output SRQ scale used by the
+/// native compiled path, whose quantizedMM arguments are concatenated.
 public func gemmaBuildPerRowOutputScale(
     _ q: GemmaQuantizedLinear, _ k: GemmaQuantizedLinear, _ v: GemmaQuantizedLinear,
     dtype: DType
 ) -> MLXArray {
-    let parts = [q, k, v].map { proj -> MLXArray in
-        broadcast(proj.outputActivationScale.asType(dtype), to: [proj.weight.shape[0]])
+    let parts = [q, k, v].map { projection in
+        broadcast(
+            projection.outputActivationScale.asType(dtype),
+            to: [projection.weight.shape[0]])
     }
     return concatenated(parts, axis: 0)
 }
 
-/// Fused q/k/v quantized matmul: concatenates the packed q/k/v weights and runs
-/// a single qmv kernel with per-row output SRQ, replacing three kernel launches
-/// with one. The caller caches the concatenated weights and per-row output
-/// scale; this function just dispatches the kernel. Mirrors Python
-/// `gemma_fused_qkv_matmul` (the dispatch part).
+/// Metal source for fused q/k/v projection without concatenating the three
+/// packed weight tensors. The projection choice is uniform for an output row,
+/// so each simdgroup reads directly from one of the original buffers while
+/// retaining a single kernel launch.
+private let gemmaFusedQKVSourceTemplate = """
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint input_row = threadgroup_position_in_grid.z;
+    uint input_dims = x_shape[1];
+    uint q_output_dims = q_weight_shape[0];
+    uint k_output_dims = k_weight_shape[0];
+    uint v_output_dims = v_weight_shape[0];
+    uint output_dims = q_output_dims + k_output_dims + v_output_dims;
+    uint packed_in = q_weight_shape[1];
+    uint output_start = threadgroup_position_in_grid.y * OUTPUTS_PER_THREADGROUP
+        + simd_group * OUTPUTS_PER_SIMDGROUP;
+
+    float in_s = static_cast<float>(input_scale[0]);
+    float accumulators[OUTPUTS_PER_SIMDGROUP] = {0.0f};
+    constexpr uint VALUES_PER_THREAD = 16;
+    constexpr uint BYTES_PER_THREAD = VALUES_PER_THREAD / VALUES_PER_BYTE;
+    constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
+
+    for (uint block_start = lane * VALUES_PER_THREAD;
+         block_start < input_dims;
+         block_start += BLOCK_SIZE) {
+        float x_thread[VALUES_PER_THREAD];
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+            float x_val = static_cast<float>(
+                x[input_row * input_dims + block_start + i]);
+            if (in_s != 0.0f) {
+                x_val = clamp(round(x_val / in_s), -128.0f, 127.0f) * in_s;
+            }
+            x_thread[i] = x_val;
+        }
+        uint packed_start = block_start / VALUES_PER_BYTE;
+        for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
+            uint output_row = output_start + row;
+            if (output_row >= output_dims) break;
+
+            uint projection_row = output_row;
+            auto selected_weight = q_weight;
+            if (output_row >= q_output_dims + k_output_dims) {
+                projection_row -= q_output_dims + k_output_dims;
+                selected_weight = v_weight;
+            } else if (output_row >= q_output_dims) {
+                projection_row -= q_output_dims;
+                selected_weight = k_weight;
+            }
+
+            float row_sum = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint b = 0; b < BYTES_PER_THREAD; ++b) {
+                UNPACK_BLOCK
+            }
+            accumulators[row] += row_sum;
+        }
+    }
+
+    for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
+        accumulators[row] = simd_sum(accumulators[row]);
+        uint output_row = output_start + row;
+        if (lane == 0 && output_row < output_dims) {
+            uint projection_row = output_row;
+            float weight_s;
+            float out_s;
+            if (output_row >= q_output_dims + k_output_dims) {
+                projection_row -= q_output_dims + k_output_dims;
+                weight_s = static_cast<float>(v_weight_scale[projection_row]);
+                out_s = static_cast<float>(v_output_scale[0]);
+            } else if (output_row >= q_output_dims) {
+                projection_row -= q_output_dims;
+                weight_s = static_cast<float>(k_weight_scale[projection_row]);
+                out_s = static_cast<float>(k_output_scale[0]);
+            } else {
+                weight_s = static_cast<float>(q_weight_scale[projection_row]);
+                out_s = static_cast<float>(q_output_scale[0]);
+            }
+
+            float result = accumulators[row] * weight_s;
+            if (out_s != 0.0f) {
+                result = clamp(round(result / out_s), -128.0f, 127.0f) * out_s;
+            }
+            out[input_row * output_dims + output_row] = static_cast<T>(result);
+        }
+    }
+"""
+
+private func gemmaFusedQKVSource(numBits: Int) -> String {
+    let valuesPerByte: Int
+    switch numBits {
+    case 2: valuesPerByte = 4
+    case 4: valuesPerByte = 2
+    case 8: valuesPerByte = 1
+    default: fatalError("Unsupported numBits \(numBits); expected 2, 4, or 8.")
+    }
+    let unpack = gemmaQMVUnpackBlock(numBits: numBits)
+        .replacingOccurrences(of: "weight[", with: "selected_weight[")
+        .replacingOccurrences(of: "output_row", with: "projection_row")
+    return gemmaFusedQKVSourceTemplate
+        .replacingOccurrences(of: "VALUES_PER_BYTE", with: "\(valuesPerByte)")
+        .replacingOccurrences(of: "OUTPUTS_PER_SIMDGROUP", with: "\(gemmaQMVOutputsPerSimdgroup)")
+        .replacingOccurrences(of: "OUTPUTS_PER_THREADGROUP", with: "\(gemmaQMVOutputsPerThreadgroup)")
+        .replacingOccurrences(of: "UNPACK_BLOCK", with: unpack)
+}
+
+private enum GemmaFusedQKVKernelCache {
+    nonisolated(unsafe) static var cache: [Int: MLXFast.MLXFastKernel] = [:]
+
+    static func kernel(numBits: Int) -> MLXFast.MLXFastKernel {
+        if let cached = cache[numBits] { return cached }
+        let kernel = MLXFast.metalKernel(
+            name: "gemma_mobile_qkv_split_b\(numBits)",
+            inputNames: [
+                "x", "q_weight", "k_weight", "v_weight",
+                "q_weight_scale", "k_weight_scale", "v_weight_scale",
+                "input_scale", "q_output_scale", "k_output_scale", "v_output_scale",
+            ],
+            outputNames: ["out"],
+            source: gemmaFusedQKVSource(numBits: numBits),
+            header: "#include <metal_simdgroup>\nusing namespace metal;")
+        cache[numBits] = kernel
+        return kernel
+    }
+}
+
+/// Fused q/k/v quantized matrix-vector multiplication over the original packed
+/// projection tensors. This keeps the single-launch decode optimization without
+/// retaining concatenated copies of q/k/v weights or scales.
 public func gemmaFusedQKVMatmul(
     x: MLXArray,
-    weight: MLXArray,
-    weightScale: MLXArray,
-    inputScale: MLXArray,
-    outputScale: MLXArray,
-    numBits: Int,
-    inputDims: Int
+    q: GemmaQuantizedLinear,
+    k: GemmaQuantizedLinear,
+    v: GemmaQuantizedLinear
 ) -> MLXArray {
-    let kernel = GemmaQMVKernelCache.kernel(numBits: numBits, perRowOutputScale: true)
-    let totalOutDims = weight.shape[0]
+    precondition(q.numBits == k.numBits && q.numBits == v.numBits)
+    precondition(q.inputDims == k.inputDims && q.inputDims == v.inputDims)
+
+    let kernel = GemmaFusedQKVKernelCache.kernel(numBits: q.numBits)
+    let totalOutDims = q.weight.shape[0] + k.weight.shape[0] + v.weight.shape[0]
     let outputShape = Array(x.shape.dropLast()) + [totalOutDims]
-    let x2d = x.reshaped([-1, inputDims])
+    let x2d = x.reshaped([-1, q.inputDims])
     let batch = x2d.shape[0]
 
-    let inS = inputScale.reshaped([1]).asType(x.dtype)
-    let outS = outputScale.asType(x.dtype)
-
     let out = kernel(
-        [x2d, weight, weightScale, inS, outS],
+        [
+            x2d, q.weight, k.weight, v.weight,
+            q.weightScale, k.weightScale, v.weightScale,
+            q.inputActivationScale.reshaped([1]).asType(x.dtype),
+            q.outputActivationScale.reshaped([1]).asType(x.dtype),
+            k.outputActivationScale.reshaped([1]).asType(x.dtype),
+            v.outputActivationScale.reshaped([1]).asType(x.dtype),
+        ],
         template: [("T", x.dtype)],
-        grid: (64, (totalOutDims + gemmaQMVOutputsPerThreadgroup - 1) / gemmaQMVOutputsPerThreadgroup, batch),
+        grid: (
+            64,
+            (totalOutDims + gemmaQMVOutputsPerThreadgroup - 1)
+                / gemmaQMVOutputsPerThreadgroup,
+            batch
+        ),
         threadGroup: (64, 1, 1),
         outputShapes: [[batch * totalOutDims]],
         outputDTypes: [x.dtype]
