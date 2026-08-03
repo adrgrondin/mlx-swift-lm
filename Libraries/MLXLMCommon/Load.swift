@@ -17,9 +17,13 @@ package func safetensorWeightURLs(in modelDirectory: URL) throws -> [URL] {
     if FileManager.default.fileExists(atPath: indexURL.path) {
         let data = try Data(contentsOf: indexURL)
         let index = try JSONDecoder().decode(SafetensorsIndex.self, from: data)
-        return Set(index.weightMap.values)
+        let indexedURLs = Set(index.weightMap.values)
             .sorted()
             .map { modelDirectory.appendingPathComponent($0) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        if !indexedURLs.isEmpty {
+            return indexedURLs
+        }
     }
 
     let enumerator = FileManager.default.enumerator(
