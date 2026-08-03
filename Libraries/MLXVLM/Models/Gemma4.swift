@@ -233,7 +233,9 @@ private func gemma4TokenTypeIds(
 private func gemma4TextOnlyPromptTokens(_ input: LMInput) -> MLXArray {
     let tokens = input.text.tokens
     if tokens.ndim == 2, tokens.dim(0) == 1 {
-        return tokens[0]
+        // Avoid a scalar Gather, whose empty index-shape metadata is rejected by
+        // Metal validation on iOS 27 beta 4.
+        return tokens.squeezed(axis: 0)
     }
     if tokens.ndim == 1 {
         return tokens
@@ -1398,7 +1400,8 @@ final class Gemma4TextBackbone: Module {
                 }
             let layerInput: MLXArray? =
                 if let finalPerLayerInputs {
-                    finalPerLayerInputs[0..., 0..., idx, 0...]
+                    finalPerLayerInputs[0..., 0..., idx ..< (idx + 1), 0...]
+                        .squeezed(axis: 2)
                 } else {
                     nil
                 }
