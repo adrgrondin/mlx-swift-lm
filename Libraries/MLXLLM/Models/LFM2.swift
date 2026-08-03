@@ -26,7 +26,8 @@ public struct LFM2Configuration: Codable, Sendable {
     private let _blockDim: Int?
     var blockDim: Int { _blockDim ?? hiddenSize }
     private let _blockFFDim: Int?
-    var blockFFDim: Int { _blockFFDim ?? hiddenSize }
+    private let intermediateSize: Int?
+    var blockFFDim: Int { _blockFFDim ?? intermediateSize ?? hiddenSize }
     let blockMultipleOf: Int
     let blockFFNDimMultiplier: Float
     let blockAutoAdjustFFDim: Bool
@@ -62,6 +63,7 @@ public struct LFM2Configuration: Codable, Sendable {
         case convLCache = "conv_L_cache"
         case _blockDim = "block_dim"
         case _blockFFDim = "block_ff_dim"
+        case intermediateSize = "intermediate_size"
         case blockMultipleOf = "block_multiple_of"
         case blockFFNDimMultiplier = "block_ffn_dim_multiplier"
         case blockAutoAdjustFFDim = "block_auto_adjust_ff_dim"
@@ -88,6 +90,7 @@ public struct LFM2Configuration: Codable, Sendable {
         self.convLCache = try container.decodeIfPresent(Int.self, forKey: .convLCache) ?? 3
         self._blockDim = try container.decodeIfPresent(Int.self, forKey: ._blockDim)
         self._blockFFDim = try container.decodeIfPresent(Int.self, forKey: ._blockFFDim)
+        self.intermediateSize = try container.decodeIfPresent(Int.self, forKey: .intermediateSize)
         self.blockMultipleOf =
             try container.decodeIfPresent(Int.self, forKey: .blockMultipleOf) ?? 256
         self.blockFFNDimMultiplier =
@@ -384,15 +387,20 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
         var sanitizedWeights: [String: MLXArray] = [:]
 
         for (name, param) in weights {
+            // mlx-vlm conversions include their top-level language model wrapper.
+            // The standalone Swift model starts directly at `model`.
+            let sanitizedName =
+                name.hasPrefix("language_model.")
+                ? String(name.dropFirst("language_model.".count)) : name
             var sanitizedParam = param
 
-            if name.contains("conv.weight") {
+            if sanitizedName.contains("conv.weight") {
                 if param.shape[param.shape.count - 1] > param.dim(1) {
                     sanitizedParam = param.transposed(0, 2, 1)
                 }
             }
 
-            sanitizedWeights[name] = sanitizedParam
+            sanitizedWeights[sanitizedName] = sanitizedParam
         }
 
         return sanitizedWeights
