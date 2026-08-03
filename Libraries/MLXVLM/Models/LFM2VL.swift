@@ -193,9 +193,11 @@ private enum Vision {
                 .reshaped(1, embedDim, srcH, srcW)
 
             for i in 0 ..< batchSize {
-                let shape = spatialShapes[i]
-                let targetH = shape[0].item(Int.self)
-                let targetW = shape[1].item(Int.self)
+                // Avoid rank-zero gathers, whose empty index metadata is rejected
+                // by Metal validation on iOS 27 beta 4.
+                let row = i ..< (i + 1)
+                let targetH = spatialShapes[row, 0 ..< 1].item(Int.self)
+                let targetW = spatialShapes[row, 1 ..< 2].item(Int.self)
 
                 // Bicubic interpolation
                 let interpolated = bicubicInterpolate(
@@ -213,8 +215,9 @@ private enum Vision {
                 resultedPositionalEmbeddings[i, 0 ..< numPositions] = resizedEmbeddings
                 // Fill remaining positions with the first embedding
                 if numPositions < maxLength {
+                    let firstEmbedding = resizedEmbeddings[0 ..< 1].squeezed(axis: 0)
                     for j in numPositions ..< maxLength {
-                        resultedPositionalEmbeddings[i, j] = resizedEmbeddings[0]
+                        resultedPositionalEmbeddings[i, j] = firstEmbedding
                     }
                 }
             }
@@ -904,15 +907,16 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         var imageFeatures = [MLXArray]()
 
         for imgIdx in 0 ..< hiddenStates.dim(0) {
-            var feature = hiddenStates[imgIdx]
-            let featureLength = imgFeatureLengths[imgIdx].item(Int.self)
+            let row = imgIdx ..< (imgIdx + 1)
+            var feature = hiddenStates[row].squeezed(axis: 0)
+            let featureLength = imgFeatureLengths[row].item(Int.self)
 
             // Slice to valid features
             feature = feature[0 ..< featureLength].expandedDimensions(axis: 0)
 
             // Get spatial dimensions
-            let featureOrgH = spatialShapes[imgIdx, 0].item(Int.self)
-            let featureOrgW = spatialShapes[imgIdx, 1].item(Int.self)
+            let featureOrgH = spatialShapes[row, 0 ..< 1].item(Int.self)
+            let featureOrgW = spatialShapes[row, 1 ..< 2].item(Int.self)
 
             // Reshape to spatial dimensions
             feature = feature.reshaped(1, featureOrgH, featureOrgW, -1)
