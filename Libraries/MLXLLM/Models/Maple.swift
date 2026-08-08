@@ -272,14 +272,20 @@ final class MapleGate: Module {
     }
 }
 
-func mapleClampedSwiGLU(gate: MLXArray, up: MLXArray) -> MLXArray {
+// Compile the elementwise expert work into one graph per operation. Stock MLX already
+// supplies Maple's fast gathered 2-bit QMV; these remove dispatches around those QMV calls.
+let mapleClampedSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { gate, up in
     let gateMaximum = MLXArray(Float(7)).asType(gate.dtype)
     let upMinimum = MLXArray(Float(-7)).asType(up.dtype)
     let upMaximum = MLXArray(Float(7)).asType(up.dtype)
     return silu(minimum(gate, gateMaximum)) * clip(up, min: upMinimum, max: upMaximum)
 }
 
-func mapleAggregateExpertOutputs(_ outputs: MLXArray, scores: MLXArray) -> MLXArray {
+let mapleAggregateExpertOutputs: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { outputs, scores in
     (outputs.asType(.float32) * expandedDimensions(scores, axis: -1))
         .sum(axis: -2).asType(outputs.dtype)
 }
@@ -308,7 +314,7 @@ final class MapleSwitchGLU: Module {
 
         let projected = upGateProj(input, selected, sortedIndices: shouldSort)
         let parts = split(projected, parts: 2, axis: -1)
-        let activated = mapleClampedSwiGLU(gate: parts[1], up: parts[0])
+        let activated = mapleClampedSwiGLU(parts[1], parts[0])
         var output = downProj(activated, selected, sortedIndices: shouldSort)
         if shouldSort {
             output = scatterUnsort(x: output, invOrder: inverseOrder, shape: indices.shape)
@@ -329,7 +335,7 @@ final class MapleSparseMoeBlock: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
         let outputs = switchMLP(x, indices: indices)
-        return mapleAggregateExpertOutputs(outputs, scores: scores)
+        return mapleAggregateExpertOutputs(outputs, scores)
     }
 }
 

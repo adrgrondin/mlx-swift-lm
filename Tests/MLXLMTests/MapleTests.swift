@@ -103,7 +103,7 @@ final class MapleTests: XCTestCase {
     func testExpertClampAndFloat32AggregationPreserveDType() {
         let gate = MLXArray([8, -8] as [Float]).asType(.bfloat16)
         let up = MLXArray([9, -9] as [Float]).asType(.bfloat16)
-        let activated = mapleClampedSwiGLU(gate: gate, up: up)
+        let activated = mapleClampedSwiGLU(gate, up)
         let expected =
             silu(minimum(gate, MLXArray(Float(7)).asType(.bfloat16)))
             * clip(
@@ -116,7 +116,7 @@ final class MapleTests: XCTestCase {
         let outputs = MLXArray([1000, 0.125, -1000, 0.25] as [Float]).asType(.bfloat16)
             .reshaped(1, 1, 2, 2)
         let scores = MLXArray([0.5001, 0.4999] as [Float]).reshaped(1, 1, 2)
-        let aggregated = mapleAggregateExpertOutputs(outputs, scores: scores)
+        let aggregated = mapleAggregateExpertOutputs(outputs, scores)
         let reference = (outputs.asType(.float32) * expandedDimensions(scores, axis: -1)).sum(
             axis: -2
         ).asType(.bfloat16)
@@ -133,8 +133,10 @@ final class MapleTests: XCTestCase {
 
         let slidingCache = KVCacheSimple()
         let fullCache = KVCacheSimple()
-        let oldKeys = zeros([1, 1, 2, 4])
-        let oldValues = zeros([1, 1, 2, 4])
+        let oldKeys = MLXArray([0.2, -0.1, 0.4, 0.3, -0.5, 0.6, 0.7, -0.2] as [Float])
+            .reshaped(1, 1, 2, 4)
+        let oldValues = MLXArray([0.3, 0.8, -0.4, 0.1, 0.5, -0.7, 0.2, 0.9] as [Float])
+            .reshaped(1, 1, 2, 4)
         _ = slidingCache.update(keys: oldKeys, values: oldValues)
         _ = fullCache.update(keys: oldKeys, values: oldValues)
         let input = MLXArray([0.1, 0.2, 0.3, 0.4, -0.5, 0.6, -0.7, 0.8] as [Float])
@@ -170,6 +172,42 @@ final class MapleTests: XCTestCase {
         XCTAssertTrue(leaves["model.word_embeddings"] is QuantizedEmbedding)
         XCTAssertTrue(leaves["lm_head"] is QuantizedLinear)
         XCTAssertFalse(leaves["model.layers.1.mlp.gate"] is Quantized)
+    }
+
+    func testExpertGraphBenchmark() throws {
+        guard ProcessInfo.processInfo.environment["MAPLE_EXPERT_BENCHMARK"] == "1" else {
+            throw XCTSkip("Set MAPLE_EXPERT_BENCHMARK=1 to run")
+        }
+        let gate = MLXRandom.normal([8, 512]).asType(.bfloat16)
+        let up = MLXRandom.normal([8, 512]).asType(.bfloat16)
+        let outputs = MLXRandom.normal([1, 1, 8, 2048]).asType(.bfloat16)
+        let scores = softmax(MLXRandom.normal([1, 1, 8]), axis: -1)
+
+        func portableActivation() -> MLXArray {
+            silu(minimum(gate, MLXArray(Float(7)).asType(gate.dtype)))
+                * clip(
+                    up, min: MLXArray(Float(-7)).asType(up.dtype),
+                    max: MLXArray(Float(7)).asType(up.dtype))
+        }
+        func portableAggregate() -> MLXArray {
+            (outputs.asType(.float32) * expandedDimensions(scores, axis: -1))
+                .sum(axis: -2).asType(outputs.dtype)
+        }
+        eval(mapleClampedSwiGLU(gate, up), mapleAggregateExpertOutputs(outputs, scores))
+        eval(portableActivation(), portableAggregate())
+
+        func measure(_ body: () -> MLXArray) -> Double {
+            let start = ProcessInfo.processInfo.systemUptime
+            for _ in 0 ..< 200 { eval(body()) }
+            return ProcessInfo.processInfo.systemUptime - start
+        }
+        let compiled =
+            measure { mapleClampedSwiGLU(gate, up) }
+            + measure { mapleAggregateExpertOutputs(outputs, scores) }
+        let portable = measure(portableActivation) + measure(portableAggregate)
+        print(
+            "Maple expert graphs: compiled=\(compiled)s portable=\(portable)s speedup=\(portable / compiled)x"
+        )
     }
 
     func testMixedCachesAndPrefillDecodeContinuation() throws {
