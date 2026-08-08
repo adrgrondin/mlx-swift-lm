@@ -145,7 +145,19 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
                         //
                         // import Tokenizers
                         //
-                        let upstream = try await Tokenizers.AutoTokenizer.from(modelFolder: directory)
+                        let upstream: Tokenizers.Tokenizer
+                        do {
+                            upstream = try await Tokenizers.AutoTokenizer.from(
+                                modelFolder: directory)
+                        } catch Tokenizers.TokenizerError.unsupportedTokenizer(let name)
+                            where name == "MapleTokenizer"
+                        {
+                            // Maple ships a standard tokenizer.json BPE model under a
+                            // checkpoint-specific class name. Non-strict mode selects
+                            // Swift Tokenizers' standard BPE implementation.
+                            upstream = try await Tokenizers.AutoTokenizer.from(
+                                modelFolder: directory, strict: false)
+                        }
                         return #adaptHuggingFaceTokenizer(upstream)
                     }
                 }

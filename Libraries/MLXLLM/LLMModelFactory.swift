@@ -32,6 +32,7 @@ public enum LLMTypeRegistry {
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
         "mistral": create(LlamaConfiguration.self, LlamaModel.init),
         "mixtral": create(MixtralConfiguration.self, MixtralModel.init),
+        "maple": create(MapleConfiguration.self, MapleModel.init),
         "llama": create(LlamaConfiguration.self, LlamaModel.init),
         "phi": create(PhiConfiguration.self, PhiModel.init),
         "phi3": create(Phi3Configuration.self, Phi3Model.init),
@@ -105,6 +106,11 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     /// Shared instance with default model configurations.
     public static let shared = LLMRegistry(modelConfigurations: all())
+
+    static public let maple2bitMLX = ModelConfiguration(
+        id: "deepgrove/maple-2bit-mlx",
+        defaultPrompt: "Why is the sky blue?"
+    )
 
     static public let smolLM_135M_4bit = ModelConfiguration(
         id: "mlx-community/SmolLM-135M-Instruct-4bit",
@@ -463,6 +469,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             llama3_8B_4bit,
             mistral7B4bit,
             mistralNeMo4bit,
+            maple2bitMLX,
             openelm270m4bit,
             phi3_5MoE,
             phi3_5_4bit,

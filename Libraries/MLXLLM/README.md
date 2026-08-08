@@ -27,6 +27,7 @@ The following models have been tried:
 - mlx-community/CodeLlama-13b-Instruct-hf-4bit-MLX
 - mlx-community/Llama-3.2-1B-Instruct-4bit
 - mlx-community/Llama-3.2-3B-Instruct-4bit
+- deepgrove/maple-2bit-mlx
 - mlx-community/Meta-Llama-3-8B-Instruct-4bit
 - mlx-community/Meta-Llama-3.1-8B-Instruct-4bit
 - mlx-community/Mistral-7B-Instruct-v0.3-4bit
@@ -48,6 +49,7 @@ Currently supported model types are:
 - Gemma2
 - InternLM2
 - Llama / Mistral
+- Maple
 - MiniCPM (v1/v2/v4; v3 uses a different architecture)
 - OpenELM
 - Phi
@@ -85,6 +87,23 @@ let session = ChatSession(model)
 print(try await session.respond(to: "What are two things to see in San Francisco?"))
 print(try await session.respond(to: "How about a great place to eat?"))
 ```
+
+## Maple
+
+Maple has a native exact-head implementation. Load the released mixed-quantized checkpoint through the normal API; its bundled tokenizer and chat template are used automatically:
+
+```swift
+let model = try await loadModel(
+    using: TokenizersLoader(),
+    id: "deepgrove/maple-2bit-mlx"
+)
+let session = ChatSession(model)
+print(try await session.respond(to: "Why is the sky blue?"))
+```
+
+The checkpoint's `model_file: "maple.py"` entry is ignored: `model_type: "maple"` selects registered Swift code and does not execute remote Python. The exact vocabulary head is always used; optional `lm_head_flash.*` tensors are ignored until approximate FlashHead support is available.
+
+The released model is a 20B-A1B sparse MoE with 2-bit transformer/expert weights and 4-bit embeddings/output head. A Mac with at least 16 GB of unified memory is recommended; available memory, prompt length, and other applications affect the practical limit. For now, producing compatible ternary checkpoints requires the Maple-specific Python converter from the [DeepGrove MLX LM fork](https://github.com/deepgrove-ai/mlx-lm); generic round-to-nearest conversion does not reproduce Maple's trained ternarization.
 
 For more information see 
 [Evaluation](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/evaluation)
