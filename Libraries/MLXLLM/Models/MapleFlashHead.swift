@@ -131,10 +131,14 @@ public final class MapleFlashHead: Module {
     /// Score the last position of `h` `[1, 1, hidden]` approximately. Returns
     /// `[1, 1, vocab]` with -inf for every unscored token.
     func callAsFunction(_ h: MLXArray, lmHead: QuantizedLinear) -> MLXArray {
-        let hv = h[0..., h.dim(1) - 1, 0...]
+        // Range slices avoid scalar Gather index metadata, which iOS 27's
+        // Metal validation rejects as a nil setBytes argument.
+        let lastPosition = h.dim(1) - 1
+        let hv = h[0..., lastPosition ..< (lastPosition + 1), 0...].squeezed(axis: 1)
         let top = argPartition(centroids(hv), kth: -nProbes, axis: -1)[
             .ellipsis, (-nProbes)...]  // [1, nProbes]
-        var oids = take(tokenMap, top[0], axis: 0).reshaped(-1)
+        let topIndices = top.squeezed(axis: 0)
+        var oids = take(tokenMap, topIndices, axis: 0).reshaped(-1)
 
         var logits = gatherQuantizedMM(
             hv.reshaped(1, 1, 1, 1, -1),
@@ -173,15 +177,15 @@ public final class MapleFlashHead: Module {
                 groupSize: lmHead.groupSize,
                 bits: lmHead.bits,
                 mode: .affine
-            )[0]
+            ).squeezed(axis: 0)
             oids = concatenated([oids, forceIds!])
             logits = concatenated([logits, forceLogits])
         }
 
         let vocabularySize = lmHead.weight.dim(0)
-        var full = MLXArray.full(
+        let full = MLXArray.full(
             [1, 1, vocabularySize], values: MLXArray(-Float.infinity), dtype: logits.dtype)
-        full[0, 0, oids] = logits
+        full[0 ..< 1, 0 ..< 1, oids] = logits.reshaped(1, 1, -1)
         return full
     }
 }
