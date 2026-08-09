@@ -101,7 +101,24 @@ let session = ChatSession(model)
 print(try await session.respond(to: "Why is the sky blue?"))
 ```
 
-The checkpoint's `model_file: "maple.py"` entry is ignored: `model_type: "maple"` selects registered Swift code and does not execute remote Python. The exact vocabulary head is always used; optional `lm_head_flash.*` tensors are ignored until approximate FlashHead support is available.
+The checkpoint's `model_file: "maple.py"` entry is ignored: `model_type: "maple"` selects registered Swift code and does not execute remote Python.
+
+Single-token decode uses fused Metal kernels (residual-add + RMSNorm, per-head Q/K norm + RoPE, and the MoE router) that are probed once against the portable implementation on live weights and permanently fall back to it on any mismatch. Set `MLX_MAPLE_FUSED_KERNELS=0` to force the portable decode path.
+
+Checkpoints carrying `flash_head` metadata also load the approximate FlashHead tensors. The exact vocabulary head remains the default; opt in to the approximate head for single-stream decode through the loaded model container:
+
+```swift
+let container = try await loadModelContainer(
+    using: TokenizersLoader(),
+    id: "deepgrove/maple-2bit-mlx"
+)
+// Opt in to the approximate FlashHead for single-stream decode.
+await container.perform { context in
+    (context.model as? MapleModel)?.headMode = .flash
+}
+```
+
+In `.flash` mode, decode scores cluster centroids and then exactly scores only the top clusters' tokens plus forced control tokens; unscored vocabulary is `-inf`. Prefill, batched calls, and non-quantized heads always use the exact head. Greedy decoding is exact whenever the true argmax lies in the probed clusters.
 
 The released model is a 20B-A1B sparse MoE with 2-bit transformer/expert weights and 4-bit embeddings/output head. A Mac with at least 16 GB of unified memory is recommended; available memory, prompt length, and other applications affect the practical limit. For now, producing compatible ternary checkpoints requires the Maple-specific Python converter from the [DeepGrove MLX LM fork](https://github.com/deepgrove-ai/mlx-lm); generic round-to-nearest conversion does not reproduce Maple's trained ternarization.
 

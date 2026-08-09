@@ -44,7 +44,7 @@ public struct MapleConfiguration: Codable, Sendable {
     public var useQKNorm: Bool
     public var useBias: Bool
     public var tieWordEmbeddings: Bool
-    public var flashHead: [String: JSONValue]?
+    public var flashHead: MapleFlashHeadMetadata?
     public var quantization: MapleQuantizationConfiguration?
 
     enum CodingKeys: String, CodingKey {
@@ -102,7 +102,7 @@ public struct MapleConfiguration: Codable, Sendable {
         useQKNorm = try c.decodeIfPresent(Bool.self, forKey: .useQKNorm) ?? true
         useBias = try c.decodeIfPresent(Bool.self, forKey: .useBias) ?? false
         tieWordEmbeddings = try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
-        flashHead = try c.decodeIfPresent([String: JSONValue].self, forKey: .flashHead)
+        flashHead = try c.decodeIfPresent(MapleFlashHeadMetadata.self, forKey: .flashHead)
         quantization = try c.decodeIfPresent(
             MapleQuantizationConfiguration.self, forKey: .quantization)
     }
@@ -171,6 +171,9 @@ final class MapleAttention: Module {
     let headDim: Int
     let scale: Float
     let useRoPE: Bool
+    let rotaryDimensions: Int
+    let eps: Float
+    let ropeTheta: Float
 
     @ModuleInfo(key: "qkv_proj") var qkvProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
@@ -179,12 +182,25 @@ final class MapleAttention: Module {
 
     let rope: RoPELayer
 
+    /// Fused Q/K norm+RoPE state: nil = unprobed, then true/false (latched).
+    var fusedQK: Bool?
+    /// Per-head norm weights broadcast to `[heads, headDim]`, and the rope
+    /// inverse frequencies, built lazily for the fused kernel.
+    var fusedQKWeights: MLXArray?
+    var fusedInvFreq: MLXArray?
+
+    /// The kernel pairs rope dims directly from `rope_theta`, so it only
+    /// matches the portable path when there is no rope scaling.
+    let fusedQKEligible: Bool
+
     init(_ config: MapleConfiguration, layerType: String) {
         attentionHeads = config.attentionHeads
         kvHeads = config.kvHeads
         headDim = config.headDim
         scale = pow(Float(config.headDim), -0.5)
         useRoPE = layerType == "sliding_attention"
+        eps = config.rmsNormEps
+        ropeTheta = config.ropeTheta
 
         _qkvProj.wrappedValue = Linear(
             config.hiddenSize,
@@ -197,20 +213,116 @@ final class MapleAttention: Module {
             _kNorm.wrappedValue = MapleRMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
         }
 
-        let rotaryDimensions = max(2, Int(Float(config.headDim) * config.partialRotaryFactor))
+        rotaryDimensions = max(2, Int(Float(config.headDim) * config.partialRotaryFactor))
+        fusedQKEligible =
+            mapleFusedKernelsEnabled
+            && config.useQKNorm && config.ropeScaling == nil
+            && config.headDim > 0 && config.headDim % 32 == 0
+            && (!useRoPE
+                || (rotaryDimensions > 0 && rotaryDimensions % 2 == 0
+                    && rotaryDimensions <= config.headDim))
         rope = initializeRope(
             dims: rotaryDimensions, base: config.ropeTheta, traditional: false,
             scalingConfig: config.ropeScaling,
             maxPositionEmbeddings: config.maxPositionEmbeddings)
     }
 
+    /// Build the concatenated per-head norm weights and rope frequencies once.
+    func prepareFusedQK() {
+        guard fusedQKWeights == nil else { return }
+        let weights = contiguous(
+            concatenated([
+                broadcast(
+                    qNorm!.weight.expandedDimensions(axis: 0),
+                    to: [attentionHeads, headDim]),
+                broadcast(
+                    kNorm!.weight.expandedDimensions(axis: 0),
+                    to: [kvHeads, headDim]),
+            ]))
+        let invFreq: MLXArray
+        if useRoPE {
+            let half = rotaryDimensions / 2
+            let exponents = MLXArray(0 ..< half).asType(.float32) / Float(half)
+            invFreq = pow(MLXArray(ropeTheta), -exponents)
+        } else {
+            invFreq = MLXArray.ones([1], dtype: .float32)
+        }
+        fusedQKWeights = weights
+        fusedInvFreq = invFreq
+        eval(weights, invFreq)
+    }
+
+    func fusedQKDecode(_ qk: MLXArray, offset: Int) -> MLXArray {
+        prepareFusedQK()
+        // The kernel reads x, w, and out through one templated pointer type,
+        // so the norm weights must share the activation dtype (float32 math
+        // inside the kernel is unaffected by the storage cast).
+        if fusedQKWeights!.dtype != qk.dtype {
+            let cast = fusedQKWeights!.asType(qk.dtype)
+            eval(cast)
+            fusedQKWeights = cast
+        }
+        return MapleQKNormRoPEKernel.callAsFunction(
+            qk, weights: fusedQKWeights!, invFreq: fusedInvFreq!, offset: offset, eps: eps,
+            headDim: headDim, ropeDim: useRoPE ? rotaryDimensions : 0)
+    }
+
+    /// The same result from stock ops: fallback, and the yardstick the fused
+    /// kernel is checked against.
+    func referenceQKDecode(_ qk: MLXArray, offset: Int) -> MLXArray {
+        var queries = qk[0 ..< attentionHeads].reshaped(1, attentionHeads, 1, headDim)
+        var keys = qk[attentionHeads...].reshaped(1, kvHeads, 1, headDim)
+        if let qNorm { queries = qNorm(queries) }
+        if let kNorm { keys = kNorm(keys) }
+        if useRoPE {
+            queries = applyRotaryPosition(rope, to: queries, offset: .scalar(offset))
+            keys = applyRotaryPosition(rope, to: keys, offset: .scalar(offset))
+        }
+        return concatenated([queries, keys], axis: 1).reshaped(qk.shape)
+    }
+
+    /// Probe the fused kernel against the reference at a nonzero position, so
+    /// a broken rotation cannot pass.
+    private func probeFusedQK(_ qk: MLXArray) -> Bool {
+        mapleKernelMatches(
+            fast: { [fusedQKDecode(qk, offset: 7)] },
+            reference: { [referenceQKDecode(qk, offset: 7)] })
+    }
+
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
+        let qkv = qkvProj(x)
+
+        if batch == 1 && length == 1 && fusedQKEligible && !(cache is BatchPositionedKVCache) {
+            // Single-token decode: one dispatch for both Q/K norms and both
+            // rope applications instead of four.
+            let nQ = attentionHeads
+            let qkSize = (attentionHeads + kvHeads) * headDim
+            let flat = qkv.reshaped(-1)
+            let qk = flat[0 ..< qkSize].reshaped(attentionHeads + kvHeads, headDim)
+            if fusedQK == nil {
+                fusedQK = probeFusedQK(qk)
+            }
+            let offset = cache?.offset ?? 0
+            let out =
+                fusedQK == true
+                ? fusedQKDecode(qk, offset: offset)
+                : referenceQKDecode(qk, offset: offset)
+            let queries = out[0 ..< nQ].reshaped(1, nQ, 1, headDim)
+            let keys = out[nQ...].reshaped(1, kvHeads, 1, headDim)
+            let values = flat[qkSize...].reshaped(1, kvHeads, 1, headDim)
+
+            let output = attentionWithCacheUpdate(
+                queries: queries, keys: keys, values: values, cache: cache,
+                scale: scale, mask: mask)
+            return oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+        }
+
         let qSize = attentionHeads * headDim
         let kSize = kvHeads * headDim
-        let parts = split(qkvProj(x), indices: [qSize, qSize + kSize], axis: -1)
+        let parts = split(qkv, indices: [qSize, qSize + kSize], axis: -1)
 
         var queries = parts[0].reshaped(batch, length, attentionHeads, headDim)
         var keys = parts[1].reshaped(batch, length, kvHeads, headDim)
@@ -255,13 +367,39 @@ final class MapleMLP: Module, UnaryLayer {
 final class MapleGate: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let topK: Int
+    let numExperts: Int
+    let hiddenSize: Int
+
+    /// Fused-router state: nil = unprobed, then true/false (latched).
+    var fusedRouter: Bool?
+    /// Persistent arrival counter for the fused router; private to this gate.
+    var routerCounter: MLXArray?
 
     init(_ config: MapleConfiguration) {
         topK = config.numExpertsPerToken
+        numExperts = config.numExperts
+        hiddenSize = config.hiddenSize
         _weight.wrappedValue = zeros([config.numExperts, config.hiddenSize])
     }
 
-    func callAsFunction(_ x: MLXArray) -> (indices: MLXArray, scores: MLXArray) {
+    private var fusedRouterEligible: Bool {
+        mapleFusedKernelsEnabled
+            && MapleFusedRouterKernel.supports(
+                topK: topK, numExperts: numExperts, hiddenSize: hiddenSize)
+    }
+
+    func fusedCall(_ x: MLXArray) -> (indices: MLXArray, scores: MLXArray) {
+        if routerCounter == nil {
+            let counter = MLXArray.zeros([8], dtype: .uint32)
+            eval(counter)
+            routerCounter = counter
+        }
+        return MapleFusedRouterKernel.callAsFunction(
+            x, weight: weight, counter: routerCounter!, topK: topK,
+            numExperts: numExperts, hiddenSize: hiddenSize)
+    }
+
+    func referenceCall(_ x: MLXArray) -> (indices: MLXArray, scores: MLXArray) {
         let logits = x.asType(.float32).matmul(weight.asType(.float32).T)
         let probabilities = softmax(logits, axis: -1, precise: true)
         let indices = stopGradient(
@@ -269,6 +407,43 @@ final class MapleGate: Module {
         var scores = takeAlong(probabilities, indices, axis: -1)
         scores = scores / (scores.sum(axis: -1, keepDims: true) + 1e-20)
         return (indices, scores)
+    }
+
+    /// Probe the fused router on a live single-token activation. The two paths
+    /// may order the selected experts differently, and an exact tie at the
+    /// top-k boundary may legitimately pick either expert, so compare sorted
+    /// score vectors and bound-check the ids (a bad id indexes the expert
+    /// gather).
+    private func probeFusedRouter(_ x: MLXArray) -> Bool {
+        do {
+            return try withError {
+                let (indices, scores) = fusedCall(x)
+                let (referenceIndices, referenceScores) = referenceCall(x)
+                eval(indices, scores, referenceIndices, referenceScores)
+                guard indices.shape == referenceIndices.shape else { return false }
+                let inBounds = ((indices .>= 0) .&& (indices .< numExperts)).all()
+                eval(inBounds)
+                guard inBounds.item(Bool.self) else { return false }
+                let close = sorted(scores, axis: -1).allClose(
+                    sorted(referenceScores, axis: -1), rtol: 1e-5, atol: 1e-5)
+                eval(close)
+                return close.item(Bool.self)
+            }
+        } catch {
+            return false
+        }
+    }
+
+    func callAsFunction(_ x: MLXArray) -> (indices: MLXArray, scores: MLXArray) {
+        if fusedRouter != false, fusedRouterEligible, x.size == hiddenSize {
+            if fusedRouter == nil {
+                fusedRouter = probeFusedRouter(x)
+            }
+            if fusedRouter == true {
+                return fusedCall(x)
+            }
+        }
+        return referenceCall(x)
     }
 }
 
@@ -376,6 +551,11 @@ public final class MapleModelInner: Module {
     let slidingAttentionIndex: Int?
     let fullAttentionIndex: Int?
 
+    /// Fused add+norm decode state: nil = unprobed, then true/false (latched).
+    var fusedAddNorm: Bool?
+    /// Initial residual for the fused decode loop; `x + 0` is exact in bf16.
+    var fusedZero: MLXArray?
+
     init(_ config: MapleConfiguration) {
         _wordEmbeddings.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
@@ -401,11 +581,61 @@ public final class MapleModelInner: Module {
                 h: hidden, cache: caches[index], windowSize: slidingWindow)
         }
 
+        if hidden.size == hidden.dim(-1) {
+            // Single-token decode is bounded by the serial dispatch chain:
+            // fold each residual add into the following norm (one dispatch per
+            // add+norm pair) when the kernel matches the portable semantics.
+            if fusedAddNorm == nil {
+                fusedAddNorm =
+                    mapleFusedKernelsEnabled
+                    && MapleAddRMSNormKernel.supports(dimensions: hidden.dim(-1))
+                    && MapleAddRMSNormKernel.probe(
+                        dimensions: hidden.dim(-1), dtype: hidden.dtype,
+                        weight: norm.weight, eps: norm.eps)
+            }
+            if fusedAddNorm == true {
+                return decodeFused(
+                    hidden, caches: caches, fullMask: fullMask, slidingMask: slidingMask)
+            }
+        }
+
         for (index, layer) in layers.enumerated() {
             let mask = layerTypes[index] == "sliding_attention" ? slidingMask! : fullMask!
             hidden = layer(hidden, mask: mask, cache: caches[index])
         }
         return norm(hidden)
+    }
+
+    /// Decode loop with residual adds folded into the norms. Carries `(h, r)`
+    /// instead of adding `r` back each step; identical arithmetic: the kernel
+    /// rounds the sum once (as the portable add did) and norms the rounded
+    /// stream with a float32 weight multiply.
+    private func decodeFused(
+        _ h0: MLXArray, caches: [KVCache?],
+        fullMask: MLXFast.ScaledDotProductAttentionMaskMode?,
+        slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
+    ) -> MLXArray {
+        if fusedZero == nil || fusedZero!.dtype != h0.dtype || fusedZero!.shape != h0.shape {
+            let zero = MLXArray.zeros(h0.shape, dtype: h0.dtype)
+            eval(zero)
+            fusedZero = zero
+        }
+        var h = h0
+        var r = fusedZero!
+        for (index, layer) in layers.enumerated() {
+            let mask = layerTypes[index] == "sliding_attention" ? slidingMask! : fullMask!
+            let inputNorm = layer.inputLayerNorm
+            let afterAttention = MapleAddRMSNormKernel.callAsFunction(
+                h, r, inputNorm.weight, eps: inputNorm.eps)
+            h = afterAttention.h
+            r = layer.selfAttention(afterAttention.hn, mask: mask, cache: caches[index])
+            let postNorm = layer.postAttentionLayerNorm
+            let afterMLPInput = MapleAddRMSNormKernel.callAsFunction(
+                h, r, postNorm.weight, eps: postNorm.eps)
+            h = afterMLPInput.h
+            r = layer.mlp(afterMLPInput.hn)
+        }
+        return MapleAddRMSNormKernel.callAsFunction(h, r, norm.weight, eps: norm.eps).hn
     }
 }
 
@@ -416,6 +646,26 @@ public final class MapleModel: Module, LLMModel, KVCacheDimensionProvider {
     let configuration: MapleConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    /// Present when the checkpoint carries usable `flash_head` metadata.
+    @ModuleInfo(key: "lm_head_flash") public var lmHeadFlash: MapleFlashHead?
+
+    /// Permanently force the portable single-token decode path (no fused
+    /// Metal kernels). Useful for diagnostics and A/B benchmarking; the
+    /// `MLX_MAPLE_FUSED_KERNELS=0` environment variable has the same effect
+    /// from process start.
+    public func disableFusedDecodeKernels() {
+        model.fusedAddNorm = false
+        for layer in model.layers {
+            layer.selfAttention.fusedQK = false
+            (layer.mlp as? MapleSparseMoeBlock)?.gate.fusedRouter = false
+        }
+    }
+
+    /// Output-head selection: ``MapleHeadMode/exact`` (default) or the
+    /// approximate ``MapleHeadMode/flash`` head for single-token decode.
+    /// Callers may set this on the model inside a loaded container; the exact
+    /// head is always used for prefill, batches, and unsupported heads.
+    public var headMode: MapleHeadMode = .exact
 
     public init(_ config: MapleConfiguration) {
         configuration = config
@@ -424,19 +674,56 @@ public final class MapleModel: Module, LLMModel, KVCacheDimensionProvider {
         model = MapleModelInner(config)
         if !config.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
+            // Instantiate FlashHead tensors whenever valid metadata exists so a
+            // FlashHead-bearing checkpoint loads in one pass; it stays unused
+            // until headMode is set to .flash.
+            if let metadata = config.flashHead, metadata.isValid {
+                _lmHeadFlash.wrappedValue = MapleFlashHead(
+                    hiddenSize: config.hiddenSize, metadata: metadata)
+            }
         }
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let hidden = model(inputs, cache: cache)
+        if headMode == .flash, let flash = lmHeadFlash,
+            hidden.dim(0) == 1, hidden.dim(1) == 1,
+            let head = lmHead as? QuantizedLinear, head.mode == .affine
+        {
+            return flash(hidden, lmHead: head)
+        }
         return lmHead?(hidden) ?? model.wordEmbeddings.asLinear(hidden)
     }
 
     public func sanitize(weights original: [String: MLXArray]) -> [String: MLXArray] {
         var weights = original.filter { key, _ in
-            !key.hasPrefix("lm_head_flash.")
-                && !key.contains("rotary_emb.inv_freq")
+            !key.contains("rotary_emb.inv_freq")
                 && !(configuration.tieWordEmbeddings && key.hasPrefix("lm_head."))
+        }
+
+        if lmHeadFlash == nil {
+            // No usable FlashHead metadata: drop its tensors so checkpoints
+            // that carry them still load.
+            weights = weights.filter { !$0.key.hasPrefix("lm_head_flash.") }
+        } else {
+            // Folded into the centroid rows at generation time; older shards
+            // still carry the tensor.
+            weights.removeValue(forKey: "lm_head_flash.cluster_scale")
+            // `lm_head_flash.head.*` is lm_head permuted by token_map, so it is
+            // pure redundancy on disk. Checkpoints may ship it or omit it;
+            // reconcile both here.
+            if weights["lm_head_flash.head.weight"] == nil,
+                let tokenMap = weights["lm_head_flash.token_map"]
+            {
+                let order = tokenMap.reshaped(-1)
+                for suffix in ["weight", "scales", "biases"] {
+                    if let source = weights["lm_head.\(suffix)"] {
+                        weights["lm_head_flash.head.\(suffix)"] =
+                            take(source, order, axis: 0)
+                            .reshaped(tokenMap.dim(0), tokenMap.dim(1), -1)
+                    }
+                }
+            }
         }
 
         let rowAlphaKeys = weights.keys.filter { $0.hasSuffix(".row_alpha") }
