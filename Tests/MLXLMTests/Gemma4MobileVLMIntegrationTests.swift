@@ -90,7 +90,7 @@ struct Gemma4MobileVLMIntegrationTests {
         #expect(vProjLinear.numBits == 8)
 
         // Forward pass (text-only) produces finite logits of the right shape.
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         let tokens = MLXArray([1, 2, 3]).reshaped([1, 3])
         let logits = model(tokens, cache: cache)
         eval(logits)

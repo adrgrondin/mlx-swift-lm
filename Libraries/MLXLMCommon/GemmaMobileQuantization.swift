@@ -80,7 +80,7 @@ private func orderedModuleQuantConfigKeys(from data: Data) -> [String]? {
     guard let mqc, !mqc.isEmpty else { return nil }
 
     guard let marker = text.range(of: "\"module_quant_configs\"") else { return nil }
-    let searchRange = marker.upperBound..<text.endIndex
+    let searchRange = marker.upperBound ..< text.endIndex
 
     var positioned: [(String, String.Index)] = []
     for key in mqc.keys {
@@ -162,7 +162,9 @@ public func applySRQ(_ x: MLXArray, scale: MLXArray, bits: Int = 8) -> MLXArray 
 /// path (the `quantizedMM` output differed by up to 4.4% relative, compounding
 /// across 35 layers to a 1.16 mean abs diff in logits).
 private enum CompiledSRQ {
-    nonisolated(unsafe) static let apply: (MLXArray, MLXArray) -> MLXArray = MLX.compile(shapeless: true) {
+    nonisolated(unsafe) static let apply: (MLXArray, MLXArray) -> MLXArray = MLX.compile(
+        shapeless: true
+    ) {
         (x, s) in
         let st = s.asType(.float32)
         return MLX.clip(MLX.round(x.asType(.float32) / st), min: -128, max: 127) * st
@@ -300,7 +302,7 @@ public func mobileToMLX(
         let b1 = reshaped[.ellipsis, 1]
         let b2 = reshaped[.ellipsis, 2]
         let b3 = reshaped[.ellipsis, 3]
-        packed = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+        packed = b0 + b1 * 256 + b2 * 65536 + b3 * 16_777_216
     }
 
     // Per-group scales/biases.
@@ -366,8 +368,14 @@ public struct GemmaMobileQuantizationConfig: Codable, Sendable {
     private struct AnyCodingKey: CodingKey {
         var stringValue: String
         var intValue: Int?
-        init?(stringValue: String) { self.stringValue = stringValue; self.intValue = nil }
-        init?(intValue: Int) { self.stringValue = "\(intValue)"; self.intValue = intValue }
+        init?(stringValue: String) {
+            self.stringValue = stringValue
+            self.intValue = nil
+        }
+        init?(intValue: Int) {
+            self.stringValue = "\(intValue)"
+            self.intValue = intValue
+        }
     }
 
     enum CodingKeys: String, CodingKey {
@@ -427,7 +435,8 @@ public struct GemmaMobileQuantizationConfig: Codable, Sendable {
         try c.encode(modulesToNotConvert, forKey: .modulesToNotConvert)
         var nested = c.nestedContainer(keyedBy: AnyCodingKey.self, forKey: .moduleQuantConfigs)
         for (pattern, bits) in moduleQuantConfigs {
-            try nested.encode(ModuleQuantConfig(numBits: bits), forKey: AnyCodingKey(stringValue: pattern)!)
+            try nested.encode(
+                ModuleQuantConfig(numBits: bits), forKey: AnyCodingKey(stringValue: pattern)!)
         }
     }
 }
@@ -501,64 +510,64 @@ private let gemmaQMVOutputsPerThreadgroup = 8  // 2 simdgroups × 4
 /// - `OUTPUTS_PER_THREADGROUP` — 8
 /// - `UNPACK_BLOCK` — bit-width-specific unpack + MAC snippet
 private let gemmaQMVSourceTemplate = """
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint input_row = threadgroup_position_in_grid.z;
-    uint input_dims = x_shape[1];
-    uint output_dims = weight_shape[0];
-    uint packed_in = weight_shape[1];
-    uint output_start = threadgroup_position_in_grid.y * OUTPUTS_PER_THREADGROUP
-        + simd_group * OUTPUTS_PER_SIMDGROUP;
+        uint lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint input_row = threadgroup_position_in_grid.z;
+        uint input_dims = x_shape[1];
+        uint output_dims = weight_shape[0];
+        uint packed_in = weight_shape[1];
+        uint output_start = threadgroup_position_in_grid.y * OUTPUTS_PER_THREADGROUP
+            + simd_group * OUTPUTS_PER_SIMDGROUP;
 
-    // Input SRQ scale is scalar (shared across all output rows); 0.0 means
-    // uncalibrated → no-op. Output SRQ scale is scalar for standalone layers.
-    float in_s = static_cast<float>(input_scale[0]);
+        // Input SRQ scale is scalar (shared across all output rows); 0.0 means
+        // uncalibrated → no-op. Output SRQ scale is scalar for standalone layers.
+        float in_s = static_cast<float>(input_scale[0]);
 
-    float accumulators[OUTPUTS_PER_SIMDGROUP] = {0.0f};
-    constexpr uint VALUES_PER_THREAD = 16;
-    constexpr uint BYTES_PER_THREAD = VALUES_PER_THREAD / VALUES_PER_BYTE;
-    constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
+        float accumulators[OUTPUTS_PER_SIMDGROUP] = {0.0f};
+        constexpr uint VALUES_PER_THREAD = 16;
+        constexpr uint BYTES_PER_THREAD = VALUES_PER_THREAD / VALUES_PER_BYTE;
+        constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
 
-    for (uint block_start = lane * VALUES_PER_THREAD;
-         block_start < input_dims;
-         block_start += BLOCK_SIZE) {
-        // Read + input-SRQ x values ONCE, shared across OUTPUTS_PER_SIMDGROUP rows.
-        float x_thread[VALUES_PER_THREAD];
-        #pragma clang loop unroll(full)
-        for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
-            float x_val = static_cast<float>(
-                x[input_row * input_dims + block_start + i]);
-            if (in_s != 0.0f) {
-                x_val = clamp(round(x_val / in_s), -128.0f, 127.0f) * in_s;
-            }
-            x_thread[i] = x_val;
-        }
-        uint packed_start = block_start / VALUES_PER_BYTE;
-        for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
-            uint output_row = output_start + row;
-            if (output_row >= output_dims) break;
-            float row_sum = 0.0f;
+        for (uint block_start = lane * VALUES_PER_THREAD;
+             block_start < input_dims;
+             block_start += BLOCK_SIZE) {
+            // Read + input-SRQ x values ONCE, shared across OUTPUTS_PER_SIMDGROUP rows.
+            float x_thread[VALUES_PER_THREAD];
             #pragma clang loop unroll(full)
-            for (uint b = 0; b < BYTES_PER_THREAD; ++b) {
-                UNPACK_BLOCK
+            for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+                float x_val = static_cast<float>(
+                    x[input_row * input_dims + block_start + i]);
+                if (in_s != 0.0f) {
+                    x_val = clamp(round(x_val / in_s), -128.0f, 127.0f) * in_s;
+                }
+                x_thread[i] = x_val;
             }
-            accumulators[row] += row_sum;
+            uint packed_start = block_start / VALUES_PER_BYTE;
+            for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
+                uint output_row = output_start + row;
+                if (output_row >= output_dims) break;
+                float row_sum = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint b = 0; b < BYTES_PER_THREAD; ++b) {
+                    UNPACK_BLOCK
+                }
+                accumulators[row] += row_sum;
+            }
         }
-    }
 
-    for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
-        accumulators[row] = simd_sum(accumulators[row]);
-        uint output_row = output_start + row;
-        if (lane == 0 && output_row < output_dims) {
-            float result = accumulators[row] * static_cast<float>(weight_scale[output_row]);
-            float out_s = static_cast<float>(output_scale[0]);
-            if (out_s != 0.0f) {
-                result = clamp(round(result / out_s), -128.0f, 127.0f) * out_s;
+        for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
+            accumulators[row] = simd_sum(accumulators[row]);
+            uint output_row = output_start + row;
+            if (lane == 0 && output_row < output_dims) {
+                float result = accumulators[row] * static_cast<float>(weight_scale[output_row]);
+                float out_s = static_cast<float>(output_scale[0]);
+                if (out_s != 0.0f) {
+                    result = clamp(round(result / out_s), -128.0f, 127.0f) * out_s;
+                }
+                out[input_row * output_dims + output_row] = static_cast<T>(result);
             }
-            out[input_row * output_dims + output_row] = static_cast<T>(result);
         }
-    }
-"""
+    """
 
 /// Bit-width-specific Metal snippet that unpacks BYTES_PER_THREAD packed bytes
 /// and MACs into `row_sum`. Ported from Python `_gemma_unpack_block`.
@@ -566,23 +575,23 @@ private func gemmaQMVUnpackBlock(numBits: Int) -> String {
     switch numBits {
     case 2:
         return """
-                    uint byte = uint(weight[output_row * packed_in + packed_start + b]);
-                    row_sum += (float(byte & 0x3) - 2.0f) * x_thread[b * 4 + 0]
-                             + (float((byte >> 2) & 0x3) - 2.0f) * x_thread[b * 4 + 1]
-                             + (float((byte >> 4) & 0x3) - 2.0f) * x_thread[b * 4 + 2]
-                             + (float(byte >> 6) - 2.0f) * x_thread[b * 4 + 3];
-        """
+                        uint byte = uint(weight[output_row * packed_in + packed_start + b]);
+                        row_sum += (float(byte & 0x3) - 2.0f) * x_thread[b * 4 + 0]
+                                 + (float((byte >> 2) & 0x3) - 2.0f) * x_thread[b * 4 + 1]
+                                 + (float((byte >> 4) & 0x3) - 2.0f) * x_thread[b * 4 + 2]
+                                 + (float(byte >> 6) - 2.0f) * x_thread[b * 4 + 3];
+            """
     case 4:
         return """
-                    uint byte = uint(weight[output_row * packed_in + packed_start + b]);
-                    row_sum += (float(byte & 0xF) - 8.0f) * x_thread[b * 2 + 0]
-                             + (float(byte >> 4) - 8.0f) * x_thread[b * 2 + 1];
-        """
+                        uint byte = uint(weight[output_row * packed_in + packed_start + b]);
+                        row_sum += (float(byte & 0xF) - 8.0f) * x_thread[b * 2 + 0]
+                                 + (float(byte >> 4) - 8.0f) * x_thread[b * 2 + 1];
+            """
     case 8:
         return """
-                    int v = int(weight[output_row * packed_in + packed_start + b]);
-                    row_sum += float(v) * x_thread[b];
-        """
+                        int v = int(weight[output_row * packed_in + packed_start + b]);
+                        row_sum += float(v) * x_thread[b];
+            """
     default:
         fatalError("Unsupported numBits \(numBits); expected 2, 4, or 8.")
     }
@@ -598,10 +607,13 @@ private func gemmaQMVSource(numBits: Int) -> String {
     case 8: valuesPerByte = 1
     default: fatalError("Unsupported numBits \(numBits); expected 2, 4, or 8.")
     }
-    return gemmaQMVSourceTemplate
+    return
+        gemmaQMVSourceTemplate
         .replacingOccurrences(of: "VALUES_PER_BYTE", with: "\(valuesPerByte)")
         .replacingOccurrences(of: "OUTPUTS_PER_SIMDGROUP", with: "\(gemmaQMVOutputsPerSimdgroup)")
-        .replacingOccurrences(of: "OUTPUTS_PER_THREADGROUP", with: "\(gemmaQMVOutputsPerThreadgroup)")
+        .replacingOccurrences(
+            of: "OUTPUTS_PER_THREADGROUP", with: "\(gemmaQMVOutputsPerThreadgroup)"
+        )
         .replacingOccurrences(of: "UNPACK_BLOCK", with: gemmaQMVUnpackBlock(numBits: numBits))
 }
 
@@ -657,89 +669,89 @@ public func gemmaBuildPerRowOutputScale(
 /// so each simdgroup reads directly from one of the original buffers while
 /// retaining a single kernel launch.
 private let gemmaFusedQKVSourceTemplate = """
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint input_row = threadgroup_position_in_grid.z;
-    uint input_dims = x_shape[1];
-    uint q_output_dims = q_weight_shape[0];
-    uint k_output_dims = k_weight_shape[0];
-    uint v_output_dims = v_weight_shape[0];
-    uint output_dims = q_output_dims + k_output_dims + v_output_dims;
-    uint packed_in = q_weight_shape[1];
-    uint output_start = threadgroup_position_in_grid.y * OUTPUTS_PER_THREADGROUP
-        + simd_group * OUTPUTS_PER_SIMDGROUP;
+        uint lane = thread_index_in_simdgroup;
+        uint simd_group = simdgroup_index_in_threadgroup;
+        uint input_row = threadgroup_position_in_grid.z;
+        uint input_dims = x_shape[1];
+        uint q_output_dims = q_weight_shape[0];
+        uint k_output_dims = k_weight_shape[0];
+        uint v_output_dims = v_weight_shape[0];
+        uint output_dims = q_output_dims + k_output_dims + v_output_dims;
+        uint packed_in = q_weight_shape[1];
+        uint output_start = threadgroup_position_in_grid.y * OUTPUTS_PER_THREADGROUP
+            + simd_group * OUTPUTS_PER_SIMDGROUP;
 
-    float in_s = static_cast<float>(input_scale[0]);
-    float accumulators[OUTPUTS_PER_SIMDGROUP] = {0.0f};
-    constexpr uint VALUES_PER_THREAD = 16;
-    constexpr uint BYTES_PER_THREAD = VALUES_PER_THREAD / VALUES_PER_BYTE;
-    constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
+        float in_s = static_cast<float>(input_scale[0]);
+        float accumulators[OUTPUTS_PER_SIMDGROUP] = {0.0f};
+        constexpr uint VALUES_PER_THREAD = 16;
+        constexpr uint BYTES_PER_THREAD = VALUES_PER_THREAD / VALUES_PER_BYTE;
+        constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
 
-    for (uint block_start = lane * VALUES_PER_THREAD;
-         block_start < input_dims;
-         block_start += BLOCK_SIZE) {
-        float x_thread[VALUES_PER_THREAD];
-        #pragma clang loop unroll(full)
-        for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
-            float x_val = static_cast<float>(
-                x[input_row * input_dims + block_start + i]);
-            if (in_s != 0.0f) {
-                x_val = clamp(round(x_val / in_s), -128.0f, 127.0f) * in_s;
-            }
-            x_thread[i] = x_val;
-        }
-        uint packed_start = block_start / VALUES_PER_BYTE;
-        for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
-            uint output_row = output_start + row;
-            if (output_row >= output_dims) break;
-
-            uint projection_row = output_row;
-            auto selected_weight = q_weight;
-            if (output_row >= q_output_dims + k_output_dims) {
-                projection_row -= q_output_dims + k_output_dims;
-                selected_weight = v_weight;
-            } else if (output_row >= q_output_dims) {
-                projection_row -= q_output_dims;
-                selected_weight = k_weight;
-            }
-
-            float row_sum = 0.0f;
+        for (uint block_start = lane * VALUES_PER_THREAD;
+             block_start < input_dims;
+             block_start += BLOCK_SIZE) {
+            float x_thread[VALUES_PER_THREAD];
             #pragma clang loop unroll(full)
-            for (uint b = 0; b < BYTES_PER_THREAD; ++b) {
-                UNPACK_BLOCK
+            for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+                float x_val = static_cast<float>(
+                    x[input_row * input_dims + block_start + i]);
+                if (in_s != 0.0f) {
+                    x_val = clamp(round(x_val / in_s), -128.0f, 127.0f) * in_s;
+                }
+                x_thread[i] = x_val;
             }
-            accumulators[row] += row_sum;
-        }
-    }
+            uint packed_start = block_start / VALUES_PER_BYTE;
+            for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
+                uint output_row = output_start + row;
+                if (output_row >= output_dims) break;
 
-    for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
-        accumulators[row] = simd_sum(accumulators[row]);
-        uint output_row = output_start + row;
-        if (lane == 0 && output_row < output_dims) {
-            uint projection_row = output_row;
-            float weight_s;
-            float out_s;
-            if (output_row >= q_output_dims + k_output_dims) {
-                projection_row -= q_output_dims + k_output_dims;
-                weight_s = static_cast<float>(v_weight_scale[projection_row]);
-                out_s = static_cast<float>(v_output_scale[0]);
-            } else if (output_row >= q_output_dims) {
-                projection_row -= q_output_dims;
-                weight_s = static_cast<float>(k_weight_scale[projection_row]);
-                out_s = static_cast<float>(k_output_scale[0]);
-            } else {
-                weight_s = static_cast<float>(q_weight_scale[projection_row]);
-                out_s = static_cast<float>(q_output_scale[0]);
-            }
+                uint projection_row = output_row;
+                auto selected_weight = q_weight;
+                if (output_row >= q_output_dims + k_output_dims) {
+                    projection_row -= q_output_dims + k_output_dims;
+                    selected_weight = v_weight;
+                } else if (output_row >= q_output_dims) {
+                    projection_row -= q_output_dims;
+                    selected_weight = k_weight;
+                }
 
-            float result = accumulators[row] * weight_s;
-            if (out_s != 0.0f) {
-                result = clamp(round(result / out_s), -128.0f, 127.0f) * out_s;
+                float row_sum = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint b = 0; b < BYTES_PER_THREAD; ++b) {
+                    UNPACK_BLOCK
+                }
+                accumulators[row] += row_sum;
             }
-            out[input_row * output_dims + output_row] = static_cast<T>(result);
         }
-    }
-"""
+
+        for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
+            accumulators[row] = simd_sum(accumulators[row]);
+            uint output_row = output_start + row;
+            if (lane == 0 && output_row < output_dims) {
+                uint projection_row = output_row;
+                float weight_s;
+                float out_s;
+                if (output_row >= q_output_dims + k_output_dims) {
+                    projection_row -= q_output_dims + k_output_dims;
+                    weight_s = static_cast<float>(v_weight_scale[projection_row]);
+                    out_s = static_cast<float>(v_output_scale[0]);
+                } else if (output_row >= q_output_dims) {
+                    projection_row -= q_output_dims;
+                    weight_s = static_cast<float>(k_weight_scale[projection_row]);
+                    out_s = static_cast<float>(k_output_scale[0]);
+                } else {
+                    weight_s = static_cast<float>(q_weight_scale[projection_row]);
+                    out_s = static_cast<float>(q_output_scale[0]);
+                }
+
+                float result = accumulators[row] * weight_s;
+                if (out_s != 0.0f) {
+                    result = clamp(round(result / out_s), -128.0f, 127.0f) * out_s;
+                }
+                out[input_row * output_dims + output_row] = static_cast<T>(result);
+            }
+        }
+    """
 
 private func gemmaFusedQKVSource(numBits: Int) -> String {
     let valuesPerByte: Int
@@ -752,10 +764,13 @@ private func gemmaFusedQKVSource(numBits: Int) -> String {
     let unpack = gemmaQMVUnpackBlock(numBits: numBits)
         .replacingOccurrences(of: "weight[", with: "selected_weight[")
         .replacingOccurrences(of: "output_row", with: "projection_row")
-    return gemmaFusedQKVSourceTemplate
+    return
+        gemmaFusedQKVSourceTemplate
         .replacingOccurrences(of: "VALUES_PER_BYTE", with: "\(valuesPerByte)")
         .replacingOccurrences(of: "OUTPUTS_PER_SIMDGROUP", with: "\(gemmaQMVOutputsPerSimdgroup)")
-        .replacingOccurrences(of: "OUTPUTS_PER_THREADGROUP", with: "\(gemmaQMVOutputsPerThreadgroup)")
+        .replacingOccurrences(
+            of: "OUTPUTS_PER_THREADGROUP", with: "\(gemmaQMVOutputsPerThreadgroup)"
+        )
         .replacingOccurrences(of: "UNPACK_BLOCK", with: unpack)
 }
 
@@ -852,9 +867,15 @@ public final class GemmaQuantizedLinear: Linear {
         let packedIn: Int
         let wDtype: DType
         switch numBits {
-        case 2: packedIn = (inputDims + 3) / 4; wDtype = .uint8
-        case 4: packedIn = (inputDims + 1) / 2; wDtype = .uint8
-        case 8: packedIn = inputDims; wDtype = .int8
+        case 2:
+            packedIn = (inputDims + 3) / 4
+            wDtype = .uint8
+        case 4:
+            packedIn = (inputDims + 1) / 2
+            wDtype = .uint8
+        case 8:
+            packedIn = inputDims
+            wDtype = .int8
         default: fatalError("Unsupported numBits \(numBits); expected 2, 4, or 8.")
         }
         self.numBits = numBits
@@ -901,8 +922,10 @@ public final class GemmaQuantizedLinear: Linear {
     /// returned (even when zero / uncalibrated) — the compiled segment's `srqF32`
     /// handles the zero-scale no-op.
     public func nativeArgs()
-        -> (packed: MLXArray, scales: MLXArray, biases: MLXArray, inScale: MLXArray,
-            outScale: MLXArray)?
+        -> (
+            packed: MLXArray, scales: MLXArray, biases: MLXArray, inScale: MLXArray,
+            outScale: MLXArray
+        )?
     {
         if !_conversionDone {
             convertToMLXFormat()
@@ -958,7 +981,11 @@ public final class GemmaQuantizedLinear: Linear {
         let out = kernel(
             [x2d, weight, weightScale, inS, outS],
             template: [("T", x.dtype)],
-            grid: (64, (outputDims + gemmaQMVOutputsPerThreadgroup - 1) / gemmaQMVOutputsPerThreadgroup, batch),
+            grid: (
+                64,
+                (outputDims + gemmaQMVOutputsPerThreadgroup - 1) / gemmaQMVOutputsPerThreadgroup,
+                batch
+            ),
             threadGroup: (64, 1, 1),
             outputShapes: [[batch * outputDims]],
             outputDTypes: [x.dtype]
@@ -1037,7 +1064,8 @@ public final class GemmaQuantizedLinear: Linear {
         if parameter == "input_activation_scale" || parameter == "output_activation_scale" {
             return
         }
-        try super.updateMissing(parameter: parameter, verify: verify, path: path, modulePath: modulePath)
+        try super.updateMissing(
+            parameter: parameter, verify: verify, path: path, modulePath: modulePath)
     }
 }
 
@@ -1057,9 +1085,15 @@ public final class GemmaQuantizedEmbedding: Embedding {
         let packedDim: Int
         let wDtype: DType
         switch numBits {
-        case 2: packedDim = (embeddingDim + 3) / 4; wDtype = .uint8
-        case 4: packedDim = (embeddingDim + 1) / 2; wDtype = .uint8
-        case 8: packedDim = embeddingDim; wDtype = .int8
+        case 2:
+            packedDim = (embeddingDim + 3) / 4
+            wDtype = .uint8
+        case 4:
+            packedDim = (embeddingDim + 1) / 2
+            wDtype = .uint8
+        case 8:
+            packedDim = embeddingDim
+            wDtype = .int8
         default: fatalError("Unsupported numBits \(numBits); expected 2, 4, or 8.")
         }
         self.numBits = numBits
@@ -1100,7 +1134,8 @@ public final class GemmaQuantizedEmbedding: Embedding {
         if parameter == "embedding_scale" {
             return
         }
-        try super.updateMissing(parameter: parameter, verify: verify, path: path, modulePath: modulePath)
+        try super.updateMissing(
+            parameter: parameter, verify: verify, path: path, modulePath: modulePath)
     }
 }
 

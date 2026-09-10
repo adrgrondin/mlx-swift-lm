@@ -157,7 +157,7 @@ struct Gemma4MobileQuantizationTests {
     func mobileToMLXInt8() throws {
         // int8: 2 rows, 128 input dims → [2, 128] int8.
         var vals: [Int8] = []
-        for i in 0..<256 {
+        for i in 0 ..< 256 {
             vals.append(Int8(truncatingIfNeeded: i - 128))
         }
         let weight = MLXArray(vals, [2, 128])
@@ -338,7 +338,8 @@ struct Gemma4MobileQuantizationTests {
                 == 2)
         // Attention → 4 bits; PLE gates/projections → 8 bits.
         #expect(
-            resolveModuleBits(path: "language_model.model.layers.0.self_attn.q_proj", config: config)
+            resolveModuleBits(
+                path: "language_model.model.layers.0.self_attn.q_proj", config: config)
                 == 4)
         #expect(
             resolveModuleBits(
@@ -392,10 +393,14 @@ struct Gemma4MobileQuantizationTests {
         // ^lm_head$ < language_model.embed_tokens$ < ...mlp. < ...self_attn.
         #expect(
             config.moduleQuantConfigs.map { $0.0 }
-                == ["^lm_head$", "language_model.embed_tokens$",
-                    "language_model.layers.[0-9]+.mlp.", "language_model.layers.[0-9]+.self_attn."])
+                == [
+                    "^lm_head$", "language_model.embed_tokens$",
+                    "language_model.layers.[0-9]+.mlp.", "language_model.layers.[0-9]+.self_attn.",
+                ])
         #expect(resolveModuleBits(path: "language_model.lm_head", config: config) == 2)
-        #expect(resolveModuleBits(path: "language_model.model.layers.0.mlp.gate_proj", config: config) == 4)
+        #expect(
+            resolveModuleBits(path: "language_model.model.layers.0.mlp.gate_proj", config: config)
+                == 4)
     }
 
     @Test("GemmaMobileQuantizationConfig preserves JSON insertion order with rawConfigData")
@@ -422,10 +427,15 @@ struct Gemma4MobileQuantizationTests {
         // Insertion order preserved: 2-bit catch-all first, 4-bit specific second.
         #expect(
             config.moduleQuantConfigs.map { $0.0 }
-                == ["language_model.layers.[0-9]+.mlp.", "language_model.layers.([0-9]|1[0-4]).mlp."])
+                == [
+                    "language_model.layers.[0-9]+.mlp.",
+                    "language_model.layers.([0-9]|1[0-4]).mlp.",
+                ])
         #expect(config.moduleQuantConfigs.map { $0.1 } == [2, 4])
         // First-match-wins: a layer-0 mlp path hits the 2-bit catch-all first.
-        #expect(resolveModuleBits(path: "language_model.model.layers.0.mlp.gate_proj", config: config) == 2)
+        #expect(
+            resolveModuleBits(path: "language_model.model.layers.0.mlp.gate_proj", config: config)
+                == 2)
     }
 
     // MARK: - Helpers

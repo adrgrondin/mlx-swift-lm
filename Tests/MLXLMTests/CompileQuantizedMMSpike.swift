@@ -29,10 +29,10 @@ struct CompileQuantizedMMSpike {
         let packedIn = inDims / 2  // int4: 2 values/byte
 
         // Random packed uint8 weights + per-channel scale.
-        let weightBytes = (0..<(outDims * packedIn)).map { _ in UInt8.random(in: 0...255) }
+        let weightBytes = (0 ..< (outDims * packedIn)).map { _ in UInt8.random(in: 0 ... 255) }
         let weight = MLXArray(weightBytes, [outDims, packedIn])
         let weightScale = MLXArray(
-            (0..<outDims).map { 0.1 * Float($0 + 1) }, [outDims, 1])
+            (0 ..< outDims).map { 0.1 * Float($0 + 1) }, [outDims, 1])
         let normWeight = MLXArray.ones([inDims])
 
         // Convert to MLX uint32 format (group_size=128).
@@ -159,7 +159,8 @@ struct CompileQuantizedMMSpike {
         let compiled2 = compiledRoPE([queries2, offset2, freqs])[0]
         eval([eager2, compiled2])
         let maxDiff2 = MLX.abs(eager2 - compiled2).max().item(Float.self)
-        #expect(maxDiff2 < 1e-5, "RoPE in compile (shape [1,8,1,256], offset=5): max diff \(maxDiff2)")
+        #expect(
+            maxDiff2 < 1e-5, "RoPE in compile (shape [1,8,1,256], offset=5): max diff \(maxDiff2)")
     }
 
     // MARK: - Combined: quantizedMM + RoPE + rmsNorm inside one compile graph
@@ -169,17 +170,17 @@ struct CompileQuantizedMMSpike {
     /// path. This is a slice of the real pre-attention compiled segment.
     @Test("Mini pre-attention segment compiles and matches eager path")
     func miniPreAttnSegment() throws {
-        let outDims = 8       // nHeads * headDim (tiny)
+        let outDims = 8  // nHeads * headDim (tiny)
         let inDims = 128
         let numBits = 4
         let packedIn = inDims / 2
         let nHeads = 4
         let headDim = 2  // outDims / nHeads
 
-        let weightBytes = (0..<(outDims * packedIn)).map { _ in UInt8.random(in: 0...255) }
+        let weightBytes = (0 ..< (outDims * packedIn)).map { _ in UInt8.random(in: 0 ... 255) }
         let weight = MLXArray(weightBytes, [outDims, packedIn])
         let weightScale = MLXArray(
-            (0..<outDims).map { 0.1 * Float($0 + 1) }, [outDims, 1])
+            (0 ..< outDims).map { 0.1 * Float($0 + 1) }, [outDims, 1])
         let inputNormW = MLXArray.ones([inDims])
         let qNormW = MLXArray.ones([headDim])
 
@@ -252,7 +253,9 @@ struct CompileQuantizedMMSpike {
             return [queries]
         }
 
-        let staticArgs: [MLXArray] = [inputNormW, packed, scales, biases, inScale, outScale, qNormW, freqs]
+        let staticArgs: [MLXArray] = [
+            inputNormW, packed, scales, biases, inScale, outScale, qNormW, freqs,
+        ]
 
         // Shape 1: [1, 4, 128].
         let x1 = MLXArray.zeros([1, 4, inDims], dtype: .float32)
@@ -287,10 +290,10 @@ struct CompileQuantizedMMSpike {
         let numBits = 4
         let packedIn = inDims / 2
 
-        let weightBytes = (0..<(outDims * packedIn)).map { _ in UInt8.random(in: 0...255) }
+        let weightBytes = (0 ..< (outDims * packedIn)).map { _ in UInt8.random(in: 0 ... 255) }
         let weight = MLXArray(weightBytes, [outDims, packedIn])
         let weightScale = MLXArray(
-            (0..<outDims).map { 0.1 * Float($0 + 1) }, [outDims, 1])
+            (0 ..< outDims).map { 0.1 * Float($0 + 1) }, [outDims, 1])
         let (packed, scales, biases) = mobileToMLX(
             weight: weight, weightScale: weightScale,
             numBits: numBits, inputDims: inDims)
@@ -299,7 +302,7 @@ struct CompileQuantizedMMSpike {
         // Simulate SRQ output: round(x/s)*s in float32, then the same in bfloat16.
         let s = MLXArray(Float(0.5))
         let xRaw = MLXArray(
-            (0..<(1 * 4 * inDims)).map { _ in Float.random(in: -2...2) },
+            (0 ..< (1 * 4 * inDims)).map { _ in Float.random(in: -2 ... 2) },
             [1, 4, inDims]
         )
         // float32 SRQ (native path style)
@@ -321,12 +324,14 @@ struct CompileQuantizedMMSpike {
         // First: how different are the SRQ outputs (the inputs to quantizedMM)?
         let srqDiff = MLX.abs(xF32 - xBf16.asType(.float32)).max().item(Float.self)
         // Then: how different are the quantizedMM outputs?
-        let mmDiff = MLX.abs(outF32.asType(.float32) - outBf16.asType(.float32)).max().item(Float.self)
+        let mmDiff = MLX.abs(outF32.asType(.float32) - outBf16.asType(.float32)).max().item(
+            Float.self)
         let mmRelDiff = mmDiff / (MLX.abs(outF32).max().item(Float.self) + 1e-6)
 
-        print("quantizedMM dtype sensitivity: SRQ input max diff = \(srqDiff), "
-            + "quantizedMM output max diff = \(mmDiff), "
-            + "relative = \(mmRelDiff)")
+        print(
+            "quantizedMM dtype sensitivity: SRQ input max diff = \(srqDiff), "
+                + "quantizedMM output max diff = \(mmDiff), "
+                + "relative = \(mmRelDiff)")
         print("  xF32.dtype=\(xF32.dtype), xBf16.dtype=\(xBf16.dtype)")
         print("  outF32.dtype=\(outF32.dtype), outBf16.dtype=\(outBf16.dtype)")
 
@@ -366,9 +371,10 @@ struct CompileQuantizedMMSpike {
         let rotatedDims = 2 * Int(partialRotaryFactor * Float(headDim) / 2)
         let ropeAngles = rotatedDims / 2
         let nopeAngles = headDim / 2 - ropeAngles
-        let exponents = MLXArray(
-            stride(from: 0, to: rotatedDims, by: 2)
-        ).asType(.float32) / Float(headDim)
+        let exponents =
+            MLXArray(
+                stride(from: 0, to: rotatedDims, by: 2)
+            ).asType(.float32) / Float(headDim)
         var nativeFreqs = MLX.pow(base, exponents)
         if nopeAngles > 0 {
             let infPad = MLXArray.ones([nopeAngles], dtype: .float32) * Float.infinity
@@ -388,11 +394,11 @@ struct CompileQuantizedMMSpike {
         }
 
         // Test with offset=0 and offset=5, shapes [1,8,4,512] and [1,8,1,512].
-        for (shape, offsetVal) in (
-            [( [1, nHeads, 4, headDim], 0), ([1, nHeads, 1, headDim], 5)] as [( [Int], Int)]
-        ) {
+        for (shape, offsetVal)
+            in ([([1, nHeads, 4, headDim], 0), ([1, nHeads, 1, headDim], 5)] as [([Int], Int)])
+        {
             let queries = MLXArray(
-                (0..<shape.reduce(1, *)).map { _ in Float.random(in: -1...1) },
+                (0 ..< shape.reduce(1, *)).map { _ in Float.random(in: -1 ... 1) },
                 shape
             ).asType(.float32)
             let offset = MLXArray(offsetVal)
@@ -413,14 +419,19 @@ struct CompileQuantizedMMSpike {
             let maxDiffNative = MLX.abs(eagerOut - nativeOut).max().item(Float.self)
             let maxDiffCompiled = MLX.abs(eagerOut - compiledOut).max().item(Float.self)
 
-            print("RoPE inf-freqs shape \(shape) offset=\(offsetVal): "
-                + "eager-vs-native max diff = \(maxDiffNative), "
-                + "eager-vs-compiled max diff = \(maxDiffCompiled)")
+            print(
+                "RoPE inf-freqs shape \(shape) offset=\(offsetVal): "
+                    + "eager-vs-native max diff = \(maxDiffNative), "
+                    + "eager-vs-compiled max diff = \(maxDiffCompiled)")
 
-            #expect(maxDiffNative < 1e-4,
-                "ProportionalRoPE inf-freqs (native, shape \(shape), offset=\(offsetVal)): max diff \(maxDiffNative)")
-            #expect(maxDiffCompiled < 1e-4,
-                "ProportionalRoPE inf-freqs (compiled, shape \(shape), offset=\(offsetVal)): max diff \(maxDiffCompiled)")
+            #expect(
+                maxDiffNative < 1e-4,
+                "ProportionalRoPE inf-freqs (native, shape \(shape), offset=\(offsetVal)): max diff \(maxDiffNative)"
+            )
+            #expect(
+                maxDiffCompiled < 1e-4,
+                "ProportionalRoPE inf-freqs (compiled, shape \(shape), offset=\(offsetVal)): max diff \(maxDiffCompiled)"
+            )
         }
     }
 }
