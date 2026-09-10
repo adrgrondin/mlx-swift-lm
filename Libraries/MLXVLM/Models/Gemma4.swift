@@ -933,15 +933,18 @@ final class Gemma4TextAttention: Module {
             let vRaw: MLXArray
 
             if !useKEqV,
-               let q = qProj as? GemmaQuantizedLinear,
-               let k = kProj as? GemmaQuantizedLinear,
-               let vQ = vProj as? GemmaQuantizedLinear,
-               let fused = tryFusedQKV(q: q, k: k, v: vQ, x: x) {
+                let q = qProj as? GemmaQuantizedLinear,
+                let k = kProj as? GemmaQuantizedLinear,
+                let vQ = vProj as? GemmaQuantizedLinear,
+                let fused = tryFusedQKV(q: q, k: k, v: vQ, x: x)
+            {
                 let qd = numHeads * headDim
                 let kvd = numKVHeads * headDim
-                queries = fused[.ellipsis, 0..<qd].reshaped(batch, length, numHeads, headDim)
-                kRaw = fused[.ellipsis, qd..<qd + kvd].reshaped(batch, length, numKVHeads, headDim)
-                vRaw = fused[.ellipsis, (qd + kvd)..<fused.dim(-1)].reshaped(batch, length, numKVHeads, headDim)
+                queries = fused[.ellipsis, 0 ..< qd].reshaped(batch, length, numHeads, headDim)
+                kRaw = fused[.ellipsis, qd ..< qd + kvd].reshaped(
+                    batch, length, numKVHeads, headDim)
+                vRaw = fused[.ellipsis, (qd + kvd) ..< fused.dim(-1)].reshaped(
+                    batch, length, numKVHeads, headDim)
             } else {
                 queries = qProj(x).reshaped(batch, length, numHeads, headDim)
                 kRaw = kProj(x).reshaped(batch, length, numKVHeads, headDim)
