@@ -6,7 +6,7 @@ import MLXLMCommon
 import MLXNN
 import Testing
 
-@testable import MLXLLM
+@_spi(GemmaEncoder) @testable import MLXLLM
 
 /// End-to-end coverage for the Gemma 4 QAT mobile (wNa8o8) load path
 /// (`quant_method: "gemma"`). Builds a tiny `gemma4` model, writes a synthetic
@@ -171,7 +171,7 @@ struct Gemma4MobileIntegrationTests {
         #expect(!(perLayerModelProj is GemmaQuantizedLinear))
 
         // Forward pass produces finite logits of the right shape.
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         let tokens = MLXArray([1, 2, 3]).reshaped([1, 3])
         let logits = model(tokens, cache: cache)
         eval(logits)
@@ -196,7 +196,8 @@ struct Gemma4MobileIntegrationTests {
             if let linear = module as? Linear, let bits = bits {
                 let (out, inDim) = linear.shape
                 let dtype: DType = bits == 8 ? .int8 : .uint8
-                arrays["\(path).weight"] = randomIntArray([out, packedInputDim(inDim, bits)], dtype: dtype)
+                arrays["\(path).weight"] = randomIntArray(
+                    [out, packedInputDim(inDim, bits)], dtype: dtype)
                 arrays["\(path).weight_scale"] = randomScaleArray([out, 1])
                 arrays["\(path).input_activation_scale"] = MLXArray(Float(0.0))
                 arrays["\(path).output_activation_scale"] = MLXArray(Float(0.0))
@@ -263,12 +264,14 @@ struct Gemma4MobileIntegrationTests {
     /// Path to the real `gemma-4-E2B-it-qat-mobile-mlx-mm` checkpoint. This is
     /// a local path and may not exist in all environments; the test skips if
     /// the checkpoint is absent.
-    private static let realCheckpointURL = URL(filePath: "/Users/adrgrondin/Workspace/mlx-vlm/gemma-4-E2B-it-qat-mobile-mlx-mm")
+    private static let realCheckpointURL = URL(
+        filePath: "/Users/adrgrondin/Workspace/mlx-vlm/gemma-4-E2B-it-qat-mobile-mlx-mm")
 
     @Test("Real gemma-4-E2B-it-qat-mobile-mlx-mm loads with quantized layers and runs")
     func loadsRealMobileCheckpoint() throws {
         let dir = Self.realCheckpointURL
-        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path) else {
+        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path)
+        else {
             // Checkpoint not available — skip this test.
             return
         }
@@ -327,13 +330,15 @@ struct Gemma4MobileIntegrationTests {
         #expect(!(perLayerModelProj is GemmaQuantizedLinear))
 
         // Forward pass produces finite logits of the right shape.
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         let tokens = MLXArray([1, 2, 3]).reshaped([1, 3])
         let logits = model(tokens, cache: cache)
         eval(logits)
         #expect(logits.shape == [1, 3, config.textConfig.vocabSize])
         let values = logits.asType(.float32).asArray(Float.self)
-        #expect(values.allSatisfy { $0.isFinite }, "logits must be finite, got first few: \(values.prefix(10))")
+        #expect(
+            values.allSatisfy { $0.isFinite },
+            "logits must be finite, got first few: \(values.prefix(10))")
     }
 
     // MARK: - Native compiled path A/B equivalence
@@ -351,7 +356,8 @@ struct Gemma4MobileIntegrationTests {
     @Test("Native compiled path matches eager path top-1 token (real model)")
     func nativeCompiledPathMatchesEager() throws {
         let dir = Self.realCheckpointURL
-        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path) else {
+        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path)
+        else {
             return  // Checkpoint not available — skip.
         }
 
@@ -375,24 +381,26 @@ struct Gemma4MobileIntegrationTests {
         // (batch > 16), isolating the difference to the compile fusion (not qmv
         // vs quantizedMM). Fixed tokens give a deterministic diff (random tokens
         // produced 0.08–0.80 mean diff due to different activation patterns).
-        let tokens = MLXArray((0..<32).map { Int32($0 % 1000 + 1) }).reshaped([1, 32])
+        let tokens = MLXArray((0 ..< 32).map { Int32($0 % 1000 + 1) }).reshaped([1, 32])
 
         // Run with the native compiled path.
         Gemma4TextModel.useNativeCompiledPath = true
-        let cache1 = model.newCache(parameters: nil)
+        let cache1 = try model.newCache(parameters: nil)
         let logitsNative = model(tokens, cache: cache1)
         eval(logitsNative)
         let nativeValues = logitsNative.asType(.float32).asArray(Float.self)
-        #expect(nativeValues.allSatisfy { $0.isFinite },
+        #expect(
+            nativeValues.allSatisfy { $0.isFinite },
             "native path logits must be finite")
 
         // Run with the eager path (flag off).
         Gemma4TextModel.useNativeCompiledPath = false
-        let cache2 = model.newCache(parameters: nil)
+        let cache2 = try model.newCache(parameters: nil)
         let logitsEager = model(tokens, cache: cache2)
         eval(logitsEager)
         let eagerValues = logitsEager.asType(.float32).asArray(Float.self)
-        #expect(eagerValues.allSatisfy { $0.isFinite },
+        #expect(
+            eagerValues.allSatisfy { $0.isFinite },
             "eager path logits must be finite")
 
         // Restore the flag.
@@ -408,20 +416,22 @@ struct Gemma4MobileIntegrationTests {
         for pos in 0 ..< nPositions {
             let offset = pos * vocabSize
             var posDiff: Float = 0
-            for i in 0..<vocabSize {
+            for i in 0 ..< vocabSize {
                 let d = abs(nativeValues[offset + i] - eagerValues[offset + i])
                 posDiff += d
                 maxDiff = max(maxDiff, d)
             }
             totalDiff += posDiff / Float(vocabSize)
-            let nativeSlice = Array(nativeValues[offset..<(offset + vocabSize)])
-            let eagerSlice = Array(eagerValues[offset..<(offset + vocabSize)])
+            let nativeSlice = Array(nativeValues[offset ..< (offset + vocabSize)])
+            let eagerSlice = Array(eagerValues[offset ..< (offset + vocabSize)])
             let nativeArgmax = nativeSlice.enumerated().max(by: { $0.1 < $1.1 })!.0
             let eagerArgmax = eagerSlice.enumerated().max(by: { $0.1 < $1.1 })!.0
             if nativeArgmax != eagerArgmax { argmaxMismatches += 1 }
         }
         let meanDiff = totalDiff / Float(nPositions)
-        print("\(nPositions)-token prompt: mean abs diff = \(meanDiff), max abs diff = \(maxDiff), argmax mismatches = \(argmaxMismatches)/\(nPositions)")
+        print(
+            "\(nPositions)-token prompt: mean abs diff = \(meanDiff), max abs diff = \(maxDiff), argmax mismatches = \(argmaxMismatches)/\(nPositions)"
+        )
         #expect(meanDiff < 0.5, "mean abs diff too large: \(meanDiff)")
         #expect(argmaxMismatches <= 4, "too many argmax mismatches: \(argmaxMismatches)")
     }
@@ -434,7 +444,8 @@ struct Gemma4MobileIntegrationTests {
     @Test("Load-time precompilation frees mobile weights and stabilizes prefill (real model)")
     func precompileFreesWeightsAndStabilizesPrefill() throws {
         let dir = Self.realCheckpointURL
-        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path) else {
+        guard FileManager.default.fileExists(atPath: dir.appending(component: "config.json").path)
+        else {
             return  // Checkpoint not available — skip.
         }
 
@@ -462,32 +473,37 @@ struct Gemma4MobileIntegrationTests {
         // with a dummy [1] array. The native path uses the converted _mlxWeight.
         let gate0 = try #require(
             modules["language_model.model.layers.0.mlp.gate_proj"] as? GemmaQuantizedLinear)
-        #expect(gate0.weight.shape == [1],
+        #expect(
+            gate0.weight.shape == [1],
             "decoder layer mobile weight should be freed, got \(gate0.weight.shape)")
-        #expect(gate0.weightScale.shape == [1],
+        #expect(
+            gate0.weightScale.shape == [1],
             "decoder layer mobile weightScale should be freed, got \(gate0.weightScale.shape)")
 
         // A KV-shared layer (15) is also freed.
         let gate15 = try #require(
             modules["language_model.model.layers.15.mlp.gate_proj"] as? GemmaQuantizedLinear)
-        #expect(gate15.weight.shape == [1],
+        #expect(
+            gate15.weight.shape == [1],
             "KV-shared layer mobile weight should be freed, got \(gate15.weight.shape)")
 
         // lm_head (2-bit, not a decoder layer) keeps its mobile weights — it
         // stays on the qmv/eager path.
         let lmHead = try #require(modules["language_model.lm_head"] as? GemmaQuantizedLinear)
-        #expect(lmHead.weight.ndim == 2,
+        #expect(
+            lmHead.weight.ndim == 2,
             "lm_head mobile weight should NOT be freed, got shape \(lmHead.weight.shape)")
 
         // Embeddings keep their packed tables (dequant-on-forward, not converted).
         let embed = try #require(
             modules["language_model.model.embed_tokens"] as? GemmaQuantizedEmbedding)
-        #expect(embed.weight.ndim == 2,
+        #expect(
+            embed.weight.ndim == 2,
             "embed_tokens weight should NOT be freed, got shape \(embed.weight.shape)")
 
         // Forward pass produces finite logits of the right shape (native path).
-        let cache = model.newCache(parameters: nil)
-        let tokens = MLXArray((0..<32).map { Int32($0 % 1000 + 1) }).reshaped([1, 32])
+        let cache = try model.newCache(parameters: nil)
+        let tokens = MLXArray((0 ..< 32).map { Int32($0 % 1000 + 1) }).reshaped([1, 32])
         let logits1 = model(tokens, cache: cache)
         eval(logits1)
         #expect(logits1.shape == [1, 32, config.textConfig.vocabSize])
@@ -496,13 +512,13 @@ struct Gemma4MobileIntegrationTests {
 
         // Prefill is stable: a second run with the same input produces the
         // exact same output (the precompiled graphs are deterministic).
-        let cache2 = model.newCache(parameters: nil)
+        let cache2 = try model.newCache(parameters: nil)
         let logits2 = model(tokens, cache: cache2)
         eval(logits2)
         let values2 = logits2.asType(.float32).asArray(Float.self)
         #expect(values2.allSatisfy { $0.isFinite }, "logits must be finite")
         var maxDiff: Float = 0
-        for i in 0..<values1.count {
+        for i in 0 ..< values1.count {
             maxDiff = max(maxDiff, abs(values1[i] - values2[i]))
         }
         #expect(maxDiff == 0, "prefill should be stable across runs, max diff = \(maxDiff)")
@@ -539,11 +555,12 @@ struct Gemma4MobileIntegrationTests {
         let gate = try #require(
             modules["language_model.model.layers.0.mlp.gate_proj"] as? GemmaQuantizedLinear)
         // Weights are NOT freed (unaligned dims → native path not usable → no-op).
-        #expect(gate.weight.ndim == 2,
+        #expect(
+            gate.weight.ndim == 2,
             "tiny model weights should NOT be freed (unaligned dims), got \(gate.weight.shape)")
 
         // Forward pass still works (eager path).
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         let tokens = MLXArray([1, 2, 3]).reshaped([1, 3])
         let logits = model(tokens, cache: cache)
         eval(logits)
