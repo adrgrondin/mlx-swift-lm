@@ -72,6 +72,7 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
         Qwen35ProcessorLoadingResolver(),
         ModelTypeProcessorResolver(processorTypes: [
             "mistral3": "Mistral3Processor",
+            "prism_hadamard_qwen35": "Qwen3VLProcessor",
             "gemma4_unified": "Gemma4UnifiedProcessor",
         ]),
     ])
@@ -143,7 +144,7 @@ public struct Qwen35ProcessorLoadingResolver: VLMProcessorLoadingResolver {
     public func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration? {
-        guard context.modelType == "qwen3_5" || context.modelType == "qwen3_5_moe" else {
+        guard ["qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"].contains(context.modelType) else {
             return nil
         }
 

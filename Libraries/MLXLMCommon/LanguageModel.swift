@@ -30,6 +30,12 @@ public protocol BaseLanguageModel: Module {
         MLXArray]
 }
 
+/// Validate sanitized checkpoint tensors before quantization and parameter updates.
+/// Unlike optional inference preparation, a validation failure must abort loading.
+package protocol ModelWeightValidating {
+    func validate(weights: [String: MLXArray]) throws
+}
+
 /// Weight files a model needs that no naming convention or `model.safetensors.index.json`
 /// selects.
 ///
