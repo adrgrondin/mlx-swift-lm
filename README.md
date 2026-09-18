@@ -101,6 +101,33 @@ print(try await session.respond(to: "How about a great place to eat?"))
 
 For alternative integration approaches (custom downloaders, alternative tokenizer packages, local-only weights), see the [using documentation](Libraries/MLXLMCommon/Documentation.docc/using.md).
 
+## Bonsai 2 (Prism Hadamard checkpoints)
+
+This branch registers `prism_hadamard_qwen35` in both model factories for
+[`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit).
+Use `VLMModelFactory` for text and images, or `LLMModelFactory` for text-only inference
+(the latter drops the vision tower's weights). No Python runtime is imported or executed.
+
+The Swift loader implements the model pack's
+[`runtime.py`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit/blob/main/runtime/runtime.py)
+and [`vision_artifact.py`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit/blob/main/runtime/vision_artifact.py)
+contracts: 2-bit affine weights with group size 128, FP32 normalized blockwise Hadamard
+transforms before language projections, and inverse transforms after embedding lookup.
+The vision tower remains unrotated. Ordinary quantized-projection fusion is not applied to
+these transformed layers.
+
+Keep the original `config.json`, `model.safetensors`, tokenizer/chat-template files, and
+`preprocessor_config.json` for vision. The layer manifest comes from `config.json`; sign
+vectors are loaded from the safetensors parameters, not `hadamard.json`. Do not rename the
+model type to `qwen3_5`: that would omit required transforms. Schema-1 text packs and
+schema-2 `mlx-vlm-qwen3_5` packs with grouped GDN layout are supported; invalid metadata,
+packed shapes, or sign vectors fail loading rather than falling back to ordinary Qwen.
+
+Regression tests cover transform numerics, synthetic checkpoint loading, text/image
+inference and continuation, and the published 27B tensor topology. These tests do not
+measure full-checkpoint generation quality, peak memory, or device performance. The
+published pack is about 8.6 GB, with additional runtime memory needed for activations and caches.
+
 ## `FoundationModels` integration
 
 `MLXFoundationModels` is a bridge between MLX models and Apple's `FoundationModels` framework: build an `MLXLanguageModel`, pass it to `LanguageModelSession`, and generate through the standard `FoundationModels` API. Requires the macOS/iOS/visionOS 27.0 SDK.
