@@ -383,6 +383,9 @@ public func loadWeights(
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
+    if let validating = model as? any ModelWeightValidating {
+        try validating.validate(weights: weights)
+    }
 
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
