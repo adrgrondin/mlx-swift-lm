@@ -264,6 +264,32 @@ final class PrismHadamardTests: XCTestCase {
         XCTAssertTrue(vlm.parameters().flattened().contains { $0.0.hasPrefix("vision_tower.") })
     }
 
+    func testTextOnlyLoaderDoesNotReadVisionTensorData() throws {
+        let data = try configuration()
+        let weights = try checkpoint(configuration: data)
+        let model = try MLXLLM.PrismHadamardQwen35(configuration: data)
+        let textWeights = weights.filter { !$0.key.hasPrefix("vision_tower.") }
+        try withCheckpoint(textWeights) { directory in
+            let visionURL = directory.appendingPathComponent("model-vision.safetensors")
+            try save(
+                arrays: weights.filter { $0.key.hasPrefix("vision_tower.") }, url: visionURL)
+            let handle = try FileHandle(forUpdating: visionURL)
+            defer { try? handle.close() }
+            let headerLength = try XCTUnwrap(handle.read(upToCount: 8)).withUnsafeBytes {
+                $0.loadUnaligned(as: UInt64.self).littleEndian
+            }
+            // Keep the vision header but remove its data: any tensor read would fail.
+            try handle.truncate(atOffset: 8 + headerLength)
+
+            try loadWeights(modelDirectory: directory, model: model)
+        }
+        let loaded = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        XCTAssertEqual(Set(loaded.keys), Set(textWeights.keys))
+        for (name, expected) in textWeights {
+            assertClose(try XCTUnwrap(loaded[name]), expected, tolerance: 0)
+        }
+    }
+
     func testVisionPackProcessesAnImageAndContinuesWithText() throws {
         let data = try configuration()
         let model = try MLXVLM.PrismHadamardQwen35(configuration: data)
