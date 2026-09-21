@@ -153,8 +153,9 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 /// Each work item lazily opens its file, evaluates only its assigned tensors (forcing that
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
 /// header cannot be parsed is loaded whole by one work item, which is exactly the serial
-/// loader's behavior for that file.
-func loadWeightArrays(urls: [URL]) throws -> (
+/// loader's behavior for that file. Excluded prefixes are filtered before evaluating arrays,
+/// including on the whole-file fallback path. File headers and metadata are still read.
+func loadWeightArrays(urls: [URL], excludingPrefixes: [String] = []) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
     let checkpoint = try loadModelCheckpoint(urls: urls)
@@ -194,7 +195,11 @@ func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bo
         let groupBytes = max(minimumBytesPerLoadGroup, totalBytes / Int64(concurrency))
         var items = [WorkItem]()
         for (file, url) in urls.enumerated() {
-            if let spans = spansPerFile[file], !spans.isEmpty {
+            if let spans = spansPerFile[file] {
+                if spans.isEmpty {
+                    items.append(WorkItem(file: file, url: url, names: []))
+                    continue
+                }
                 let bytes = spans.reduce(0) { $0 + $1.byteCount }
                 let groupCount = max(1, Int(bytes / groupBytes))
                 for range in contiguousLoadGroups(
@@ -231,6 +236,7 @@ func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bo
                 } else {
                     selected = all.filter { isRead($0.key) }
                 }
+
 
                 // force this range's I/O here, on this stream, in file-offset order
                 if !selected.isEmpty { eval(Array(selected.values)) }
@@ -422,6 +428,7 @@ public func loadWeights(
     checkpoint.perLayerQuantization = perLayerQuantization
     checkpoint = try model.prepareCheckpoint(checkpoint)
     try applyCheckpoint(checkpoint, to: model)
+
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.

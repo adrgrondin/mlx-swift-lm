@@ -5,7 +5,9 @@ import MLX
 import MLXLMCommon
 
 /// Text inference for Bonsai 2, including language weights from vision-capable packs.
-final class PrismHadamardQwen35: Qwen35Model, ModelWeightValidating {
+final class PrismHadamardQwen35: Qwen35Model, ModelWeightValidating, ModelWeightFiltering {
+    var excludedWeightPrefixes: [String] { ["vision_tower."] }
+
     private let packedConfiguration: PrismHadamardConfiguration
 
     init(configuration data: Data) throws {
@@ -22,7 +24,9 @@ final class PrismHadamardQwen35: Qwen35Model, ModelWeightValidating {
                 uniqueKeysWithValues: weights.map { ("language_model." + $0.key, $0.value) })
         }
         // Packed tensors and norms are already in MLX layout; do not shift or transpose them.
-        return weights.filter { !$0.key.hasPrefix("vision_tower.") }
+        return weights.filter { name, _ in
+            !excludedWeightPrefixes.contains { name.hasPrefix($0) }
+        }
     }
 
     func validate(weights: [String: MLXArray]) throws {
