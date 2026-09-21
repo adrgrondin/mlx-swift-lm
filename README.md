@@ -105,8 +105,11 @@ For alternative integration approaches (custom downloaders, alternative tokenize
 
 This branch registers `prism_hadamard_qwen35` in both model factories for
 [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit).
-Use `VLMModelFactory` for text and images, or `LLMModelFactory` for text-only inference
-(the latter drops the vision tower's weights). No Python runtime is imported or executed.
+Use `VLMModelFactory` for text and images, or `LLMModelFactory` for text-only inference.
+The text-only loader does not create a vision tower and skips its tensor data before loading
+weights into memory; checkpoint headers are still read and downloads are unchanged.
+`VLMModelFactory` still loads both towers, even for text-only prompts.
+No Python runtime is imported or executed.
 
 The Swift loader implements the model pack's
 [`runtime.py`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit/blob/main/runtime/runtime.py)

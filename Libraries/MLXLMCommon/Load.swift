@@ -150,8 +150,9 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 /// Each work item lazily opens its file, evaluates only its assigned tensors (forcing that
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
 /// header cannot be parsed is loaded whole by one work item, which is exactly the serial
-/// loader's behavior for that file.
-func loadWeightArrays(urls: [URL]) throws -> (
+/// loader's behavior for that file. Excluded prefixes are filtered before evaluating arrays,
+/// including on the whole-file fallback path. File headers and metadata are still read.
+func loadWeightArrays(urls: [URL], excludingPrefixes: [String] = []) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
     struct WorkItem {
@@ -165,7 +166,9 @@ func loadWeightArrays(urls: [URL]) throws -> (
         var spansPerFile = [[SafetensorSpan]?]()
         var totalBytes: Int64 = 0
         for url in urls {
-            let spans = try? safetensorSpansInFileOrder(url: url)
+            let spans = (try? safetensorSpansInFileOrder(url: url))?.filter { span in
+                !excludingPrefixes.contains { span.name.hasPrefix($0) }
+            }
             spansPerFile.append(spans)
             totalBytes += spans?.reduce(0) { $0 + $1.byteCount } ?? 0
         }
@@ -174,7 +177,11 @@ func loadWeightArrays(urls: [URL]) throws -> (
         let groupBytes = max(minimumBytesPerLoadGroup, totalBytes / Int64(concurrency))
         var items = [WorkItem]()
         for (file, url) in urls.enumerated() {
-            if let spans = spansPerFile[file], !spans.isEmpty {
+            if let spans = spansPerFile[file] {
+                if spans.isEmpty {
+                    items.append(WorkItem(file: file, url: url, names: []))
+                    continue
+                }
                 let bytes = spans.reduce(0) { $0 + $1.byteCount }
                 let groupCount = max(1, Int(bytes / groupBytes))
                 for range in contiguousLoadGroups(
@@ -205,7 +212,9 @@ func loadWeightArrays(urls: [URL]) throws -> (
                     if let array = all[name] { selected[name] = array }
                 }
             } else {
-                selected = all
+                selected = all.filter { name, _ in
+                    !excludingPrefixes.contains { name.hasPrefix($0) }
+                }
             }
 
             // force this range's I/O here, on this stream, in file-offset order
@@ -379,7 +388,9 @@ public func loadWeights(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+    let excludedPrefixes = (model as? any ModelWeightFiltering)?.excludedWeightPrefixes ?? []
+    (weights, metadata) = try loadWeightArrays(
+        urls: weightURLs, excludingPrefixes: excludedPrefixes)
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
