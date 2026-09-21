@@ -168,6 +168,68 @@ final class LoadWeightsTests: XCTestCase {
         XCTAssertEqual(weights["shared.weight"]?.asArray(Float.self), [1, 1, 1, 1])
     }
 
+    func testLoadWeightArraysSkipsExcludedDataBeforeEvaluation() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let url = directory.appendingPathComponent("model.safetensors")
+        // The second case makes span parsing fail, exercising the whole-file fallback.
+        for visionEnd in [24, 0] {
+            let header: [String: Any] = [
+                "__metadata__": ["format": "mlx"],
+                "language_model.weight": [
+                    "dtype": "F32", "shape": [1], "data_offsets": [0, 4],
+                ],
+                "vision_tower_extra.weight": [
+                    "dtype": "F32", "shape": [1], "data_offsets": [4, 8],
+                ],
+                "vision_tower.weight": [
+                    "dtype": "F32", "shape": [4], "data_offsets": [8, visionEnd],
+                ],
+            ]
+            let json = try JSONSerialization.data(withJSONObject: header)
+            var length = UInt64(json.count).littleEndian
+            var data = withUnsafeBytes(of: &length) { Data($0) }
+            data.append(json)
+            data.append([Float(1), Float(2)].withUnsafeBytes { Data($0) })
+            // Vision data is deliberately absent: evaluating it would fail the read.
+            try data.write(to: url)
+
+            let (weights, metadata) = try loadWeightArrays(
+                urls: [url], excludingPrefixes: ["vision_tower."])
+
+            XCTAssertEqual(
+                Set(weights.keys), ["language_model.weight", "vision_tower_extra.weight"])
+            XCTAssertEqual(weights["language_model.weight"]?.asArray(Float.self), [1])
+            XCTAssertEqual(weights["vision_tower_extra.weight"]?.asArray(Float.self), [2])
+            XCTAssertEqual(metadata, ["format": "mlx"])
+        }
+    }
+
+    func testLoadWeightArraysPreservesMetadataWhenAllTensorsAreExcluded() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let visionURL = directory.appendingPathComponent("model-vision.safetensors")
+        let textURL = directory.appendingPathComponent("model-text.safetensors")
+        try save(
+            arrays: ["vision_tower.weight": MLXArray.ones([4])],
+            metadata: ["format": "mlx"], url: visionURL)
+        try save(
+            arrays: ["language_model.weight": MLXArray.zeros([4])],
+            metadata: ["format": "pt"], url: textURL)
+
+        let (empty, metadata) = try loadWeightArrays(
+            urls: [visionURL], excludingPrefixes: ["vision_tower."])
+        XCTAssertTrue(empty.isEmpty)
+        XCTAssertEqual(metadata, ["format": "mlx"])
+
+        let (weights, firstMetadata) = try loadWeightArrays(
+            urls: [visionURL, textURL], excludingPrefixes: ["vision_tower."])
+        XCTAssertEqual(Set(weights.keys), ["language_model.weight"])
+        XCTAssertEqual(firstMetadata, ["format": "mlx"])
+    }
+
     func testLoadWeightArraysSurfacesAMissingFile() {
         let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent("LoadWeightsTests-missing-\(UUID().uuidString).safetensors")

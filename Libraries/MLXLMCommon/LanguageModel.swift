@@ -17,6 +17,11 @@ public protocol BaseLanguageModel: Module {
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
 }
 
+/// Checkpoint tensor prefixes to skip before reading tensor data, using unsanitized names.
+package protocol ModelWeightFiltering {
+    var excludedWeightPrefixes: [String] { get }
+}
+
 /// Validate sanitized checkpoint tensors before quantization and parameter updates.
 /// Unlike optional inference preparation, a validation failure must abort loading.
 package protocol ModelWeightValidating {
