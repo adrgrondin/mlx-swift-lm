@@ -242,6 +242,7 @@ func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bo
                 if !selected.isEmpty { eval(Array(selected.values)) }
                 state.merge(file: item.file, weights: selected, metadata: metadata)
             }
+
         } catch {
             state.record(error: error)
         }
@@ -390,7 +391,10 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 /// calls ``BaseLanguageModel/prepareCheckpoint(_:)`` to allow per-model preprocessing,
 /// applies optional quantization, and
 /// updates the model with the weights. Derived inference-only state is prepared after the
-/// checkpoint update and before the model is evaluated and returned to callers.
+/// checkpoint update. The original model is materialized before optional preparation,
+/// and derived state is checked before returning. MLX errors reported during weight or
+/// model materialization are thrown; a failed optional fusion keeps the usable originals.
+/// Failed source-module rollback and unrecognized preparation errors also abort loading.
 ///
 /// The weight files are chosen from `model.safetensors.index.json` when it names files that
 /// exist, and otherwise by the conventional `model*.safetensors` names. A model can name extra
@@ -429,10 +433,37 @@ public func loadWeights(
     checkpoint = try model.prepareCheckpoint(checkpoint)
     try applyCheckpoint(checkpoint, to: model)
 
+<<<<<<< HEAD
+=======
+    // per-model cleanup (models can inspect metadata to customize behavior)
+    weights = try withError { model.sanitize(weights: weights, metadata: metadata) }
+    if let validating = model as? any ModelWeightValidating {
+        try validating.validate(weights: weights)
+    }
+
+    // quantize if needed
+    if quantization != nil || perLayerQuantization != nil {
+        quantize(model: model) { path, module in
+            if weights["\(path).scales"] != nil {
+                if let perLayerQuantization {
+                    return perLayerQuantization.quantization(layer: path)?.asTuple
+                } else {
+                    return quantization?.asTuple
+                }
+            } else {
+                return nil
+            }
+        }
+    }
+
+    // apply the loaded weights
+    let parameters = ModuleParameters.unflattened(weights)
+    try model.update(parameters: parameters, verify: [.all])
+>>>>>>> e2856f0 (Fix recoverable Qwen fusion preparation failures)
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
-    materializeModelForInference(model)
+    try materializeModelForInference(model)
 
     // Warm native graphs and release converted mobile-format weights before publication.
     if let precompilable = model as? NativePrecompilable {
