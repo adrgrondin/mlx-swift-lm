@@ -2,11 +2,11 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
 import MLXNN
 import XCTest
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 final class Qwen35FusedGDNProjectionTests: XCTestCase {
@@ -195,6 +195,48 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         XCTAssertTrue(layer.hasFusedInputProjection)
     }
 
+    func testAsyncLoaderPreparesTextAndVisionQwen() async throws {
+        let textModel = Qwen35TextModel(try llmConfiguration())
+        let textLayer = try XCTUnwrap(
+            textModel.modules().compactMap { $0 as? Qwen35GatedDeltaNet }.first)
+        try quantize(textLayer)
+        let visionJSON = """
+            {
+                "model_type": "qwen3_5", "text_config": \(configurationJSON),
+                "vision_config": {
+                    "model_type": "qwen3_5", "depth": 1, "hidden_size": 32,
+                    "intermediate_size": 64, "out_hidden_size": 64, "num_heads": 4,
+                    "patch_size": 2, "spatial_merge_size": 1, "temporal_patch_size": 1,
+                    "num_position_embeddings": 16
+                }
+            }
+            """
+        let visionModel = MLXVLM.Qwen35(
+            try JSONDecoder().decode(
+                MLXVLM.Qwen35Configuration.self, from: Data(visionJSON.utf8)))
+        let visionLayer = try XCTUnwrap(
+            visionModel.modules().compactMap { $0 as? Qwen35Language.GatedDeltaNet }.first)
+        try quantize(visionLayer)
+        textLayer.fusedInputProjectionEnabled = true
+        visionLayer.fusedInputProjectionEnabled = true
+
+        for model in [textModel as BaseLanguageModel, visionModel as BaseLanguageModel] {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("QwenFusion-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+            try save(
+                arrays: parameters, metadata: ["format": "mlx"],
+                url: directory.appendingPathComponent("model.safetensors"))
+            try await loadWeights(modelDirectory: directory, model: model)
+            XCTAssertEqual(Set(model.parameters().flattened().map(\.0)), Set(parameters.keys))
+        }
+        XCTAssertTrue(textLayer.hasFusedInputProjection)
+        XCTAssertTrue(visionLayer.hasFusedInputProjection)
+    }
+
     func testIncompatibleProjectionPoliciesFallBack() throws {
         let layer = Qwen35GatedDeltaNet(try llmConfiguration())
         try layer.update(
@@ -224,6 +266,28 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         XCTAssertFalse(try layer.prepareFusedInputProjection())
         XCTAssertFalse(layer.hasFusedInputProjection)
         XCTAssertTrue(layer.inProjQKV is QLoRALinear)
+    }
+
+    func testHadamardProjectionsAreExcludedFromGenericFusion() throws {
+        for block in [0, 512] {
+            let hadamard = MLXLMCommon.PrismHadamardLinear(rows: 8, width: 512, block: block)
+            let originals: [Linear] =
+                [hadamard]
+                + (0 ..< 3).map { _ in
+                    QuantizedLinear(
+                        weight: hadamard.weight, bias: nil, scales: hadamard.scales,
+                        biases: hadamard.biases, groupSize: 128, bits: 2)
+                }
+            let cache = FusedQuantizedLinearProjectionCache()
+            XCTAssertFalse(
+                try cache.prepare(
+                    enabled: true, linears: originals,
+                    materialize: { _ in XCTFail("custom projections must not be materialized") },
+                    installSourceModules: { _ in XCTFail("custom projections must not be replaced")
+                    }))
+            XCTAssertNil(cache.fused)
+            XCTAssertTrue(originals[0] === hadamard)
+        }
     }
 
     func testCheckpointTopologyIsPreserved() throws {
@@ -342,6 +406,119 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         XCTAssertEqual(installAttempts, 3)
     }
 
+    func testMaterializationFailurePreservesOriginalsAndDoesNotRetry() throws {
+        let failure = try withError { MLXEvaluationFailureFixture.array() }
+        try assertMaterializationFailurePreservesOriginals(failure) {
+            MLXEvaluationFailureFixture.assertExpectedError($0)
+        }
+    }
+
+    func testRejectedLaunchPreservesOriginalsAndDoesNotRetry() throws {
+        let failure = try withError { try MLXEvaluationFailureFixture.rejectedLaunchArray() }
+        XCTAssertEqual(failure.shape, [1], "graph construction must succeed before evaluation")
+        try assertMaterializationFailurePreservesOriginals(failure) {
+            MLXEvaluationFailureFixture.assertRejectedLaunchError($0)
+        }
+    }
+
+    private func assertMaterializationFailurePreservesOriginals(
+        _ failure: MLXArray, checkError: (any Error) -> Void
+    ) throws {
+        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+        try quantize(layer)
+        let originals = [layer.inProjQKV, layer.inProjZ, layer.inProjB, layer.inProjA]
+        let parameters = layer.parameters().flattened()
+        eval(layer)
+        let input = MLXArray.ones([1, 1, 64])
+        let reference = originals.map { $0(input) }
+        eval(reference)
+        let cache = FusedQuantizedLinearProjectionCache()
+        var materializations = 0
+        var installations = 0
+
+        XCTAssertThrowsError(
+            try cache.prepare(
+                enabled: true, linears: originals,
+                materialize: { arrays in
+                    materializations += 1
+                    eval(arrays + [failure])
+                },
+                installSourceModules: { _ in installations += 1 })
+        ) { checkError($0) }
+
+        XCTAssertFalse(cache.isPrepared)
+        XCTAssertNil(cache.fused)
+        XCTAssertEqual(installations, 0)
+        XCTAssertEqual(
+            [layer.inProjQKV, layer.inProjZ, layer.inProjB, layer.inProjA].map(
+                ObjectIdentifier.init),
+            originals.map(ObjectIdentifier.init))
+        let remaining = Dictionary(uniqueKeysWithValues: layer.parameters().flattened())
+        for (name, array) in parameters {
+            XCTAssertTrue(remaining[name] === array, name)
+        }
+        for (actual, expected) in zip(originals.map({ $0(input) }), reference) {
+            assertBitIdentical(actual, expected, "unfused after failed materialization")
+        }
+
+        XCTAssertFalse(
+            try cache.prepare(
+                enabled: true, linears: originals,
+                materialize: { _ in materializations += 1 },
+                installSourceModules: { _ in installations += 1 }))
+        XCTAssertEqual(materializations, 1)
+        XCTAssertEqual(installations, 0)
+        cache.invalidate()
+        XCTAssertTrue(try cache.prepare(enabled: true, linears: originals) { _ in })
+    }
+
+    func testLLMAndVLMLazySourceFailureDoesNotPublishFusion() throws {
+        let llm = Qwen35GatedDeltaNet(try llmConfiguration())
+        let vlm = Qwen35Language.GatedDeltaNet(try vlmConfiguration())
+        try quantize(llm)
+        try quantize(vlm)
+
+        for (layer, prepare, isPrepared, projection) in [
+            (
+                llm as Module, llm.prepareFusedInputProjection, { llm.hasFusedInputProjection },
+                { llm.inProjQKV }
+            ),
+            (
+                vlm as Module, vlm.prepareFusedInputProjection, { vlm.hasFusedInputProjection },
+                { vlm.inProjQKV }
+            ),
+        ] {
+            let original = projection()
+            let weightIdentity = original.weight
+            let validWeight =
+                original.weight
+                + MLXArray.zeros(
+                    original.weight.shape, dtype: original.weight.dtype)
+            eval(validWeight)
+            let failedWeight = try withError {
+                MLXEvaluationFailureFixture.array(
+                    shape: validWeight.shape, dtype: validWeight.dtype)
+            }
+            try layer.update(
+                parameters: ModuleParameters.unflattened(["in_proj_qkv.weight": failedWeight]),
+                verify: [])
+            XCTAssertThrowsError(try prepare()) {
+                MLXEvaluationFailureFixture.assertExpectedError($0)
+            }
+            XCTAssertFalse(isPrepared())
+            XCTAssertTrue(projection() === original)
+            XCTAssertTrue(projection().weight === weightIdentity)
+            XCTAssertFalse(try prepare())
+
+            // A parameter update is the explicit reset; never reuse the failed lazy array.
+            try layer.update(
+                parameters: ModuleParameters.unflattened(["in_proj_qkv.weight": validWeight]),
+                verify: [])
+            XCTAssertTrue(try prepare())
+            XCTAssertTrue(isPrepared())
+        }
+    }
+
     func testRollbackFailureIsIncludedInPreparationError() throws {
         enum ExpectedFailure: Error { case install, rollback }
 
@@ -363,6 +540,15 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         }
         XCTAssertEqual(installAttempts, 2)
         XCTAssertFalse(cache.isPrepared)
+        XCTAssertNil(cache.fused)
+        XCTAssertThrowsError(
+            try cache.prepare(enabled: true, linears: linears) { _ in
+                XCTFail("a failed rollback must not be retried")
+            })
+        XCTAssertThrowsError(
+            try cache.prepare(enabled: false, linears: linears) { _ in
+                XCTFail("disabling fusion must not hide a failed rollback")
+            })
     }
 
     /// Opt-in paired benchmark for a local Qwen 3.5 checkpoint.

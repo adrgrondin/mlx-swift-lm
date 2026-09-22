@@ -772,7 +772,7 @@ public func loadParoQuantModel<T: LanguageModel>(
     // 12. Prepare generic inference-only state, then materialize the model.
     // This must follow the final IO-layer topology update above, just like the
     // standard checkpoint-loading path.
-    materializeModelForInference(model)
+    try materializeModelForInference(model)
     markPhase("eval")
     logger.info("ParoQuant model loaded and evaluated")
     let totalSeconds = (loadClock.now - loadStart) / .seconds(1)
