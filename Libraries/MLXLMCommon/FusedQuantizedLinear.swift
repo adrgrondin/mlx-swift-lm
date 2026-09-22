@@ -21,11 +21,19 @@ package struct FusedQuantizedLinearProjection {
     package let sourceViews: [QuantizedLinear]
 }
 
+/// Fusion failed before any source modules were replaced.
+package struct FusedQuantizedLinearConstructionError: Error, CustomStringConvertible {
+    package let underlyingError: any Error
+
+    package var description: String {
+        "unable to construct fused projection (\(underlyingError)); the original projections are unchanged"
+    }
+}
+
 /// A fused projection could not replace its source modules atomically.
 ///
 /// `rollbackError` is non-nil only when restoring the original source modules
-/// also failed; callers can then surface both failures while retaining the
-/// conservative unfused execution path.
+/// also failed. The model must not be used in that case.
 package struct FusedQuantizedLinearPreparationError: Error, CustomStringConvertible {
     package let installationError: any Error
     package let rollbackError: (any Error)?
@@ -53,6 +61,7 @@ package final class FusedQuantizedLinearProjectionCache {
         case preparing
         case ready
         case ineligible
+        case failedRestoration(FusedQuantizedLinearPreparationError)
     }
 
     private var state = State.unprepared
@@ -61,7 +70,8 @@ package final class FusedQuantizedLinearProjectionCache {
     package init() {}
 
     package var isPrepared: Bool {
-        state == .ready && fused != nil
+        if case .ready = state { return fused != nil }
+        return false
     }
 
     /// Drop derived state after any source-module or source-parameter update.
@@ -69,7 +79,7 @@ package final class FusedQuantizedLinearProjectionCache {
     /// are ignored; the preparation transaction publishes `fused` only after
     /// every view has been installed successfully.
     package func invalidate() {
-        guard state != .preparing else { return }
+        if case .preparing = state { return }
         fused = nil
         state = .unprepared
     }
@@ -81,8 +91,10 @@ package final class FusedQuantizedLinearProjectionCache {
     package func prepare(
         enabled: Bool,
         linears: [Linear],
+        materialize: ([MLXArray]) -> Void = { eval($0) },
         installSourceModules: ([Linear]) throws -> Void
     ) throws -> Bool {
+        if case .failedRestoration(let error) = state { throw error }
         guard enabled else { return false }
 
         switch state {
@@ -90,33 +102,47 @@ package final class FusedQuantizedLinearProjectionCache {
             return fused != nil
         case .preparing, .ineligible:
             return false
+        case .failedRestoration(let error):
+            throw error
         case .unprepared:
             break
         }
 
         state = .preparing
-        guard let projection = fuseQuantizedLinearProjections(linears),
-            projection.sourceViews.count == linears.count
+        defer {
+            if case .preparing = state {
+                fused = nil
+                state = .ineligible
+            }
+        }
+        let projection: FusedQuantizedLinearProjection?
+        do {
+            projection = try fuseQuantizedLinearProjections(linears, materialize: materialize)
+        } catch {
+            throw FusedQuantizedLinearConstructionError(underlyingError: error)
+        }
+        guard let projection, projection.sourceViews.count == linears.count
         else {
             state = .ineligible
             return false
         }
 
         do {
-            try installSourceModules(projection.sourceViews)
+            try withError { try installSourceModules(projection.sourceViews) }
         } catch let installationError {
             let rollbackError: (any Error)?
             do {
-                try installSourceModules(linears)
+                try withError { try installSourceModules(linears) }
                 rollbackError = nil
             } catch let error {
                 rollbackError = error
             }
             fused = nil
-            state = .ineligible
-            throw FusedQuantizedLinearPreparationError(
+            let error = FusedQuantizedLinearPreparationError(
                 installationError: installationError,
                 rollbackError: rollbackError)
+            state = rollbackError == nil ? .ineligible : .failedRestoration(error)
+            throw error
         }
 
         fused = projection.fused
@@ -132,8 +158,9 @@ package final class FusedQuantizedLinearProjectionCache {
 /// represented by one stock quantized matmul. Incompatible inputs return
 /// `nil` and callers keep their original projections.
 package func fuseQuantizedLinearProjections(
-    _ linears: [Linear]
-) -> FusedQuantizedLinearProjection? {
+    _ linears: [Linear],
+    materialize: ([MLXArray]) -> Void = { eval($0) }
+) throws -> FusedQuantizedLinearProjection? {
     guard linears.count > 1 else { return nil }
 
     let projections = linears.compactMap { $0 as? QuantizedLinear }
@@ -177,47 +204,59 @@ package func fuseQuantizedLinearProjections(
         return nil
     }
 
-    let fusedWeight = concatenated(projections.map(\.weight), axis: 0)
-    let fusedScales = concatenated(projections.map(\.scales), axis: 0)
-    let fusedBiases =
-        hasQuantizationBiases
-        ? concatenated(projections.compactMap(\.biases), axis: 0)
-        : nil
+    // Scope the handler here: loading may run on a dispatch worker rather than
+    // the caller's Swift task. Never consume a tensor after an MLX error.
+    return try withError { error in
+        let fusedWeight = concatenated(projections.map(\.weight), axis: 0)
+        try error.check()
+        let fusedScales = concatenated(projections.map(\.scales), axis: 0)
+        try error.check()
+        let fusedBiases =
+            hasQuantizationBiases
+            ? concatenated(projections.compactMap(\.biases), axis: 0)
+            : nil
+        try error.check()
 
-    // Realize the concatenations once. The fused projection and the named
-    // source views below then share this materialized backing storage.
-    eval(fusedWeight, fusedScales)
-    if let fusedBiases {
-        eval(fusedBiases)
-    }
+        materialize([fusedWeight, fusedScales] + (fusedBiases.map { [$0] } ?? []))
+        try error.check()
 
-    let fused = QuantizedLinear(
-        weight: fusedWeight,
-        bias: nil,
-        scales: fusedScales,
-        biases: fusedBiases,
-        groupSize: first.groupSize,
-        bits: first.bits,
-        mode: first.mode)
-    fused.freeze()
-
-    var start = 0
-    let sourceViews = projections.map { projection in
-        let end = start + projection.shape.0
-        defer { start = end }
-
-        let rows = start ..< end
-        let view = QuantizedLinear(
-            weight: fusedWeight[rows],
+        let fused = QuantizedLinear(
+            weight: fusedWeight,
             bias: nil,
-            scales: fusedScales[rows],
-            biases: fusedBiases.map { $0[rows] },
+            scales: fusedScales,
+            biases: fusedBiases,
             groupSize: first.groupSize,
             bits: first.bits,
             mode: first.mode)
-        view.freeze()
-        return view
-    }
+        fused.freeze()
 
-    return FusedQuantizedLinearProjection(fused: fused, sourceViews: sourceViews)
+        var start = 0
+        let sourceViews = try projections.map { projection in
+            let end = start + projection.shape.0
+            defer { start = end }
+
+            let rows = start ..< end
+            let weight = fusedWeight[rows]
+            try error.check()
+            let scales = fusedScales[rows]
+            try error.check()
+            let biases = fusedBiases.map { $0[rows] }
+            try error.check()
+            let view = QuantizedLinear(
+                weight: weight,
+                bias: nil,
+                scales: scales,
+                biases: biases,
+                groupSize: first.groupSize,
+                bits: first.bits,
+                mode: first.mode)
+            view.freeze()
+            return view
+        }
+
+        // Realize the storage-sharing slices before replacing any originals.
+        eval(sourceViews)
+        try error.check()
+        return FusedQuantizedLinearProjection(fused: fused, sourceViews: sourceViews)
+    }
 }

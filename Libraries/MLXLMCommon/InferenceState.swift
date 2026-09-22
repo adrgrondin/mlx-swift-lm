@@ -21,9 +21,9 @@ private let inferenceStateLogger = Logger(
 /// Prepare a language model after checkpoint loading or an explicit topology
 /// update.
 ///
-/// A failed optional optimization is logged and reported while the model
-/// remains usable through its unfused path. `BaseLanguageModel` values outside
-/// the inference lifecycle, such as rerankers, require no preparation.
+/// Preparation failures are logged and reported, not assumed recoverable.
+/// `BaseLanguageModel` values outside the inference lifecycle, such as rerankers,
+/// require no preparation.
 @discardableResult
 package func prepareInferenceState(
     in model: BaseLanguageModel
@@ -48,12 +48,27 @@ package func prepareInferenceState(
 /// Prepare derived state and realize a fully loaded model before publication.
 ///
 /// All custom checkpoint loaders should finalize through this function so
-/// inference-only optimizations are applied consistently.
+/// inference-only optimizations are applied consistently. Ordinary materialization
+/// and unrecognized preparation errors propagate. Only fusion failures that leave
+/// the original projections intact permit unfused inference.
 @discardableResult
 package func materializeModelForInference(
     _ model: BaseLanguageModel
-) -> InferenceStatePreparationReport {
+) throws -> InferenceStatePreparationReport {
+    // Validate the original model before an optional evaluation can fail and
+    // leave a lazy source array in an unusable state.
+    try withError { eval(model) }
     let report = prepareInferenceState(in: model)
-    eval(model)
+    for failure in report.failures {
+        switch failure.error {
+        case is FusedQuantizedLinearConstructionError:
+            break
+        case let error as FusedQuantizedLinearPreparationError where error.rollbackError == nil:
+            break
+        default:
+            throw failure.error
+        }
+    }
+    try withError { eval(model) }
     return report
 }

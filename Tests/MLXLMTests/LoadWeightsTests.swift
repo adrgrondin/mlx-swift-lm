@@ -70,6 +70,74 @@ private final class FailingInferenceStateModel: Module, LanguageModel,
     }
 }
 
+private final class FusionLoadingModel: Module, LanguageModel, KVCacheDimensionProvider {
+    enum Failure { case materialization, installation, rollback, ordinaryMaterialization }
+    enum InstallationError: Error { case failed }
+
+    @ModuleInfo var projections: [Linear]
+    let kvHeads: [Int] = []
+    let fusion = FusedQuantizedLinearProjectionCache()
+    let failure: Failure
+    private(set) var preparationCount = 0
+    private(set) var materializationCount = 0
+    private(set) var installationCount = 0
+
+    init(failure: Failure) {
+        self.failure = failure
+        _projections.wrappedValue = (0 ..< 4).map { _ in
+            QuantizedLinear(64, 8, bias: false, groupSize: 32, bits: 4)
+        }
+        super.init()
+    }
+
+    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        var weights = weights
+        if failure == .ordinaryMaterialization, let weight = weights["projections.0.weight"] {
+            weights["projections.0.weight"] = MLXEvaluationFailureFixture.array(
+                shape: weight.shape, dtype: weight.dtype)
+        }
+        return weights
+    }
+
+    func prepare() throws {
+        preparationCount += 1
+        try fusion.prepare(
+            enabled: true, linears: projections,
+            materialize: { arrays in
+                self.materializationCount += 1
+                if self.failure == .materialization {
+                    eval(arrays + [MLXEvaluationFailureFixture.array()])
+                } else {
+                    eval(arrays)
+                }
+            },
+            installSourceModules: { modules in
+                self.installationCount += 1
+                // Mutate before throwing to exercise restoration after partial installation.
+                try self.update(
+                    modules: ModuleChildren(values: [
+                        "projections": .array(modules.map { .value($0) })
+                    ]), verify: [])
+                if self.failure == .rollback {
+                    throw InstallationError.failed
+                }
+                if self.failure == .installation && self.installationCount == 1 {
+                    eval(MLXEvaluationFailureFixture.array())
+                }
+            })
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        projections[0](inputs)
+    }
+}
+
 final class LoadWeightsTests: XCTestCase {
 
     // MARK: - Concurrent loading
@@ -251,6 +319,93 @@ final class LoadWeightsTests: XCTestCase {
         XCTAssertTrue(report.failures[0].modelType.contains("FailingInferenceStateModel"))
         XCTAssertTrue(
             report.failures[0].error is FailingInferenceStateModel.ExpectedFailure)
+    }
+
+    func testEvaluationFailureFixtureIsLazyAndRecoverable() throws {
+        let array = try withError { MLXEvaluationFailureFixture.array() }
+        XCTAssertEqual(array.shape, [1])
+        XCTAssertThrowsError(try withError { eval(array) }) {
+            MLXEvaluationFailureFixture.assertExpectedError($0)
+        }
+        XCTAssertEqual(MLXArray.ones([1]).item(Float.self), 1)
+    }
+
+    func testAsyncLoadingRecoversOptionalFusionFailuresOnItsWorker() async throws {
+        for failure in [FusionLoadingModel.Failure.materialization, .installation] {
+            let directory = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let model = FusionLoadingModel(failure: failure)
+            try save(
+                arrays: Dictionary(uniqueKeysWithValues: model.parameters().flattened()),
+                url: directory.appendingPathComponent("model.safetensors"))
+            let originals = model.projections
+            let input = MLXArray.ones([1, 64])
+            let expected = model(input, cache: nil).asArray(Float.self)
+
+            // Deliberately no outer withError: the handler must live on the load worker.
+            try await loadWeights(modelDirectory: directory, model: model)
+
+            XCTAssertEqual(model.preparationCount, 1)
+            XCTAssertEqual(model.materializationCount, 1)
+            XCTAssertEqual(model.installationCount, failure == .installation ? 2 : 0)
+            XCTAssertFalse(model.fusion.isPrepared)
+            XCTAssertNil(model.fusion.fused)
+            XCTAssertEqual(
+                model.projections.map(ObjectIdentifier.init), originals.map(ObjectIdentifier.init))
+            XCTAssertEqual(model(input, cache: nil).asArray(Float.self), expected)
+            try model.prepare()
+            XCTAssertEqual(model.materializationCount, 1)
+        }
+    }
+
+    func testAsyncLoadingRejectsOrdinaryMaterializationAndRollbackFailures() async throws {
+        for failure in [FusionLoadingModel.Failure.ordinaryMaterialization, .rollback] {
+            let directory = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let model = FusionLoadingModel(failure: failure)
+            try save(
+                arrays: Dictionary(uniqueKeysWithValues: model.parameters().flattened()),
+                url: directory.appendingPathComponent("model.safetensors"))
+
+            do {
+                try await loadWeights(modelDirectory: directory, model: model)
+                XCTFail("invalid model must not be published")
+            } catch {
+                if failure == .ordinaryMaterialization {
+                    MLXEvaluationFailureFixture.assertExpectedError(error)
+                    XCTAssertEqual(model.preparationCount, 0)
+                } else {
+                    XCTAssertNotNil((error as? FusedQuantizedLinearPreparationError)?.rollbackError)
+                    XCTAssertThrowsError(try materializeModelForInference(model))
+                    XCTAssertEqual(model.installationCount, 2)
+                }
+            }
+            XCTAssertNil(model.fusion.fused)
+        }
+    }
+
+    func testAsyncLoadingRejectsUnrecognizedPreparationFailure() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            try await loadWeights(modelDirectory: directory, model: FailingInferenceStateModel())
+            XCTFail("an arbitrary preparation error is not proof of a usable fallback")
+        } catch {
+            XCTAssertTrue(error is FailingInferenceStateModel.ExpectedFailure)
+        }
+    }
+
+    func testAsyncLoadingRejectsMalformedCheckpoint() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("invalid safetensors".utf8).write(
+            to: directory.appendingPathComponent("model.safetensors"))
+        do {
+            try await loadWeights(modelDirectory: directory, model: TwoLayerModel())
+            XCTFail("malformed weights must not load")
+        } catch {
+            // Header parsing and the whole-file fallback must still report an error.
+        }
     }
 
     // MARK: - Index
