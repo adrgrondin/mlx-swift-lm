@@ -128,10 +128,42 @@ model type to `qwen3_5`: that would omit required transforms. Schema-1 text pack
 schema-2 `mlx-vlm-qwen3_5` packs with grouped GDN layout are supported; invalid metadata,
 packed shapes, or sign vectors fail loading rather than falling back to ordinary Qwen.
 
-Regression tests cover transform numerics, synthetic checkpoint loading, text/image
-inference and continuation, and the published 27B tensor topology. These tests do not
-measure full-checkpoint generation quality, peak memory, or device performance. The
-published pack is about 8.6 GB, with additional runtime memory needed for activations and caches.
+### Generation settings
+
+Sampling settings from `generation_config.json` are not applied automatically. Opt in to
+`GenerateParameters.bonsai2Thinking()` for the [model card's thinking-mode settings](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit#best-practices):
+temperature 1.0, top-p 0.95, top-k 20, min-p 0.0, and no repetition or presence penalty.
+This does not change other models' defaults or enable thinking in the chat template.
+
+With a Bonsai 2 `modelContainer` loaded through either factory:
+
+```swift
+let session = ChatSession(
+    modelContainer,
+    instructions: "You are a helpful assistant",
+    generateParameters: .bonsai2Thinking(maxTokens: 16_384),
+    additionalContext: ["reasoning_effort": "medium"]
+)
+print(try await session.respond(to: "Explain your reasoning, then give the answer."))
+```
+
+The preset's 16,384-token output budget follows the [demo's guidance](https://github.com/PrismML-Eng/Bonsai-demo#best-practices-bonsai-2-27b).
+It counts both reasoning and answer tokens; it is not a separate thinking budget. A short
+limit can stop the model before its answer. Adjust `maxTokens` for your device and request.
+The template defaults to `xhigh` effort; `medium` asks for shorter reasoning without imposing
+a fixed thinking-token budget. `low` is not supported reliably. The demo's optional
+`min_p = 0.05` tuning differs from the model-card/benchmark setting; set `parameters.minP`
+explicitly if you want it.
+
+### Validation scope
+
+Regression tests cover FP16/FP32 transform numerics at 512/1024/2048/4096 blocks, packed
+linear/embedding operations at the published 5120/17408 input widths, synthetic 1024-block
+checkpoint loading, text/image inference and cached continuation, and the published 27B
+tensor topology. Numerical references use independent dense Walsh matrices. These are
+Swift-side regressions, not cross-runtime or full-checkpoint quality comparisons, and do
+not measure peak memory or device performance. The published pack is about 8.6 GB, with
+additional runtime memory needed for activations and caches.
 
 ## `FoundationModels` integration
 
