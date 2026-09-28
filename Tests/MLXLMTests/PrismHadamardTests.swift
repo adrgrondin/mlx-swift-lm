@@ -10,10 +10,10 @@ import XCTest
 @testable import MLXVLM
 
 final class PrismHadamardTests: XCTestCase {
-    private func configuration(schema: Int = 2) throws -> Data {
+    private func configuration(schema: Int = 2, block: Int = 512) throws -> Data {
         var records: [[String: Any]] = [
-            ["path": "model.embed_tokens", "block": 512, "embedding": true, "dtype": "float16"],
-            ["path": "lm_head", "block": 512, "embedding": false, "dtype": "float16"],
+            ["path": "model.embed_tokens", "block": block, "embedding": true, "dtype": "float16"],
+            ["path": "lm_head", "block": block, "embedding": false, "dtype": "float16"],
         ]
         for layer in 0 ..< 2 {
             let projections =
@@ -22,7 +22,7 @@ final class PrismHadamardTests: XCTestCase {
                 : ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]
             for suffix in projections + ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
                 records.append([
-                    "path": "model.layers.\(layer).\(suffix)", "block": 512,
+                    "path": "model.layers.\(layer).\(suffix)", "block": block,
                     "embedding": false, "dtype": "float16",
                 ])
             }
@@ -36,18 +36,21 @@ final class PrismHadamardTests: XCTestCase {
             "modules": records, "image_token_id": 15, "video_token_id": 14,
             "vision_start_token_id": 13, "tie_word_embeddings": false,
             "text_config": [
-                "model_type": "qwen3_5_text", "hidden_size": 512, "intermediate_size": 512,
+                "model_type": "qwen3_5_text", "hidden_size": block, "intermediate_size": block,
                 "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
-                "head_dim": 128, "vocab_size": 16, "tie_word_embeddings": false,
+                "head_dim": block / 4, "vocab_size": 16, "tie_word_embeddings": false,
                 "linear_num_value_heads": 4, "linear_num_key_heads": 2,
-                "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+                "linear_key_head_dim": block / 4, "linear_value_head_dim": block / 4,
                 "linear_conv_kernel_dim": 4, "full_attention_interval": 2,
                 "partial_rotary_factor": 0.25,
-                "rope_parameters": ["rope_theta": 10_000_000, "mrope_section": [4, 6, 6]],
+                "rope_parameters": [
+                    "rope_theta": 10_000_000,
+                    "mrope_section": [block / 128, 3 * block / 256, 3 * block / 256],
+                ],
             ],
             "vision_config": [
                 "model_type": "qwen3_5", "depth": 1, "hidden_size": 32, "intermediate_size": 64,
-                "out_hidden_size": 512,
+                "out_hidden_size": block,
                 "num_heads": 4, "patch_size": 2, "spatial_merge_size": 1,
                 "temporal_patch_size": 1, "num_position_embeddings": 16,
             ],
@@ -115,14 +118,14 @@ final class PrismHadamardTests: XCTestCase {
     }
 
     // Independent dense Walsh matrix, not a call to the transform under test.
-    private func referenceTransform(_ x: MLXArray, signs: MLXArray, inverse: Bool = false)
-        -> MLXArray
-    {
-        let block = 512
+    private func referenceTransform(
+        _ x: MLXArray, block: Int = 512, signs: MLXArray, inverse: Bool = false
+    ) -> MLXArray {
+        let scale = 1 / sqrt(Float(block))
         let h = MLXArray(
             (0 ..< block * block).map { index -> Float in
                 let parity = ((index / block) & (index % block)).nonzeroBitCount % 2
-                return (parity == 0 ? 1 : -1) / sqrt(Float(block))
+                return (parity == 0 ? 1 : -1) * scale
             }
         ).reshaped(block, block)
         var result = x.asType(.float32)
@@ -143,40 +146,83 @@ final class PrismHadamardTests: XCTestCase {
     }
 
     func testForwardAndInverseTransformsMatchIndependentReference() {
-        let x = sin(MLXArray(0 ..< 3072).asType(.float32) * 0.01).reshaped(1, 3, 1024).asType(
-            .float16)
-        let signs = signs(width: 1024)
-        let forward = prismHadamardTransform(x, block: 512, signs: signs)
-        assertClose(forward, referenceTransform(x, signs: signs))
-        assertClose(prismHadamardTransform(forward, block: 512, signs: signs, inverse: true), x)
-        assertClose(
-            prismHadamardTransform(x, block: 512, signs: signs, inverse: true),
-            referenceTransform(x, signs: signs, inverse: true))
-        assertClose(prismHadamardTransform(x, block: 0, signs: nil), x, tolerance: 0)
+        for block in [512, 1024, 2048, 4096] {
+            let width = block * 2
+            let signs = signs(width: width)
+            for dtype in [DType.float16, .float32] {
+                // Keep multiple blocks and noncontiguous rows to catch layout mistakes.
+                let x = (sin(MLXArray(0 ..< 6 * width).asType(.float32) * 0.01) * 0.1)
+                    .asType(dtype).reshaped(3, width, 2)[0..., 0..., 0]
+                    .expandedDimensions(axis: 0)
+                let tolerance: Float = dtype == .float32 ? 0.0001 : 0.005
+                let forward = prismHadamardTransform(x, block: block, signs: signs)
+                XCTAssertEqual(forward.dtype, dtype)
+                assertClose(
+                    forward, referenceTransform(x, block: block, signs: signs),
+                    tolerance: tolerance)
+                assertClose(
+                    prismHadamardTransform(forward, block: block, signs: signs, inverse: true),
+                    x, tolerance: tolerance)
+                let inverse = prismHadamardTransform(x, block: block, signs: signs, inverse: true)
+                XCTAssertEqual(inverse.dtype, dtype)
+                assertClose(
+                    inverse, referenceTransform(x, block: block, signs: signs, inverse: true),
+                    tolerance: tolerance)
+                assertClose(prismHadamardTransform(x, block: 0, signs: nil), x, tolerance: 0)
+            }
+        }
     }
 
     func testPackedLinearAndEmbeddingPreserveTransformsAndCheckpointKeys() throws {
-        let dense = (sin(MLXArray(0 ..< 2048).asType(.float32) * 0.03) * 0.05).reshaped(4, 512)
-            .asType(.float16)
-        let (weight, scales, biases) = quantized(dense, groupSize: 128, bits: 2)
-        let signs = signs(width: 512)
-        let arrays = [
-            "weight": weight, "scales": scales, "biases": try XCTUnwrap(biases), "signs": signs,
-        ]
-        let linear = PrismHadamardLinear(rows: 4, width: 512, block: 512)
-        let embedding = PrismHadamardEmbedding(rows: 4, width: 512, block: 512)
-        try linear.update(parameters: ModuleParameters.unflattened(arrays), verify: [.all])
-        try embedding.update(parameters: ModuleParameters.unflattened(arrays), verify: [.all])
-        let x = cos(MLXArray(0 ..< 1024).asType(.float32) * 0.03).reshaped(1, 2, 512).asType(
-            .float16)
-        let unpacked = dequantized(weight, scales: scales, biases: biases, groupSize: 128, bits: 2)
-        assertClose(linear(x), matmul(referenceTransform(x, signs: signs), unpacked.T))
-        let tokens = MLXArray([3, 0, 3, 1]).reshaped(2, 2)
-        assertClose(
-            embedding(tokens), referenceTransform(unpacked[tokens], signs: signs, inverse: true))
-        assertClose(embedding.asLinear(x), linear(x))
-        XCTAssertTrue(quantizeSingle(layer: linear, groupSize: 128, bits: 2) == nil)
-        XCTAssertEqual(Set(linear.parameters().flattened().map(\.0)), Set(arrays.keys))
+        // Include the published hidden and MLP widths, not only a single transform block.
+        for (block, width) in [(512, 512), (1024, 5120), (1024, 17408)] {
+            let dense = (sin(MLXArray(0 ..< 4 * width).asType(.float32) * 0.03) * 0.05)
+                .reshaped(4, width).asType(.float16)
+            let (weight, scales, biases) = quantized(dense, groupSize: 128, bits: 2)
+            let signs = signs(width: width)
+            let arrays = [
+                "weight": weight, "scales": scales, "biases": try XCTUnwrap(biases), "signs": signs,
+            ]
+            let linear = PrismHadamardLinear(rows: 4, width: width, block: block)
+            let embedding = PrismHadamardEmbedding(rows: 4, width: width, block: block)
+            try linear.update(parameters: ModuleParameters.unflattened(arrays), verify: [.all])
+            try embedding.update(parameters: ModuleParameters.unflattened(arrays), verify: [.all])
+            let unpacked = dequantized(
+                weight, scales: scales, biases: biases, groupSize: 128, bits: 2)
+            for count in [1, 3] {
+                let x = (cos(MLXArray(0 ..< count * width).asType(.float32) * 0.03) * 0.1)
+                    .reshaped(1, count, width).asType(.float16)
+                let expected = matmul(referenceTransform(x, block: block, signs: signs), unpacked.T)
+                assertClose(linear(x), expected)
+                assertClose(embedding.asLinear(x), expected)
+            }
+            let tokens = MLXArray([3, 0, 3, 1]).reshaped(2, 2)
+            assertClose(
+                embedding(tokens),
+                referenceTransform(unpacked[tokens], block: block, signs: signs, inverse: true))
+            XCTAssertTrue(quantizeSingle(layer: linear, groupSize: 128, bits: 2) == nil)
+            for module in [linear as Module, embedding] {
+                XCTAssertEqual(Set(module.parameters().flattened().map(\.0)), Set(arrays.keys))
+            }
+            XCTAssertEqual(linear.weight.shape, [4, width / 16])
+            XCTAssertEqual(embedding.weight.shape, [4, width / 16])
+        }
+    }
+
+    func testBonsaiThinkingPresetIsOptInAndCustomizable() {
+        let preset = GenerateParameters.bonsai2Thinking()
+        XCTAssertEqual(preset.maxTokens, 16_384)
+        XCTAssertEqual(preset.temperature, 1.0)
+        XCTAssertEqual(preset.topP, 0.95)
+        XCTAssertEqual(preset.topK, 20)
+        XCTAssertEqual(preset.minP, 0.0)
+        XCTAssertNil(preset.processor())
+        XCTAssertTrue(preset.sampler() is TopPSampler)
+        XCTAssertEqual(GenerateParameters.bonsai2Thinking(maxTokens: 32_768).maxTokens, 32_768)
+        XCTAssertNil(GenerateParameters.bonsai2Thinking(maxTokens: nil).maxTokens)
+        XCTAssertEqual(GenerateParameters().temperature, 0.6)
+        XCTAssertEqual(GenerateParameters().topP, 1.0)
+        XCTAssertEqual(GenerateParameters().topK, 0)
     }
 
     private func checkpoint(configuration data: Data) throws -> [String: MLXArray] {
@@ -211,7 +257,7 @@ final class PrismHadamardTests: XCTestCase {
     }
 
     func testBothRegistriesLoadVisionPackAndAgreeOnTextPrefillAndDecode() async throws {
-        let data = try configuration()
+        let data = try configuration(block: 1024)
         let weights = try checkpoint(configuration: data)
         let llm = try await LLMTypeRegistry.shared.createModel(
             configuration: data, modelType: "prism_hadamard_qwen35")
@@ -239,20 +285,27 @@ final class PrismHadamardTests: XCTestCase {
             let signs = try XCTUnwrap(denseWeights.removeValue(forKey: path + ".signs"))
             denseWeights[path + ".weight"] = referenceTransform(
                 dequantized(packed, scales: scales, biases: biases, groupSize: 128, bits: 2),
-                signs: signs, inverse: true)
+                block: record.block, signs: signs, inverse: true)
         }
         try reference.update(parameters: ModuleParameters.unflattened(denseWeights), verify: [.all])
         let referenceCache = try reference.newCache(parameters: nil)
         let llmCache = try llm.newCache(parameters: nil)
         let vlmCache = try vlm.newCache(parameters: nil)
         var state: LMOutput.State?
-        for tokens in [MLXArray([1, 2, 3]).reshaped(1, 3), MLXArray([4]).reshaped(1, 1)] {
+        var prefix = [Int]()
+        for nextTokens in [[1, 2, 3], [4], [5], [6]] {
+            prefix += nextTokens
+            let tokens = MLXArray(nextTokens).reshaped(1, -1)
             let a = llm(LMInput.Text(tokens: tokens), cache: llmCache, state: nil).logits
             let result = vlm(LMInput.Text(tokens: tokens), cache: vlmCache, state: state)
             state = result.state
             XCTAssertTrue(isFinite(a).all().item(Bool.self))
             assertClose(a, result.logits, tolerance: 0.02)
             assertClose(a, reference(tokens, cache: referenceCache), tolerance: 0.02)
+            let full = llm(
+                .init(tokens: MLXArray(prefix).reshaped(1, -1)), cache: nil, state: nil
+            ).logits
+            assertClose(a[0, -1], full[0, -1], tolerance: 0.02)
         }
         // Loading/preparation must not turn transformed projections into ordinary fused linears.
         for model in [llm, vlm] {
@@ -293,7 +346,7 @@ final class PrismHadamardTests: XCTestCase {
     }
 
     func testVisionPackProcessesAnImageAndContinuesWithText() throws {
-        let data = try configuration()
+        let data = try configuration(block: 1024)
         let model = try MLXVLM.PrismHadamardQwen35(configuration: data)
         try withCheckpoint(checkpoint(configuration: data)) {
             try loadWeights(modelDirectory: $0, model: model)
@@ -310,6 +363,13 @@ final class PrismHadamardTests: XCTestCase {
             .init(tokens: MLXArray([3]).reshaped(1, 1)), cache: cache, state: output.state)
         XCTAssertTrue(isFinite(continued.logits).all().item(Bool.self))
         XCTAssertEqual(continued.logits.shape, [1, 1, 16])
+        let fullInput = LMInput(
+            text: .init(tokens: MLXArray([1, 13, 15, 15, 15, 15, 2, 3]).reshaped(1, 8)),
+            image: input.image)
+        let full = try model.prepare(
+            fullInput, cache: model.newCache(parameters: nil), state: nil, prefill: .init())
+        guard case .logits(let fullOutput) = full else { return XCTFail("expected vision logits") }
+        assertClose(continued.logits[0, -1], fullOutput.logits[0, -1], tolerance: 0.02)
     }
 
     func testSchemaOneTextPackLoadsWithoutVision() throws {
