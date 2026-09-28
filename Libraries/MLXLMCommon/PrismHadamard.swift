@@ -4,6 +4,15 @@ import Foundation
 import MLX
 import MLXNN
 
+extension GenerateParameters {
+    /// Model-card thinking-mode sampling for Bonsai 2; does not change the chat template.
+    /// The default output budget follows the demo's recommendation, not a thinking-token limit.
+    public static func bonsai2Thinking(maxTokens: Int? = 16_384) -> GenerateParameters {
+        GenerateParameters(
+            maxTokens: maxTokens, temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0)
+    }
+}
+
 package enum PrismHadamardError: Error, LocalizedError {
     case invalidCheckpoint(String)
 
