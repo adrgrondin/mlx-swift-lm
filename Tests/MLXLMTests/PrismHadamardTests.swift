@@ -183,7 +183,8 @@ final class PrismHadamardTests: XCTestCase {
         let config = try JSONDecoder().decode(MLXVLM.Qwen35Configuration.self, from: data)
         let base = MLXVLM.Qwen35(config)
         var weights = Dictionary(uniqueKeysWithValues: base.parameters().flattened())
-        let metadata = try JSONDecoder().decode(PrismHadamardConfiguration.self, from: data)
+        let metadata = try JSONDecoder().decode(
+            MLXLMCommon.PrismHadamardConfiguration.self, from: data)
         for record in metadata.modules {
             let path = "language_model." + record.path
             let original = try XCTUnwrap(weights[path + ".weight"])
@@ -228,7 +229,8 @@ final class PrismHadamardTests: XCTestCase {
         let reference = MLXLLM.Qwen35Model(
             try JSONDecoder().decode(MLXLLM.Qwen35Configuration.self, from: data))
         var denseWeights = llm.sanitize(weights: weights)
-        let metadata = try JSONDecoder().decode(PrismHadamardConfiguration.self, from: data)
+        let metadata = try JSONDecoder().decode(
+            MLXLMCommon.PrismHadamardConfiguration.self, from: data)
         for record in metadata.modules {
             let path = "language_model." + record.path
             let packed = try XCTUnwrap(denseWeights[path + ".weight"])
