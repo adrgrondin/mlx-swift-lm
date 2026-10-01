@@ -6,7 +6,8 @@ import Foundation
 ///
 /// Conforming models can precompile compiled Metal graphs and free converted
 /// weights after loading, eliminating the per-shape JIT cost on the first
-/// forward pass and reducing peak memory. ``loadWeights`` calls
+/// forward pass and reducing peak memory.
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-6eqw7`` calls
 /// ``precompileNativeFunctions()`` after weights are loaded and modules are
 /// replaced (after `update(parameters:)` and `eval(model)`).
 ///
