@@ -239,9 +239,55 @@ final class LoadWeightsTests: XCTestCase {
     func testLoadWeightArraysSkipsExcludedDataBeforeEvaluation() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("model.safetensors")
+        let visionBytes = 64 * 1024 * 1024
+        let header: [String: Any] = [
+            "__metadata__": ["format": "mlx"],
+            "language_model.weight": [
+                "dtype": "F32", "shape": [1], "data_offsets": [0, 4],
+            ],
+            "vision_tower_extra.weight": [
+                "dtype": "F32", "shape": [1], "data_offsets": [4, 8],
+            ],
+            "vision_tower.weight": [
+                "dtype": "F32", "shape": [visionBytes / 4], "data_offsets": [8, 8 + visionBytes],
+            ],
+        ]
+        let json = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(json.count).littleEndian
+        var data = withUnsafeBytes(of: &length) { Data($0) }
+        data.append(json)
+        data.append([Float(1), Float(2)].withUnsafeBytes { Data($0) })
+        try data.write(to: url)
+        let handle = try FileHandle(forUpdating: url)
+        // A sparse file satisfies header validation without allocating the vision payload.
+        try handle.truncate(atOffset: UInt64(data.count + visionBytes))
+        try handle.close()
+
+        Memory.peakMemory = 0
+        let baseline = Memory.activeMemory
+        let (weights, metadata) = try loadWeightArrays(
+            urls: [url], excludingPrefixes: ["vision_tower."])
+        XCTAssertEqual(Set(weights.keys), ["language_model.weight", "vision_tower_extra.weight"])
+        XCTAssertEqual(weights["language_model.weight"]?.asArray(Float.self), [1])
+        XCTAssertEqual(weights["vision_tower_extra.weight"]?.asArray(Float.self), [2])
+        XCTAssertEqual(metadata, ["format": "mlx"])
+        XCTAssertLessThan(Memory.peakMemory - baseline, visionBytes / 2)
+
+        // Positive control: the same loader must materialize the payload without filtering.
+        Memory.peakMemory = 0
+        let unfilteredBaseline = Memory.activeMemory
+        let (all, _) = try loadWeightArrays(urls: [url])
+        XCTAssertEqual(all["vision_tower.weight"]?.size, visionBytes / 4)
+        XCTAssertGreaterThanOrEqual(Memory.peakMemory - unfilteredBaseline, visionBytes)
+    }
+
+    func testLoadWeightArraysRejectsMalformedExcludedTensors() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
 
         let url = directory.appendingPathComponent("model.safetensors")
-        // The second case makes span parsing fail, exercising the whole-file fallback.
+        // Cover both truncated data and invalid offsets on the whole-file fallback.
         for visionEnd in [24, 0] {
             let header: [String: Any] = [
                 "__metadata__": ["format": "mlx"],
@@ -260,17 +306,10 @@ final class LoadWeightsTests: XCTestCase {
             var data = withUnsafeBytes(of: &length) { Data($0) }
             data.append(json)
             data.append([Float(1), Float(2)].withUnsafeBytes { Data($0) })
-            // Vision data is deliberately absent: evaluating it would fail the read.
             try data.write(to: url)
 
-            let (weights, metadata) = try loadWeightArrays(
-                urls: [url], excludingPrefixes: ["vision_tower."])
-
-            XCTAssertEqual(
-                Set(weights.keys), ["language_model.weight", "vision_tower_extra.weight"])
-            XCTAssertEqual(weights["language_model.weight"]?.asArray(Float.self), [1])
-            XCTAssertEqual(weights["vision_tower_extra.weight"]?.asArray(Float.self), [2])
-            XCTAssertEqual(metadata, ["format": "mlx"])
+            XCTAssertThrowsError(
+                try loadWeightArrays(urls: [url], excludingPrefixes: ["vision_tower."]))
         }
     }
 

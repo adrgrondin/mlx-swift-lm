@@ -103,13 +103,29 @@ print(try await session.respond(to: "How about a great place to eat?"))
 
 For alternative integration approaches (custom downloaders, alternative tokenizer packages, local-only weights), see the [using documentation](Libraries/MLXLMCommon/Documentation.docc/using.md).
 
+## Prism runtime compatibility
+
+This branch uses Prism's [`sync/upstream-0.32.2`](https://github.com/PrismML-Eng/mlx-swift/tree/sync/upstream-0.32.2)
+runtime to retain 1-bit Bonsai support while picking up the newer MLX Swift APIs and kernels.
+The model-level Gemma mobile packing, Bonsai checkpoint validation, and text-only vision
+exclusion remain in this package. The newer runtime's shared/fused Hadamard layers are not
+automatically substituted for our checkpoint-compatible layers.
+
+**Older-OS deployment blocker:** the reviewed Prism revision `4026556` does not include
+[upstream's 0.32.3 logger fix](https://github.com/ml-explore/mlx-swift/commit/19601207e9a0de51e03ee6ec0c3c5f3784275075).
+Without that fix, logging can crash on iOS/macOS versions before 26.4. Upstream
+`mlx-swift-lm` now requires 0.32.3 for this reason. A successful build on OS 27 does not
+establish compatibility with this package's older deployment targets; the Prism runtime
+must pick up the fix before shipping to those systems.
+
 ## Bonsai 2 (Prism Hadamard checkpoints)
 
 This branch registers `prism_hadamard_qwen35` in both model factories for
 [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit).
 Use `VLMModelFactory` for text and images, or `LLMModelFactory` for text-only inference.
 The text-only loader does not create a vision tower and skips its tensor data before loading
-weights into memory; checkpoint headers are still read and downloads are unchanged.
+weights into memory; checkpoint headers are still read and validated, and downloads are
+unchanged. Corrupt or truncated excluded tensors can therefore still fail loading.
 `VLMModelFactory` still loads both towers, even for text-only prompts.
 No Python runtime is imported or executed.
 
@@ -160,9 +176,11 @@ explicitly if you want it.
 Regression tests cover FP16/FP32 transform numerics at 512/1024/2048/4096 blocks, packed
 linear/embedding operations at the published 5120/17408 input widths, synthetic 1024-block
 checkpoint loading, text/image inference and cached continuation, and the published 27B
-tensor topology. Numerical references use independent dense Walsh matrices. These are
-Swift-side regressions, not cross-runtime or full-checkpoint quality comparisons, and do
-not measure peak memory or device performance. The published pack is about 8.6 GB, with
+tensor topology. Numerical references use independent dense Walsh matrices on CPU FP32,
+so GPU TF32 does not weaken the transform accuracy checks. A sparse-file regression checks
+that vision exclusion avoids materializing the excluded payload. These are Swift-side
+regressions, not cross-runtime or full-checkpoint quality comparisons, and do not measure
+full-model peak memory or device performance. The published pack is about 8.6 GB, with
 additional runtime memory needed for activations and caches.
 
 ## `FoundationModels` integration
