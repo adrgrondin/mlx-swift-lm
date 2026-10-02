@@ -105,18 +105,15 @@ For alternative integration approaches (custom downloaders, alternative tokenize
 
 ## Prism runtime compatibility
 
-This branch uses Prism's [`sync/upstream-0.32.2`](https://github.com/PrismML-Eng/mlx-swift/tree/sync/upstream-0.32.2)
+This branch uses Prism's [`sync/upstream-0.32.3`](https://github.com/PrismML-Eng/mlx-swift/tree/sync/upstream-0.32.3)
 runtime to retain 1-bit Bonsai support while picking up the newer MLX Swift APIs and kernels.
 The model-level Gemma mobile packing, Bonsai checkpoint validation, and text-only vision
 exclusion remain in this package. The newer runtime's shared/fused Hadamard layers are not
 automatically substituted for our checkpoint-compatible layers.
 
-**Older-OS deployment blocker:** the reviewed Prism revision `4026556` does not include
-[upstream's 0.32.3 logger fix](https://github.com/ml-explore/mlx-swift/commit/19601207e9a0de51e03ee6ec0c3c5f3784275075).
-Without that fix, logging can crash on iOS/macOS versions before 26.4. Upstream
-`mlx-swift-lm` now requires 0.32.3 for this reason. A successful build on OS 27 does not
-establish compatibility with this package's older deployment targets; the Prism runtime
-must pick up the fix before shipping to those systems.
+This runtime includes [upstream's 0.32.3 logger fix](https://github.com/ml-explore/mlx-swift/commit/19601207e9a0de51e03ee6ec0c3c5f3784275075),
+addressing the known logging crash on iOS/macOS versions before 26.4 while retaining Prism's
+low-bit kernels. Builds and tests on OS 27 do not replace runtime testing on older devices.
 
 ## Bonsai 2 (Prism Hadamard checkpoints)
 
