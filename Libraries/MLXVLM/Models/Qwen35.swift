@@ -334,11 +334,12 @@ public enum Qwen35Language {
         }
 
         func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
-            var x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
+            let x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
             if let gate {
-                x = x * silu(gate)
+                return (x.asType(.float32) * silu(gate.asType(.float32)))
+                    .asType(hiddenStates.dtype)
             }
-            return x
+            return x.asType(hiddenStates.dtype)
         }
     }
 
@@ -743,17 +744,7 @@ public enum Qwen35Language {
             let k = split[1].reshaped(B, S, numKHeads, headKDim)
             let v = split[2].reshaped(B, S, numVHeads, headVDim)
 
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            // rmsNorm adds eps to mean(x^2). The reference l2norm adds 1e-6 to
-            // sum(x^2), so divide the eps by the head dim.
-            let qkEps = 1e-6 / Float(headKDim)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: qkEps)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: qkEps)
+            let (qNormed, kNormed) = normalizeGatedDeltaQK(q: q, k: k)
 
             let out: MLXArray
             let newRecState: MLXArray
