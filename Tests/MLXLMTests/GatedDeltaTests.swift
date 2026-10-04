@@ -7,6 +7,31 @@ import XCTest
 
 public class GatedDeltaTests: XCTestCase {
 
+    func testQKNormalizationMatchesL2ReferenceForSmallInputs() {
+        for width in [64, 128, 192] {
+            for dtype in [DType.float32, .float16, .bfloat16] {
+                let values = (0 ..< width * 2).map { Float($0 % 17 - 8) * 0.0001 }
+                let q = MLXArray(values).reshaped(1, 2, 1, width).asType(dtype)
+                let k = q * MLXArray(0.5).asType(dtype)
+                let (normalizedQ, normalizedK) = normalizeGatedDeltaQK(q: q, k: k)
+                for (input, actual, scale) in [
+                    (q, normalizedQ, 1 / sqrt(Float(width))), (k, normalizedK, Float(1)),
+                ] {
+                    let x = input.asType(.float32)
+                    let expected = x / sqrt((x * x).sum(axis: -1, keepDims: true) + 1e-6) * scale
+                    XCTAssertEqual(actual.dtype, dtype)
+                    let tolerance: Float = dtype == .float32 ? 1e-6 : 0.002
+                    XCTAssertLessThan(
+                        abs(actual.asType(.float32) - expected).max().item(Float.self), tolerance)
+                }
+                let zeros = MLXArray.zeros(q.shape, dtype: dtype)
+                let (zeroQ, zeroK) = normalizeGatedDeltaQK(q: zeros, k: zeros)
+                XCTAssertEqual(abs(zeroQ).max().item(Float.self), 0)
+                XCTAssertEqual(abs(zeroK).max().item(Float.self), 0)
+            }
+        }
+    }
+
     private struct Inputs {
         let q, k, v, a, b, aLog, dtBias: MLXArray
     }

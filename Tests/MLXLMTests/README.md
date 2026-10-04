@@ -1,4 +1,6 @@
-The two includes resources are for testing the MediaProcessing pipeline for correctness and validation
+## Media resources
+
+The two movie resources test the MediaProcessing pipeline for correctness and validation.
 
 The video file was created via FFMPEG via
 
@@ -36,3 +38,29 @@ ffmpeg \
 -write_tmcd true \
 -y audio_only.mov
 ```
+
+## Bonsai 2 reference fixture
+
+`Resources/prism_hadamard_reference.json` records logits from Prism's Python model at
+`38f27dc24b535928246b64b211b66d38b7a3e17f`, using MLX 0.32.3 on Metal. It contains a tiny
+synthetic two-layer model, repeating tensor patterns, and expected outputs. No published
+model weights or tokenizer are needed. Swift tests consume the stored patterns and logits;
+they do not derive expected logits from another Swift model.
+
+Coverage includes schema-1 and schema-2 loading, both Swift language paths, tied and untied
+heads, block-0 and block-1024 projections, FP16 weights with FP32 signs/recurrent state,
+uncached prefill, cached decode, and multi-token continuation. Separate unit tests cover
+8192-element blocks, small-magnitude L2 normalization, gated-norm precision, and invalid
+metadata. The fixture is not a full 27B quality or performance benchmark.
+
+To regenerate, install `mlx==0.32.3` and the pinned Prism checkout in a temporary Python
+virtual environment, then run from the repository root:
+
+```sh
+python scripts/generate-prism-hadamard-reference.py \
+  --mlx-lm /path/to/pinned/prism-mlx-lm \
+  --output Tests/MLXLMTests/Resources/prism_hadamard_reference.json
+```
+
+The generator checks the reference revision and MLX version. Normal unit tests require
+neither Python nor network access.

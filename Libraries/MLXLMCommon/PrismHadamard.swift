@@ -58,7 +58,7 @@ package struct PrismHadamardConfiguration: Decodable {
 
     package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        schemaVersion = try c.decode(Int.self, forKey: .schemaVersion)
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 2
         let modelType = try c.decode(String.self, forKey: .modelType)
         let quantization = try c.decode(Quantization.self, forKey: .quantization)
         hasVision =
@@ -68,14 +68,13 @@ package struct PrismHadamardConfiguration: Decodable {
         else {
             throw PrismHadamardError.invalidCheckpoint("unsupported schema or quantization")
         }
-        if schemaVersion == 2 {
-            guard try c.decode(String.self, forKey: .baseModelType) == "qwen3_5",
-                try c.decode(String.self, forKey: .tensorNamespace) == "mlx-vlm-qwen3_5",
-                try c.decode(String.self, forKey: .gdnActivationLayout) == "grouped"
-            else {
-                throw PrismHadamardError.invalidCheckpoint(
-                    "unsupported base model or tensor layout")
-            }
+        let namespace = try c.decode(String.self, forKey: .tensorNamespace)
+        let layout = try c.decodeIfPresent(String.self, forKey: .gdnActivationLayout) ?? "grouped"
+        let baseModelType = try c.decodeIfPresent(String.self, forKey: .baseModelType)
+        guard namespace == (schemaVersion == 1 ? "mlx-lm-text" : "mlx-vlm-qwen3_5"),
+            layout == "grouped", baseModelType == nil || baseModelType == "qwen3_5"
+        else {
+            throw PrismHadamardError.invalidCheckpoint("unsupported base model or tensor layout")
         }
         modules = try c.decode([Record].self, forKey: .modules)
         var seen = Set<String>()
@@ -84,7 +83,7 @@ package struct PrismHadamardConfiguration: Decodable {
         }
         for record in modules {
             guard seen.insert(record.path).inserted,
-                record.dtype == "float16", [0, 512, 1024, 2048, 4096].contains(record.block)
+                record.dtype == "float16", [0, 512, 1024, 2048, 4096, 8192].contains(record.block)
             else {
                 throw PrismHadamardError.invalidCheckpoint(
                     "invalid or duplicate module \(record.path)")

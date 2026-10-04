@@ -29,7 +29,8 @@ final class PrismHadamardTests: XCTestCase {
         }
         let config: [String: Any] = [
             "schema_version": schema, "model_type": "prism_hadamard_qwen35",
-            "base_model_type": "qwen3_5", "tensor_namespace": "mlx-vlm-qwen3_5",
+            "base_model_type": "qwen3_5",
+            "tensor_namespace": schema == 1 ? "mlx-lm-text" : "mlx-vlm-qwen3_5",
             "gdn_activation_layout": "grouped",
             "components": ["text": true, "vision": schema == 2],
             "quantization": ["bits": 2, "group_size": 128, "mode": "affine"],
@@ -117,23 +118,36 @@ final class PrismHadamardTests: XCTestCase {
         MLXArray((0 ..< width).map { Float(($0 / 3) % 2 == 0 ? 1 : -1) })
     }
 
-    // Independent dense Walsh matrix, not a call to the transform under test.
+    // Independent scalar butterfly, not a call to MLX's transform.
     private func referenceTransform(
         _ x: MLXArray, block: Int = 512, signs: MLXArray, inverse: Bool = false
     ) -> MLXArray {
+        guard block != 0 else { return x }
         let scale = 1 / sqrt(Float(block))
-        let h = MLXArray(
-            (0 ..< block * block).map { index -> Float in
-                let parity = ((index / block) & (index % block)).nonzeroBitCount % 2
-                return (parity == 0 ? 1 : -1) * scale
+        let signs = signs.asArray(Float.self)
+        var values = x.asType(.float32).asArray(Float.self)
+        if !inverse {
+            for i in values.indices { values[i] *= signs[i % signs.count] }
+        }
+        for start in stride(from: 0, to: values.count, by: block) {
+            var step = 1
+            while step < block {
+                for group in stride(from: start, to: start + block, by: step * 2) {
+                    for i in group ..< group + step {
+                        let a = values[i]
+                        let b = values[i + step]
+                        values[i] = a + b
+                        values[i + step] = a - b
+                    }
+                }
+                step *= 2
             }
-        ).reshaped(block, block)
-        var result = x.asType(.float32)
-        if !inverse { result = result * signs }
-        // Keep the reference in IEEE FP32 even when GPU matmuls use TF32.
-        result = matmul(result.reshaped(-1, block), h, stream: .cpu).reshaped(x.shape)
-        if inverse { result = result * signs }
-        return result.asType(x.dtype)
+        }
+        for i in values.indices {
+            values[i] *= scale
+            if inverse { values[i] *= signs[i % signs.count] }
+        }
+        return MLXArray(values).reshaped(x.shape).asType(x.dtype)
     }
 
     private func assertClose(
@@ -147,7 +161,7 @@ final class PrismHadamardTests: XCTestCase {
     }
 
     func testForwardAndInverseTransformsMatchIndependentReference() {
-        for block in [512, 1024, 2048, 4096] {
+        for block in [512, 1024, 2048, 4096, 8192] {
             let width = block * 2
             let signs = signs(width: width)
             for dtype in [DType.float16, .float32] {
@@ -176,14 +190,15 @@ final class PrismHadamardTests: XCTestCase {
 
     func testPackedLinearAndEmbeddingPreserveTransformsAndCheckpointKeys() throws {
         // Include the published hidden and MLP widths, not only a single transform block.
-        for (block, width) in [(512, 512), (1024, 5120), (1024, 17408)] {
+        for (block, width) in [(0, 512), (512, 512), (1024, 5120), (1024, 17408), (8192, 16384)] {
             let dense = (sin(MLXArray(0 ..< 4 * width).asType(.float32) * 0.03) * 0.05)
                 .reshaped(4, width).asType(.float16)
             let (weight, scales, biases) = quantized(dense, groupSize: 128, bits: 2)
             let signs = signs(width: width)
-            let arrays = [
-                "weight": weight, "scales": scales, "biases": try XCTUnwrap(biases), "signs": signs,
+            var arrays = [
+                "weight": weight, "scales": scales, "biases": try XCTUnwrap(biases),
             ]
+            if block != 0 { arrays["signs"] = signs }
             let linear = PrismHadamardLinear(rows: 4, width: width, block: block)
             let embedding = PrismHadamardEmbedding(rows: 4, width: width, block: block)
             try linear.update(parameters: ModuleParameters.unflattened(arrays), verify: [.all])
@@ -376,6 +391,72 @@ final class PrismHadamardTests: XCTestCase {
         let model = try MLXLLM.PrismHadamardQwen35(configuration: data)
         try withCheckpoint(textWeights) { try loadWeights(modelDirectory: $0, model: model) }
         XCTAssertThrowsError(try MLXVLM.PrismHadamardQwen35(configuration: data))
+    }
+
+    func testSchemaMetadataMatchesPrismDefaultsAndNamespaces() throws {
+        for schema in [1, 2] {
+            let data = try configuration(schema: schema)
+            let original = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            var minimal = original
+            minimal.removeValue(forKey: "base_model_type")
+            minimal.removeValue(forKey: "gdn_activation_layout")
+            if schema == 2 { minimal.removeValue(forKey: "schema_version") }
+            XCTAssertNoThrow(
+                try MLXLLM.PrismHadamardQwen35(
+                    configuration: JSONSerialization.data(withJSONObject: minimal)))
+            for (key, value) in [
+                ("tensor_namespace", schema == 1 ? "mlx-vlm-qwen3_5" : "mlx-lm-text"),
+                ("gdn_activation_layout", "interleaved"), ("base_model_type", "qwen3_next"),
+            ] {
+                var invalid = original
+                invalid[key] = value
+                XCTAssertThrowsError(
+                    try MLXLLM.PrismHadamardQwen35(
+                        configuration: JSONSerialization.data(withJSONObject: invalid)))
+            }
+            var missingNamespace = original
+            missingNamespace.removeValue(forKey: "tensor_namespace")
+            XCTAssertThrowsError(
+                try MLXLLM.PrismHadamardQwen35(
+                    configuration: JSONSerialization.data(withJSONObject: missingNamespace)))
+        }
+    }
+
+    func testAllSupportedBlocksInstallWithoutUnpackingWeights() throws {
+        for block in [0, 512, 1024, 2048, 4096, 8192] {
+            let width = max(512, block)
+            var config = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: configuration(block: width)) as? [String: Any])
+            var records = try XCTUnwrap(config["modules"] as? [[String: Any]])
+            for i in records.indices { records[i]["block"] = block }
+            config["modules"] = records
+            let model = try MLXLLM.PrismHadamardQwen35(
+                configuration: JSONSerialization.data(withJSONObject: config))
+            let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+            XCTAssertEqual(
+                parameters["language_model.model.embed_tokens.weight"]?.shape, [16, width / 16])
+            XCTAssertEqual(parameters["language_model.model.embed_tokens.signs"] == nil, block == 0)
+        }
+    }
+
+    func testVLMGatedNormPreservesFP32GateArithmetic() throws {
+        for dtype in [DType.float16, .bfloat16, .float32] {
+            let x = sin(MLXArray(0 ..< 512).asType(.float32)).reshaped(4, 128).asType(dtype)
+            let gate = (cos(MLXArray(0 ..< 512).asType(.float32)) * 4).reshaped(4, 128).asType(
+                dtype)
+            let norm = MLXVLM.Qwen35Language.RMSNormGated(dimensions: 128)
+            try norm.update(
+                parameters: ModuleParameters.unflattened([
+                    "weight": MLXArray.ones([128], dtype: dtype)
+                ]), verify: [.all])
+            let normalized = MLXFast.rmsNorm(x, weight: norm.weight, eps: norm.eps).asType(.float32)
+            let gate32 = gate.asType(.float32)
+            let expected = (normalized * (gate32 * sigmoid(gate32))).asType(dtype)
+            let actual = norm(x, gate: gate)
+            XCTAssertEqual(actual.dtype, dtype)
+            assertClose(actual, expected, tolerance: 0.00001)
+            assertClose(norm(x), normalized.asType(dtype), tolerance: 0)
+        }
     }
 
     func testMalformedMetadataFailsBeforeInference() throws {
