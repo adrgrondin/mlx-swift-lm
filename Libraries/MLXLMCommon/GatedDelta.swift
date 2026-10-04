@@ -9,6 +9,21 @@ import Foundation
 import MLX
 import MLXNN
 
+// MARK: - Q/K Normalization
+
+/// L2-normalize Q/K and fold the head-dimension readout scale into Q.
+package func normalizeGatedDeltaQK(q: MLXArray, k: MLXArray) -> (MLXArray, MLXArray) {
+    let invScale = pow(Float(q.dim(-1)), -0.5)
+    // RMSNorm adds epsilon to the mean square, not the sum of squares.
+    let rmsEpsilon: Float = 1e-6 / Float(q.dim(-1))
+    return (
+        MLXArray(invScale * invScale).asType(q.dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: rmsEpsilon),
+        MLXArray(invScale).asType(k.dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: rmsEpsilon)
+    )
+}
+
 // MARK: - Compute G
 
 /// Fused form of the decay gate chain — elementwise, and MLX `compile`

@@ -397,14 +397,7 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let (qNormed, kNormed) = normalizeGatedDeltaQK(q: q, k: k)
 
         let out: MLXArray
         let newRecState: MLXArray

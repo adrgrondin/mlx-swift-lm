@@ -320,11 +320,12 @@ public enum Qwen35Language {
         }
 
         func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
-            var x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
+            let x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
             if let gate {
-                x = x * silu(gate)
+                return (x.asType(.float32) * silu(gate.asType(.float32)))
+                    .asType(hiddenStates.dtype)
             }
-            return x
+            return x.asType(hiddenStates.dtype)
         }
     }
 
@@ -630,14 +631,7 @@ public enum Qwen35Language {
             let v = split[2].reshaped(B, S, numVHeads, headVDim)
 
             var state = cache?[1]
-            let dtype = q.dtype
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            let (qNormed, kNormed) = normalizeGatedDeltaQK(q: q, k: k)
 
             let out: MLXArray
             if let split = checkpointAfter, split > 0, split < S {

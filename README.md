@@ -137,9 +137,18 @@ these transformed layers.
 Keep the original `config.json`, `model.safetensors`, tokenizer/chat-template files, and
 `preprocessor_config.json` for vision. The layer manifest comes from `config.json`; sign
 vectors are loaded from the safetensors parameters, not `hadamard.json`. Do not rename the
-model type to `qwen3_5`: that would omit required transforms. Schema-1 text packs and
-schema-2 `mlx-vlm-qwen3_5` packs with grouped GDN layout are supported; invalid metadata,
-packed shapes, or sign vectors fail loading rather than falling back to ordinary Qwen.
+model type to `qwen3_5`: that would omit required transforms. Schema-1 `mlx-lm-text` packs and
+schema-2 `mlx-vlm-qwen3_5` packs with grouped GDN layout are supported. Supported transform
+blocks are 512, 1024, 2048, 4096, and 8192; block 0 disables rotation. An omitted schema defaults
+to 2 and an omitted GDN layout defaults to grouped, matching Prism's loader. `base_model_type`
+is optional, but must be `qwen3_5` when present. Invalid metadata, packed shapes, or sign vectors
+fail loading rather than falling back to ordinary Qwen.
+
+The Qwen3.5 language paths include Prism's current L2-normalization epsilon correction and
+FP32 gated-norm arithmetic. Small mixed-precision prefill/decode fixtures from
+[`PrismML-Eng/mlx-lm` at `38f27dc`](https://github.com/PrismML-Eng/mlx-lm/tree/38f27dc24b535928246b64b211b66d38b7a3e17f)
+check both language implementations, both schemas, and tied/untied heads without downloading the 27B
+weights. See [test fixture regeneration](Tests/MLXLMTests/README.md#bonsai-2-reference-fixture).
 
 ### Generation settings
 
