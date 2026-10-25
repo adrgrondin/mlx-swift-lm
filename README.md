@@ -128,7 +128,8 @@ then uses the converted tensors. Parameter updates through `Module.update(parame
 restore checkpoint-shaped mobile tensors when needed and invalidate converted weights
 and cached decoder arguments; module replacements also invalidate the decoder arguments.
 As with other model updates, callers must hold exclusive access while changing weights
-or modules. Aligned synthetic regressions cover these paths without a downloaded model.
+or modules. Shared Gemma QMV kernel caches synchronize first-use specialization lookup.
+Aligned synthetic regressions cover these paths without a downloaded model.
 
 ## Bonsai 2 (Prism Hadamard checkpoints)
 
