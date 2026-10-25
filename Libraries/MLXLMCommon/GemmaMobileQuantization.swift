@@ -870,7 +870,7 @@ public final class GemmaQuantizedLinear: Linear {
     private var _conversionDone = false
     private var _needsInputSRQ = true
     private var _needsOutputSRQ = true
-    private var _freedMobileShapes: (weight: [Int], scale: [Int], scaleType: DType)?
+    private var _mobileWeightsReleased = false
     private var _parameterVersion = 0
 
     package var parameterVersion: Int { _parameterVersion }
@@ -888,30 +888,17 @@ public final class GemmaQuantizedLinear: Linear {
             return try super.update(
                 parameters: parameters, verify: verify, path: path, modulePath: modulePath)
         }
-        restoreMobileWeights()
         defer {
             // Updates may throw after changing an earlier parameter.
             _mlxWeight = nil
             _mlxScales = nil
             _mlxBiases = nil
             _conversionDone = false
+            _mobileWeightsReleased = false
             _parameterVersion &+= 1
         }
         return try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-    }
-
-    private func restoreMobileWeights() {
-        guard let shapes = _freedMobileShapes,
-            let packed = _mlxWeight, let scales = _mlxScales
-        else { return }
-        let bytes = packed.view(dtype: .uint8).reshaped(shapes.weight)
-        let mobile = numBits == 8 ? (bytes.asType(.int32) - 128).asType(.int8) : bytes
-        let column = scales[0..., 0 ..< 1]
-        let scale = shapes.scale.reduce(1, *) == 1 ? column.flattened()[0 ..< 1] : column
-        weight._updateInternal(mobile)
-        weightScale._updateInternal(scale.reshaped(shapes.scale).asType(shapes.scaleType))
-        _freedMobileShapes = nil
     }
 
     public init(inputDims: Int, outputDims: Int, numBits: Int, bias: Bool = false) {
@@ -991,32 +978,29 @@ public final class GemmaQuantizedLinear: Linear {
 
     /// Free the mobile-format weights after native conversion.
     ///
-    /// Replaces the packed mobile `weight` and per-channel `weightScale` with
-    /// tiny dummy arrays to recover memory (the native compiled path uses the
-    /// converted `_mlxWeight`/`_mlxScales`/`_mlxBiases`, not the mobile weights).
-    /// The SRQ scales (`inputActivationScale`, `outputActivationScale`) are
-    /// preserved because the native path still reads them.
+    /// Int2/4 parameters become byte views of the native storage. Int8 parameters
+    /// become a lazy reconstruction, evaluated only when a caller needs the mobile
+    /// values. Per-channel and SRQ scales stay intact, so parameter mapping and
+    /// dtype conversion never see placeholders. Evaluating the int8 parameter again
+    /// materializes its mobile buffer.
     ///
-    /// Parameter updates restore the mobile representation from the native tensors
-    /// before validation, then invalidate the conversion. Eager calls use native
-    /// matmul while the mobile buffers are freed.
+    /// Eager calls use native matmul while mobile storage is released. Parameter
+    /// updates invalidate the conversion and resume ordinary mobile execution.
     ///
     /// No-op if native conversion has not succeeded (`nativeArgs()` returned
-    /// `nil`), so the eager / qmv fallback path keeps its mobile weights. Mirrors
-    /// Python `_free_mobile_weights` (the per-module part).
+    /// `nil`), so the eager / qmv fallback path keeps its mobile weights.
     public func freeMobileWeights() {
-        guard _conversionDone, _mlxWeight != nil, _freedMobileShapes == nil else { return }
-        _freedMobileShapes = (weight.shape, weightScale.shape, weightScale.dtype)
-        let wDtype = weight.dtype
-        let sDtype = weightScale.dtype
-        weight._updateInternal(MLXArray.zeros([1], dtype: wDtype))
-        weightScale._updateInternal(MLXArray.zeros([1], dtype: sDtype))
+        guard _conversionDone, let packed = _mlxWeight, !_mobileWeightsReleased else { return }
+        let bytes = packed.view(dtype: .uint8).reshaped(weight.shape)
+        let mobile = numBits == 8 ? (bytes.asType(.int32) - 128).asType(.int8) : bytes
+        weight._updateInternal(mobile)
+        _mobileWeightsReleased = true
     }
 
     /// Whether the fused qmv kernel can be used for this layer and batch size.
     /// Requires batch ≤ 16 and aligned input dims (÷512 for int2/int4, ÷16 for int8).
     public func canUseQMV(batchSize: Int) -> Bool {
-        guard _freedMobileShapes == nil, batchSize <= 16 else { return false }
+        guard !_mobileWeightsReleased, batchSize <= 16 else { return false }
         if numBits == 8 { return inputDims % 16 == 0 }
         return inputDims % 512 == 0  // int2, int4
     }

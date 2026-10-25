@@ -341,6 +341,14 @@ struct Gemma4MobileQuantizationTests {
                 ]), verify: [.noUnusedKeys, .shapeMismatch])
         }
         expectOutput(-2.1)
+
+        if freeWeights { linear.freeMobileWeights() }
+        let container = Sequential { linear }
+        container.apply { array in
+            array.dtype.isFloatingPoint ? array.asType(.float16) : array
+        }
+        #expect(linear.weightScale.dtype == .float16)
+        expectOutput(-7 * Float(Float16(0.3)))
     }
 
     // MARK: - Per-layer bit resolution

@@ -124,9 +124,13 @@ projection segments. Affine, TurboQuant, and variance-normalized caches retain t
 cache-specific attention routes, including layers that share KV with an earlier layer.
 
 Load-time precompilation can release the original mobile weight buffers. Eager fallback
-then uses the converted tensors. Parameter updates through `Module.update(parameters:)`
-restore checkpoint-shaped mobile tensors when needed and invalidate converted weights
-and cached decoder arguments; module replacements also invalidate the decoder arguments.
+then uses the converted tensors. Registered parameters remain valid: int2/4 weights are
+native-backed byte views, int8 weights are lazy reconstructions, and scales stay intact.
+Parameter mapping and dtype conversion through `Module.apply` therefore see real values,
+not placeholders. Explicitly evaluating an int8 weight materializes its mobile buffer again.
+
+Parameter updates invalidate converted weights and cached decoder arguments; module
+replacements also invalidate the decoder arguments.
 As with other model updates, callers must hold exclusive access while changing weights
 or modules. Shared Gemma QMV kernel caches synchronize first-use specialization lookup.
 Aligned synthetic regressions cover these paths without a downloaded model.
