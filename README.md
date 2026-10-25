@@ -117,6 +117,19 @@ This runtime includes [upstream's 0.32.3 logger fix](https://github.com/ml-explo
 addressing the known logging crash on iOS/macOS versions before 26.4 while retaining Prism's
 low-bit kernels. Builds and tests on OS 27 do not replace runtime testing on older devices.
 
+## Gemma 4 mobile inference
+
+The mobile-QAT text decoder keeps cache updates and attention outside its compiled
+projection segments. Affine, TurboQuant, and variance-normalized caches retain their
+cache-specific attention routes, including layers that share KV with an earlier layer.
+
+Load-time precompilation can release the original mobile weight buffers. Eager fallback
+then uses the converted tensors. Parameter updates through `Module.update(parameters:)`
+restore checkpoint-shaped mobile tensors when needed and invalidate converted weights
+and cached decoder arguments; module replacements also invalidate the decoder arguments.
+As with other model updates, callers must hold exclusive access while changing weights
+or modules. Aligned synthetic regressions cover these paths without a downloaded model.
+
 ## Bonsai 2 (Prism Hadamard checkpoints)
 
 This branch registers `prism_hadamard_qwen35` in both model factories for

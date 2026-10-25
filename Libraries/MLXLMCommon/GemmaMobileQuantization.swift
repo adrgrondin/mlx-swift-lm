@@ -659,7 +659,7 @@ public func gemmaBuildPerRowOutputScale(
     let parts = [q, k, v].map { projection in
         broadcast(
             projection.outputActivationScale.asType(dtype),
-            to: [projection.weight.shape[0]])
+            to: [projection.shape.0])
     }
     return concatenated(parts, axis: 0)
 }
@@ -862,6 +862,49 @@ public final class GemmaQuantizedLinear: Linear {
     private var _conversionDone = false
     private var _needsInputSRQ = true
     private var _needsOutputSRQ = true
+    private var _freedMobileShapes: (weight: [Int], scale: [Int], scaleType: DType)?
+    private var _parameterVersion = 0
+
+    package var parameterVersion: Int { _parameterVersion }
+
+    public override var shape: (Int, Int) {
+        (_mlxWeight?.dim(0) ?? weight.dim(0), inputDims)
+    }
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        guard !parameters.isEmpty else {
+            return try super.update(
+                parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        }
+        restoreMobileWeights()
+        defer {
+            // Updates may throw after changing an earlier parameter.
+            _mlxWeight = nil
+            _mlxScales = nil
+            _mlxBiases = nil
+            _conversionDone = false
+            _parameterVersion &+= 1
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    private func restoreMobileWeights() {
+        guard let shapes = _freedMobileShapes,
+            let packed = _mlxWeight, let scales = _mlxScales
+        else { return }
+        let bytes = packed.view(dtype: .uint8).reshaped(shapes.weight)
+        let mobile = numBits == 8 ? (bytes.asType(.int32) - 128).asType(.int8) : bytes
+        let column = scales[0..., 0 ..< 1]
+        let scale = shapes.scale.reduce(1, *) == 1 ? column.flattened()[0 ..< 1] : column
+        weight._updateInternal(mobile)
+        weightScale._updateInternal(scale.reshaped(shapes.scale).asType(shapes.scaleType))
+        _freedMobileShapes = nil
+    }
 
     public init(inputDims: Int, outputDims: Int, numBits: Int, bias: Bool = false) {
         let packedIn: Int
@@ -946,11 +989,16 @@ public final class GemmaQuantizedLinear: Linear {
     /// The SRQ scales (`inputActivationScale`, `outputActivationScale`) are
     /// preserved because the native path still reads them.
     ///
+    /// Parameter updates restore the mobile representation from the native tensors
+    /// before validation, then invalidate the conversion. Eager calls use native
+    /// matmul while the mobile buffers are freed.
+    ///
     /// No-op if native conversion has not succeeded (`nativeArgs()` returned
     /// `nil`), so the eager / qmv fallback path keeps its mobile weights. Mirrors
     /// Python `_free_mobile_weights` (the per-module part).
     public func freeMobileWeights() {
-        guard _conversionDone, _mlxWeight != nil else { return }
+        guard _conversionDone, _mlxWeight != nil, _freedMobileShapes == nil else { return }
+        _freedMobileShapes = (weight.shape, weightScale.shape, weightScale.dtype)
         let wDtype = weight.dtype
         let sDtype = weightScale.dtype
         weight._updateInternal(MLXArray.zeros([1], dtype: wDtype))
@@ -960,7 +1008,7 @@ public final class GemmaQuantizedLinear: Linear {
     /// Whether the fused qmv kernel can be used for this layer and batch size.
     /// Requires batch ≤ 16 and aligned input dims (÷512 for int2/int4, ÷16 for int8).
     public func canUseQMV(batchSize: Int) -> Bool {
-        guard batchSize <= 16 else { return false }
+        guard _freedMobileShapes == nil, batchSize <= 16 else { return false }
         if numBits == 8 { return inputDims % 16 == 0 }
         return inputDims % 512 == 0  // int2, int4
     }

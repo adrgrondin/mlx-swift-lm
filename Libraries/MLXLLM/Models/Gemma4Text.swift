@@ -658,6 +658,13 @@ private class Gemma4Attention: Module {
         super.init()
     }
 
+    fileprivate func invalidateNativeProjection() {
+        _fusedQKVNative = nil
+        _fusedQKVNativeReady = false
+        _fusedQKVReady = false
+        _fusedQKVDisabled = false
+    }
+
     /// Precomputed RoPE frequencies for the native compiled path.
     var compiledRopeFreqs: MLXArray { _compiledRopeFreqs }
 
@@ -705,7 +712,7 @@ private class Gemma4Attention: Module {
     ) -> MLXArray? {
         if _fusedQKVDisabled { return nil }
         let batchSize = x.shape.dropLast().reduce(1, *)
-        guard q.canUseQMV(batchSize: batchSize) else { return nil }
+        guard [q, k, v].allSatisfy({ $0.canUseQMV(batchSize: batchSize) }) else { return nil }
         guard q.numBits == k.numBits && q.numBits == v.numBits else { return nil }
         guard q.inputDims == k.inputDims && q.inputDims == v.inputDims else { return nil }
 
@@ -788,22 +795,7 @@ private class Gemma4Attention: Module {
             }
             v = v.transposed(0, 2, 1, 3)
 
-            if let quantizedCache = cache as? QuantizedKVCacheProtocol {
-                let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
-                    keys: k, values: v)
-                kvState = .quantized(
-                    keys: quantizedKeys,
-                    values: quantizedValues,
-                    groupSize: quantizedCache.groupSize,
-                    bits: quantizedCache.bits,
-                    mode: quantizedCache.mode
-                )
-            } else if let cache {
-                let (updatedK, updatedV) = cache.update(keys: k, values: v)
-                kvState = .regular(keys: updatedK, values: updatedV)
-            } else {
-                kvState = .regular(keys: k, values: v)
-            }
+            kvState = .update(keys: k, values: v, cache: cache)
         }
 
         queries = queries.transposed(0, 2, 1, 3)
@@ -818,28 +810,8 @@ private class Gemma4Attention: Module {
             }
         }
 
-        let attentionOutput: MLXArray =
-            switch kvState {
-            case .regular(let keys, let values):
-                MLXFast.scaledDotProductAttention(
-                    queries: queries,
-                    keys: keys,
-                    values: values,
-                    scale: scale,
-                    mask: adjustedMask ?? .none
-                )
-            case .quantized(let keys, let values, let groupSize, let bits, let mode):
-                quantizedScaledDotProductAttention(
-                    queries: queries,
-                    quantizedKeys: keys,
-                    quantizedValues: values,
-                    scale: scale,
-                    mask: adjustedMask ?? .none,
-                    groupSize: groupSize,
-                    bits: bits,
-                    mode: mode
-                )
-            }
+        let attentionOutput = kvState.attend(
+            queries: queries, scale: scale, mask: adjustedMask ?? .none)
 
         let output =
             attentionOutput
@@ -1002,6 +974,11 @@ private class Gemma4TextExperts: Module {
         let postFn: @Sendable ([MLXArray]) -> [MLXArray]
         let postArgs: [MLXArray]
         let precompileSignature: Gemma4NativePrecompile.LayerSignature
+        let sources: [(linear: GemmaQuantizedLinear, version: Int)]
+
+        var isCurrent: Bool {
+            sources.allSatisfy { $0.linear.parameterVersion == $0.version }
+        }
     }
     private var _nativeArgs: NativeArgs?
     private var _nativeArgsChecked = false
@@ -1058,6 +1035,20 @@ private class Gemma4TextExperts: Module {
         super.init()
     }
 
+    @discardableResult
+    public override func update(
+        modules: ModuleChildren, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer {
+            _nativeArgs = nil
+            _nativeArgsChecked = false
+            selfAttn.invalidateNativeProjection()
+        }
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
+
     /// Lazily extract and cache native compiled-path arguments. Returns `nil` if
     /// the native path is not usable (MoE, non-gemma-quantized, unaligned dims,
     /// or no PLE). Mirrors Python `DecoderLayer._get_native_args`.
@@ -1066,8 +1057,10 @@ private class Gemma4TextExperts: Module {
     /// trigger conversion + read the cached args for the load-time direct-compile
     /// path (Phase 5).
     fileprivate func getNativeArgs() -> NativeArgs? {
-        if _nativeArgsChecked { return _nativeArgs }
+        if _nativeArgsChecked, _nativeArgs?.isCurrent != false { return _nativeArgs }
+        _nativeArgs = nil
         _nativeArgsChecked = true
+        selfAttn.invalidateNativeProjection()
 
         // Guard: no MoE, PLE present.
         guard !enableMoE,
@@ -1162,10 +1155,15 @@ private class Gemma4TextExperts: Module {
                 mlpBits: mlpBits,
                 pleBits: pleBits,
                 attentionOutputDimension: attn.nHeads * attn.effectiveHeadDim))
+        let sources = [
+            attn.qProj, attn.kProj, attn.vProj, attn.oProj,
+            mlp.gateProj, mlp.upProj, mlp.downProj, pleGate, pleProj,
+        ].compactMap { $0 as? GemmaQuantizedLinear }
         let result = NativeArgs(
             isSource: isSource, preFn: preFn, preArgs: preArgs,
             postFn: postFn, postArgs: postArgs,
-            precompileSignature: precompileSignature)
+            precompileSignature: precompileSignature,
+            sources: sources.map { ($0, $0.parameterVersion) })
         _nativeArgs = result
         return result
     }
@@ -1240,71 +1238,32 @@ private class Gemma4TextExperts: Module {
             let offset = ropeOffsetToArray(ropeOffset)
 
             let (B, L) = (x.dim(0), x.dim(1))
-            let attnOutput: MLXArray
+            let queries: MLXArray
             let kvState: Gemma4SharedKVState
 
             if isSource {
                 let preOut = preFn([x] + preArgs + [offset])
-                let queries = preOut[0]
-                let keys = preOut[1]
-                let values = preOut[2]
-
-                // KV cache update (eager — outside the compiled graph).
-                let updatedK: MLXArray
-                let updatedV: MLXArray
-                if let cache = cache {
-                    let (k, v) = cache.update(keys: keys, values: values)
-                    updatedK = k
-                    updatedV = v
-                } else {
-                    updatedK = keys
-                    updatedV = values
-                }
-                kvState = .regular(keys: updatedK, values: updatedV)
-
-                // Adjust mask if cache size differs from mask size.
-                var adjustedMask = mask
-                if case .array(let maskArray) = mask {
-                    let keysSeqLen = updatedK.dim(2)
-                    if maskArray.dim(-1) != keysSeqLen {
-                        adjustedMask = .array(maskArray[.ellipsis, 0 ..< keysSeqLen])
-                    }
-                }
-
-                let attnOut = MLXFast.scaledDotProductAttention(
-                    queries: queries,
-                    keys: updatedK,
-                    values: updatedV,
-                    scale: attn.scale,
-                    mask: adjustedMask ?? .none
-                )
-                attnOutput = attnOut.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                queries = preOut[0]
+                kvState = .update(keys: preOut[1], values: preOut[2], cache: cache)
             } else {
-                let queries = preFn([x] + preArgs + [offset])[0]
-
-                // Use shared KV from the source layer.
                 guard let sharedKV else {
-                    // KV-shared layer without shared KV — shouldn't happen in normal
-                    // generation, but handle gracefully by falling back.
                     return eagerCall(
                         x, mask: mask, cache: cache, perLayerInput: perLayerInput,
                         sharedKV: sharedKV, positionOffset: positionOffset)
                 }
-
-                switch sharedKV {
-                case .regular(let keys, let values):
-                    let attnOut = MLXFast.scaledDotProductAttention(
-                        queries: queries, keys: keys, values: values,
-                        scale: attn.scale, mask: mask ?? .none)
-                    attnOutput = attnOut.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-                    kvState = sharedKV
-                case .quantized:
-                    // Quantized shared KV — fall back to eager for now.
-                    return eagerCall(
-                        x, mask: mask, cache: cache, perLayerInput: perLayerInput,
-                        sharedKV: sharedKV, positionOffset: positionOffset)
-                }
+                queries = preFn([x] + preArgs + [offset])[0]
+                kvState = sharedKV
             }
+
+            var adjustedMask = mask
+            if case .array(let maskArray) = mask,
+                maskArray.dim(-1) != kvState.sequenceLength
+            {
+                adjustedMask = .array(maskArray[.ellipsis, 0 ..< kvState.sequenceLength])
+            }
+            let attnOutput = kvState.attend(
+                queries: queries, scale: attn.scale, mask: adjustedMask ?? .none
+            ).transposed(0, 2, 1, 3).reshaped(B, L, -1)
 
             // Post-attention compiled segment (o_proj + norms + MLP + PLE + layer_scalar).
             let h = postFn([residual, attnOutput, perLayerInput] + postArgs)[0]
@@ -1677,12 +1636,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Set to `false` to skip load-time precompilation + weight freeing (the
     /// `NativePrecompilable` hook in `loadWeights`). Defaults to `true`.
     ///
-    /// The A/B equivalence test sets this to `false` so the eager path (which
-    /// needs the mobile-format weights) still works after `loadWeights` — once
-    /// weights are freed the eager path can no longer dequantize them. In
-    /// production this stays `true` so load converts to the native `quantizedMM`
-    /// format, frees the mobile weights, and warms up the per-shape `compile`
-    /// graphs.
+    /// Disabling this keeps the mobile buffers for QMV/native A/B comparisons.
+    /// With precompilation enabled, eager fallback uses the converted native
+    /// tensors instead of reading the freed mobile buffers.
     nonisolated(unsafe) public static var precompileAtLoad = true
 
     fileprivate let config: Gemma4TextConfiguration
