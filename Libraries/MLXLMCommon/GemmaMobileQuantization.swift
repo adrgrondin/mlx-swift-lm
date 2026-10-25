@@ -620,18 +620,22 @@ private func gemmaQMVSource(numBits: Int) -> String {
 /// Cache of compiled qmv kernels keyed by bit width. Metal kernel compilation
 /// is expensive, so each specialization is compiled once and reused.
 private enum GemmaQMVKernelCache {
-    nonisolated(unsafe) static var cache: [Int: MLXFast.MLXFastKernel] = [:]
+    private static let lock = NSLock()
+    // All access is guarded by lock.
+    nonisolated(unsafe) private static var cache: [Int: MLXFast.MLXFastKernel] = [:]
 
     static func kernel(numBits: Int) -> MLXFast.MLXFastKernel {
-        if let cached = cache[numBits] { return cached }
-        let kernel = MLXFast.metalKernel(
-            name: "gemma_mobile_qmv_b\(numBits)",
-            inputNames: ["x", "weight", "weight_scale", "input_scale", "output_scale"],
-            outputNames: ["out"],
-            source: gemmaQMVSource(numBits: numBits),
-            header: "#include <metal_simdgroup>\nusing namespace metal;")
-        cache[numBits] = kernel
-        return kernel
+        lock.withLock {
+            if let cached = cache[numBits] { return cached }
+            let kernel = MLXFast.metalKernel(
+                name: "gemma_mobile_qmv_b\(numBits)",
+                inputNames: ["x", "weight", "weight_scale", "input_scale", "output_scale"],
+                outputNames: ["out"],
+                source: gemmaQMVSource(numBits: numBits),
+                header: "#include <metal_simdgroup>\nusing namespace metal;")
+            cache[numBits] = kernel
+            return kernel
+        }
     }
 }
 
@@ -775,22 +779,26 @@ private func gemmaFusedQKVSource(numBits: Int) -> String {
 }
 
 private enum GemmaFusedQKVKernelCache {
-    nonisolated(unsafe) static var cache: [Int: MLXFast.MLXFastKernel] = [:]
+    private static let lock = NSLock()
+    // All access is guarded by lock.
+    nonisolated(unsafe) private static var cache: [Int: MLXFast.MLXFastKernel] = [:]
 
     static func kernel(numBits: Int) -> MLXFast.MLXFastKernel {
-        if let cached = cache[numBits] { return cached }
-        let kernel = MLXFast.metalKernel(
-            name: "gemma_mobile_qkv_split_b\(numBits)",
-            inputNames: [
-                "x", "q_weight", "k_weight", "v_weight",
-                "q_weight_scale", "k_weight_scale", "v_weight_scale",
-                "input_scale", "q_output_scale", "k_output_scale", "v_output_scale",
-            ],
-            outputNames: ["out"],
-            source: gemmaFusedQKVSource(numBits: numBits),
-            header: "#include <metal_simdgroup>\nusing namespace metal;")
-        cache[numBits] = kernel
-        return kernel
+        lock.withLock {
+            if let cached = cache[numBits] { return cached }
+            let kernel = MLXFast.metalKernel(
+                name: "gemma_mobile_qkv_split_b\(numBits)",
+                inputNames: [
+                    "x", "q_weight", "k_weight", "v_weight",
+                    "q_weight_scale", "k_weight_scale", "v_weight_scale",
+                    "input_scale", "q_output_scale", "k_output_scale", "v_output_scale",
+                ],
+                outputNames: ["out"],
+                source: gemmaFusedQKVSource(numBits: numBits),
+                header: "#include <metal_simdgroup>\nusing namespace metal;")
+            cache[numBits] = kernel
+            return kernel
+        }
     }
 }
 
