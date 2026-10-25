@@ -583,23 +583,16 @@ struct Gemma4MobileIntegrationTests {
 
         let modules = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
 
-        // Decoder-layer mobile weights are freed: `weight`/`weightScale` replaced
-        // with a dummy [1] array. The native path uses the converted _mlxWeight.
+        // Releasing mobile storage must preserve checkpoint-shaped parameters.
         let gate0 = try #require(
             modules["language_model.model.layers.0.mlp.gate_proj"] as? GemmaQuantizedLinear)
-        #expect(
-            gate0.weight.shape == [1],
-            "decoder layer mobile weight should be freed, got \(gate0.weight.shape)")
-        #expect(
-            gate0.weightScale.shape == [1],
-            "decoder layer mobile weightScale should be freed, got \(gate0.weightScale.shape)")
+        #expect(gate0.weight.shape == [gate0.shape.0, gate0.inputDims * gate0.numBits / 8])
+        #expect(gate0.weightScale.shape == [gate0.shape.0, 1])
 
         // A KV-shared layer (15) is also freed.
         let gate15 = try #require(
             modules["language_model.model.layers.15.mlp.gate_proj"] as? GemmaQuantizedLinear)
-        #expect(
-            gate15.weight.shape == [1],
-            "KV-shared layer mobile weight should be freed, got \(gate15.weight.shape)")
+        #expect(gate15.weight.shape == [gate15.shape.0, gate15.inputDims * gate15.numBits / 8])
 
         // lm_head (2-bit, not a decoder layer) keeps its mobile weights — it
         // stays on the qmv/eager path.
