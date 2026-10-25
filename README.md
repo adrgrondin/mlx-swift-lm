@@ -131,6 +131,8 @@ not placeholders. Explicitly evaluating an int8 weight materializes its mobile b
 
 Parameter updates invalidate converted weights and cached decoder arguments; module
 replacements also invalidate the decoder arguments.
+Eager fused QKV independently rechecks input-scale compatibility after projection or
+parameter changes, even when the native compiled path is disabled.
 As with other model updates, callers must hold exclusive access while changing weights
 or modules. Shared Gemma QMV kernel caches synchronize first-use specialization lookup.
 Aligned synthetic regressions cover these paths without a downloaded model.
