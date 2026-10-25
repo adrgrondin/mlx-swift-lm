@@ -258,6 +258,71 @@ struct Gemma4MobileIntegrationTests {
         }
     }
 
+    @Test(
+        "Eager mobile QKV observes projection replacements and scale updates",
+        arguments: ["decoder", "attention", "parameters"])
+    func eagerQKVUpdates(update: String) throws {
+        let oldCompiled = Gemma4TextModel.useNativeCompiledPath
+        defer { Gemma4TextModel.useNativeCompiledPath = oldCompiled }
+        Gemma4TextModel.useNativeCompiledPath = false
+
+        let data = Data(tinyConfigJSON(aligned: true).utf8)
+        var config = try JSONDecoder().decode(Gemma4Configuration.self, from: data).textConfig
+        config.hiddenSize = 512  // The int4 QMV kernel requires 512-wide inputs.
+        let model = Gemma4TextModel(config)
+        let layer = model.model.layers[0]
+        let attention = try #require(layer.children().flattened().first { $0.0 == "self_attn" }?.1)
+
+        func projection(inputScale: Float) -> GemmaQuantizedLinear {
+            let projection = GemmaQuantizedLinear(inputDims: 512, outputDims: 128, numBits: 4)
+            projection.update(
+                parameters: ModuleParameters.unflattened([
+                    ("weight", MLXArray([UInt8](repeating: 0x99, count: 128 * 256), [128, 256])),
+                    ("input_activation_scale", MLXArray(inputScale)),
+                ]))
+            return projection
+        }
+        try layer.update(
+            modules: ModuleChildren.unflattened([
+                ("self_attn.q_proj", projection(inputScale: 0) as Module),
+                ("self_attn.k_proj", projection(inputScale: 0) as Module),
+                ("self_attn.v_proj", projection(inputScale: 0) as Module),
+            ]), verify: .all)
+
+        func expectKeys(_ expected: Float) {
+            let (_, state, _) = layer(MLXArray.ones([1, 1, 512]))
+            guard case .regular(let keys, _) = state else {
+                Issue.record("Expected regular KV state")
+                return
+            }
+            #expect(abs(keys - expected).max().item(Float.self) < 1e-5)
+        }
+        expectKeys(1)
+        for scale: Float in [100, 0, 100] {
+            switch update {
+            case "decoder":
+                try layer.update(
+                    modules: ModuleChildren.unflattened([
+                        ("self_attn.k_proj", projection(inputScale: scale) as Module)
+                    ]), verify: .all)
+            case "attention":
+                try attention.update(
+                    modules: ModuleChildren.unflattened([
+                        ("k_proj", projection(inputScale: scale) as Module)
+                    ]), verify: .all)
+            default:
+                try attention.update(
+                    parameters: ModuleParameters.unflattened([
+                        ("k_proj.input_activation_scale", MLXArray(scale))
+                    ]), verify: [.noUnusedKeys, .shapeMismatch])
+            }
+            // Scale 100 rounds the normalized input to zero; Q/V remain uncalibrated.
+            expectKeys(scale == 0 ? 1 : 0)
+        }
+        model.invalidateCompiledTraces()
+        expectKeys(0)
+    }
+
     private func mobileLogits(
         _ model: Gemma4Model, input: MLXArray, cache: [KVCache]? = nil, compiled: Bool
     ) -> MLXArray {
