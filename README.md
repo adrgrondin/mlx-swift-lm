@@ -129,8 +129,9 @@ native-backed byte views, int8 weights are lazy reconstructions, and scales stay
 Parameter mapping and dtype conversion through `Module.apply` therefore see real values,
 not placeholders. Explicitly evaluating an int8 weight materializes its mobile buffer again.
 
-Parameter updates invalidate converted weights and cached decoder arguments; module
-replacements also invalidate the decoder arguments.
+Parameter updates invalidate converted weights and cached decoder arguments. Native
+arguments also track current module identities, including replacements made directly in
+an attention or MLP subtree, and participate in `Module.invalidateCompiledTraces()`.
 Eager fused QKV independently rechecks input-scale compatibility after projection or
 parameter changes, even when the native compiled path is disabled.
 As with other model updates, callers must hold exclusive access while changing weights

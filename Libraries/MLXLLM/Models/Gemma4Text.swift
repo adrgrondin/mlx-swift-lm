@@ -988,8 +988,34 @@ private class Gemma4TextExperts: Module {
             sources.allSatisfy { $0.linear.parameterVersion == $0.version }
         }
     }
-    private var _nativeArgs: NativeArgs?
-    private var _nativeArgsChecked = false
+    private final class NativeState: CompiledTraceInvalidating {
+        var args: NativeArgs?
+        var sourceModules: [Module]?
+
+        func invalidate() {
+            args = nil
+            sourceModules = nil
+        }
+
+        func isCurrent(modules: [Module]) -> Bool {
+            guard let sourceModules, sourceModules.count == modules.count else { return false }
+            return zip(sourceModules, modules).allSatisfy { $0 === $1 }
+                && args?.isCurrent != false
+        }
+    }
+    private let _nativeState = NativeState()
+
+    private var nativeSourceModules: [Module] {
+        let modules: [Module?] = [
+            selfAttn, mlp, inputLayernorm, postAttentionLayernorm,
+            preFeedforwardLayernorm, postFeedforwardLayernorm,
+            perLayerInputGate, perLayerProjection, postPerLayerInputNorm,
+            selfAttn.qProj, selfAttn.kProj, selfAttn.vProj, selfAttn.oProj,
+            selfAttn.qNorm, selfAttn.kNorm, selfAttn.vNorm, selfAttn.rope,
+            mlp.gateProj, mlp.upProj, mlp.downProj,
+        ]
+        return modules.compactMap { $0 }
+    }
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         // _addRMSNorm bakes kRMSEps into its compiled graph. Catch a future
@@ -1043,20 +1069,6 @@ private class Gemma4TextExperts: Module {
         super.init()
     }
 
-    @discardableResult
-    public override func update(
-        modules: ModuleChildren, verify: VerifyUpdate,
-        path: [String] = [], modulePath: [String] = []
-    ) throws -> Self {
-        defer {
-            _nativeArgs = nil
-            _nativeArgsChecked = false
-            selfAttn.invalidateNativeProjection()
-        }
-        return try super.update(
-            modules: modules, verify: verify, path: path, modulePath: modulePath)
-    }
-
     /// Lazily extract and cache native compiled-path arguments. Returns `nil` if
     /// the native path is not usable (MoE, non-gemma-quantized, unaligned dims,
     /// or no PLE). Mirrors Python `DecoderLayer._get_native_args`.
@@ -1065,9 +1077,10 @@ private class Gemma4TextExperts: Module {
     /// trigger conversion + read the cached args for the load-time direct-compile
     /// path (Phase 5).
     fileprivate func getNativeArgs() -> NativeArgs? {
-        if _nativeArgsChecked, _nativeArgs?.isCurrent != false { return _nativeArgs }
-        _nativeArgs = nil
-        _nativeArgsChecked = true
+        let modules = nativeSourceModules
+        if _nativeState.isCurrent(modules: modules) { return _nativeState.args }
+        _nativeState.invalidate()
+        _nativeState.sourceModules = modules
         selfAttn.invalidateNativeProjection()
 
         // Guard: no MoE, PLE present.
@@ -1172,7 +1185,7 @@ private class Gemma4TextExperts: Module {
             postFn: postFn, postArgs: postArgs,
             precompileSignature: precompileSignature,
             sources: sources.map { ($0, $0.parameterVersion) })
-        _nativeArgs = result
+        _nativeState.args = result
         return result
     }
 
