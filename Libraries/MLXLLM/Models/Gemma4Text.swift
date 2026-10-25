@@ -1527,10 +1527,9 @@ private class Gemma4TextExperts: Module {
     /// Three steps:
     /// 1. **Convert + free mobile weights layer by layer** — call `getNativeArgs()`
     ///   on each decoder layer (triggering lazy `nativeArgs()` conversion to the
-    ///   native `quantizedMM` format), then replace the mobile `weight`/
-    ///   `weightScale` with dummy arrays. Keeps the conversion peak at roughly
-    ///   half-mobile + half-native per layer (the native weights are `eval`'d
-    ///   inside `convertToMLXFormat`).
+    ///   native `quantizedMM` format), then replace mobile weights with native-
+    ///   backed byte views or lazy int8 reconstructions. Parameter reads remain
+    ///   valid without retaining a separate materialized int8 buffer.
     /// 2. **Precompile `compile` functions** — run dummy forward passes for
     ///   common prompt lengths with `eval` on the output. Use the hybrid compile
     ///   strategy: full forward pass for shapes ≤ 32 (negligible activations,
