@@ -241,8 +241,42 @@ struct Gemma4MobileIntegrationTests {
                 previous = actual
             }
 
-            // Replacing one module disables the native segment; the remaining
-            // projections must still work without their freed mobile buffers.
+            let referenceLayer = reference.languageModel.model.layers[0]
+            let nativeMLP = try #require(layer.children().flattened().first { $0.0 == "mlp" }?.1)
+            let referenceMLP = try #require(
+                referenceLayer.children().flattened().first { $0.0 == "mlp" }?.1)
+            for mlp in [nativeMLP, referenceMLP] {
+                let down = GemmaQuantizedLinear(inputDims: 256, outputDims: 128, numBits: 4)
+                let bytes = (0 ..< 128).flatMap { row in
+                    [UInt8](repeating: row.isMultiple(of: 2) ? 0x99 : 0x77, count: 128)
+                }
+                down.update(
+                    parameters: ModuleParameters.unflattened([
+                        ("weight", MLXArray(bytes, [128, 128]))
+                    ]))
+                try mlp.update(
+                    modules: ModuleChildren.unflattened([("down_proj", down as Module)]),
+                    verify: .all)
+            }
+            let nested = mobileLogits(native, input: input, compiled: true)
+            let nestedExpected = mobileLogits(reference, input: input, compiled: false)
+            #expect(abs(nested - nestedExpected).max().item(Float.self) < 1e-3)
+            #expect(abs(nestedExpected - previous).max().item(Float.self) > 1e-4)
+
+            let dense = concatenated([MLXArray.eye(128), MLXArray.zeros([128, 128])], axis: 1)
+            for mlp in [nativeMLP, referenceMLP] {
+                try mlp.update(
+                    modules: ModuleChildren.unflattened([
+                        ("down_proj", Linear(weight: dense) as Module)
+                    ]), verify: .all)
+            }
+            native.invalidateCompiledTraces()
+            reference.invalidateCompiledTraces()
+            let fallback = mobileLogits(native, input: input, compiled: true)
+            let fallbackExpected = mobileLogits(reference, input: input, compiled: false)
+            #expect(abs(fallback - fallbackExpected).max().item(Float.self) < 1e-3)
+
+            // A decoder-level replacement must also retain a safe eager fallback.
             let replacement = MLXArray.zeros([128, 128])
             try layer.update(
                 modules: ModuleChildren.unflattened([
