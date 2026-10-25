@@ -308,6 +308,23 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         #expect(metadata["2.0"] == "KVCache")
     }
 
+    @Test func testLoadedPromptCacheNoLongerReadsItsFile() throws {
+        let cache = KVCacheSimple()
+        let keys = MLXArray(0 ..< 32).reshaped([1, 2, 4, 4]).asType(.float32)
+        let values = -keys
+        _ = cache.update(keys: keys, values: values)
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try savePromptCache(url: url, cache: [cache])
+
+        // Saving truncates the file before it evaluates what it writes.
+        let snapshot = try loadPromptCacheSnapshot(url: url)
+        try savePromptCache(url: url, cache: snapshot.cache)
+
+        let restored = try loadPromptCacheSnapshot(url: url)
+        assertArraysClose(restored.cache[0].state, [keys, values])
+    }
+
     @Test func testEmptyPromptCacheStateUsesTheLegacyFormat() throws {
         let cache = KVCacheSimple()
         _ = cache.update(
@@ -896,6 +913,36 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
             ])
     }
 
+    @Test func testArrayMaskSpansTheRetainedCacheWindow() throws {
+        let cache = RotatingKVCache(maxSize: 8)
+        _ = cache.update(
+            keys: MLXArray.ones([1, 1, 20, 2], dtype: .float32),
+            values: MLXArray.ones([1, 1, 20, 2], dtype: .float32))
+
+        let pending = MLXArray.ones([1, 5, 2], dtype: .float32)
+        let arrayMask: MLXArray? = createAttentionMask(h: pending, cache: [cache])
+        // 7 retained rows plus the 5 pending: the absolute offset (20) must
+        // not leak into the width.
+        #expect(arrayMask?.shape == [5, 12])
+
+        let (presentedKeys, _) = cache.update(
+            keys: MLXArray.ones([1, 1, 5, 2], dtype: .float32),
+            values: MLXArray.ones([1, 1, 5, 2], dtype: .float32))
+        #expect(arrayMask?.dim(-1) == presentedKeys.dim(2))
+    }
+
+    @Test func testArrayMaskKeepsOffsetWidthForUnboundedCaches() throws {
+        let cache = KVCacheSimple()
+        _ = cache.update(
+            keys: MLXArray.ones([1, 1, 3, 2], dtype: .float32),
+            values: MLXArray.ones([1, 1, 3, 2], dtype: .float32))
+
+        let arrayMask: MLXArray? = createAttentionMask(
+            h: MLXArray.ones([1, 5, 2], dtype: .float32), cache: [cache])
+        // A cache that never evicts keeps every token: width stays offset + n.
+        #expect(arrayMask?.shape == [5, 8])
+    }
+
     @Test func testSSMMaskUsesSharedMambaMetadataPath() throws {
         let leftPadded = MambaCache(leftPadding: [1, 3])
         let input = MLXArray.ones([2, 4, 8], dtype: .float32)
@@ -1293,6 +1340,38 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         }
     }
 
+    // MARK: - Quantized attention head dims
+    // Regression for #652: MLA caches store [kvLatent, kPe] as keys and only kvLatent as
+    // values, so the GQA output reshape must follow the value head dim, not the query one.
+
+    @Test("quantizedScaledDotProductAttention supports values narrower than keys")
+    func quantizedAttentionSupportsMLAStyleHeadDims() throws {
+        withRandomState(MLXRandom.RandomState(seed: 0)) {
+            let (B, nKVHeads, nRepeats, L) = (1, 1, 4, 3)
+            let (kHeadDim, vHeadDim) = (192, 128)
+            let scale = 1.0 / Float(kHeadDim).squareRoot()
+
+            let q = MLXRandom.normal([B, nKVHeads * nRepeats, L, kHeadDim])
+            let k = MLXRandom.normal([B, nKVHeads, L, kHeadDim])
+            let v = MLXRandom.normal([B, nKVHeads, L, vHeadDim])
+
+            let reference = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: .causal)
+
+            let cache = QuantizedKVCache(groupSize: 64, bits: 8)
+            let (qK, qV) = cache.updateQuantized(keys: k, values: v)
+            let out = quantizedScaledDotProductAttention(
+                queries: q, quantizedKeys: qK, quantizedValues: qV,
+                scale: scale, mask: .causal,
+                groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
+
+            #expect(out.shape == reference.shape)
+            #expect(
+                allClose(out, reference, rtol: 0.05, atol: 0.1).item(Bool.self),
+                "quantized MLA attention diverges from full precision")
+        }
+    }
+
     // MARK: - ropeOffset overridability
 
     /// A `BaseKVCache` subclass reporting a per-row RoPE offset, as a batched cache does.
@@ -1377,6 +1456,14 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
 
         let short = try #require(cache.logicalView(tail: 3))
         #expect(encodedPositions(short.0) == [17, 18, 19], "a short tail took the wrong end")
+    }
+
+    @Test func testRotatingKVCacheReportsEvictedTokensThroughKVCache() {
+        let rotating = RotatingKVCache(maxSize: 8, keep: 2)
+        fillOneAtATime(rotating, positions: 0 ..< 20)
+
+        let cache: any KVCache = rotating
+        #expect(cache.evictedTokenCount == 12)
     }
 
     @Test func testRotatingLogicalViewClampsTailToWhatTheCacheHolds() throws {
@@ -1566,6 +1653,19 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         #expect(relativeRMSError(cachedValues, values) < 0.5)
     }
 
+    @Test func testVarianceNormalizedKVCacheInnerStateHoldsTheStoredSlabs() throws {
+        let cache = VarianceNormalizedKVCache(
+            tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
+        let keys = MLXRandom.normal([1, 1, 8 * 32 + 5, 32]).asType(.float16)
+        let values = MLXRandom.normal([1, 1, 8 * 32 + 5, 32]).asType(.float16)
+        let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+        eval(cachedKeys, cachedValues)
+
+        let stateBytes = cache.state.reduce(0) { $0 + $1.nbytes }
+        #expect(KVCacheStatus(cache: [cache]).memoryBytes == stateBytes)
+        #expect(cache.innerState().count < cache.state.count)
+    }
+
     @Test func testVarianceNormalizedKVCacheSerializationRoundTrip() throws {
         let cache = VarianceNormalizedKVCache(
             tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
@@ -1725,6 +1825,102 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
             nativeCache.metaState == [
                 "32", "36", "4", "4", "2", "1", "4", "1", "float16", "float16",
             ])
+    }
+
+    @Test(arguments: [
+        (headDim: 64, bits: 4, dtype: DType.float16),
+        (headDim: 64, bits: 8, dtype: DType.bfloat16),
+        (headDim: 128, bits: 4, dtype: DType.bfloat16),
+        (headDim: 128, bits: 8, dtype: DType.float16),
+    ])
+    func testQuantizedKVCachePrefillAttentionMatchesQuantizedMatmulPath(
+        headDim: Int, bits: Int, dtype: DType
+    ) {
+        // 64 queries over a 100-token quantized history take the dequantized fused route;
+        // it must agree with the quantized-matmul attention over the same cache contents
+        // and stay close to full-precision attention over the unquantized history.
+        let fusedCache = QuantizedKVCache(groupSize: 64, bits: bits)
+        let matmulCache = QuantizedKVCache(groupSize: 64, bits: bits)
+        let plainCache = KVCacheSimple()
+        let history = (
+            keys: deterministicTensor(shape: [1, 2, 100, headDim], salt: 40).asType(dtype),
+            values: deterministicTensor(shape: [1, 2, 100, headDim], salt: 41).asType(dtype)
+        )
+        for cache in [fusedCache, matmulCache] {
+            _ = cache.updateQuantized(keys: history.keys, values: history.values)
+        }
+        _ = plainCache.update(keys: history.keys, values: history.values)
+
+        let queries = deterministicTensor(shape: [1, 4, 64, headDim], salt: 42).asType(dtype)
+        let keys = deterministicTensor(shape: [1, 2, 64, headDim], salt: 43).asType(dtype)
+        let values = deterministicTensor(shape: [1, 2, 64, headDim], salt: 44).asType(dtype)
+        let scale = 1 / sqrt(Float(headDim))
+        #expect(usesDequantizedPrefillAttention(queries: queries, valueHeadDim: headDim))
+
+        let fused = attentionWithCacheUpdate(
+            queries: queries, keys: keys, values: values, cache: fusedCache,
+            scale: scale, mask: .causal)
+        let (quantizedKeys, quantizedValues) = matmulCache.updateQuantized(
+            keys: keys, values: values)
+        let viaMatmul = quantizedScaledDotProductAttention(
+            queries: queries, quantizedKeys: quantizedKeys, quantizedValues: quantizedValues,
+            scale: scale, mask: .causal, groupSize: 64, bits: bits)
+        let fullPrecision = attentionWithCacheUpdate(
+            queries: queries, keys: keys, values: values, cache: plainCache,
+            scale: scale, mask: .causal)
+        eval(fused, viaMatmul, fullPrecision)
+
+        #expect(fused.shape == [1, 4, 64, headDim])
+        #expect(fused.dtype == dtype)
+        #expect(relativeRMSError(fused, viaMatmul) < 1e-2)
+        #expect(relativeRMSError(fused, fullPrecision) < (bits == 4 ? 5e-2 : 1e-2))
+        #expect(fusedCache.offset == 164)
+    }
+
+    @Test func testAttentionKVStateQuantizedRouteSharesPrefillDispatch() {
+        // The state-based route (shared-KV layers) must make the same fused-versus-quantized
+        // decision as `attentionWithCacheUpdate`.
+        let stateCache = QuantizedKVCache(groupSize: 64, bits: 4)
+        let directCache = QuantizedKVCache(groupSize: 64, bits: 4)
+        let queries = deterministicTensor(shape: [1, 4, 64, 64], salt: 52)
+        let keys = deterministicTensor(shape: [1, 2, 64, 64], salt: 53)
+        let values = deterministicTensor(shape: [1, 2, 64, 64], salt: 54)
+        let scale = 1 / sqrt(Float(64))
+
+        let state = AttentionKVState.update(keys: keys, values: values, cache: stateCache)
+        guard case .quantized = state else {
+            Issue.record("expected a quantized attention state")
+            return
+        }
+        let viaState = state.attend(queries: queries, scale: scale, mask: .causal)
+        let direct = attentionWithCacheUpdate(
+            queries: queries, keys: keys, values: values, cache: directCache,
+            scale: scale, mask: .causal)
+        eval(viaState, direct)
+
+        #expect(state.sequenceLength == 64)
+        #expect(allClose(viaState, direct).item(Bool.self))
+    }
+
+    @Test func testDequantizedPrefillAttentionRouteGates() {
+        #expect(
+            !usesDequantizedPrefillAttention(
+                queries: deterministicTensor(shape: [1, 4, 1, 64], salt: 46), valueHeadDim: 64))
+        #expect(
+            !usesDequantizedPrefillAttention(
+                queries: deterministicTensor(shape: [1, 4, 63, 64], salt: 47), valueHeadDim: 64))
+        #expect(
+            usesDequantizedPrefillAttention(
+                queries: deterministicTensor(shape: [1, 4, 64, 64], salt: 48), valueHeadDim: 64))
+        // MLX runs head dim 256 unfused on most GPUs, so it keeps the quantized route.
+        #expect(
+            !usesDequantizedPrefillAttention(
+                queries: deterministicTensor(shape: [1, 4, 64, 256], salt: 49),
+                valueHeadDim: 256))
+        // MLA-style caches with narrower values than queries stay on the quantized route.
+        #expect(
+            !usesDequantizedPrefillAttention(
+                queries: deterministicTensor(shape: [1, 4, 64, 128], salt: 51), valueHeadDim: 64))
     }
 
     @Test func testVarianceNormalizedKVCacheQuantizedTileAttentionSupportsGQA() {

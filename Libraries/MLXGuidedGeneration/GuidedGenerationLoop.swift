@@ -20,10 +20,7 @@ import MLXLMCommon
 /// KV cache.
 public enum GuidedGenerationLoop {
 
-    private static let logger = Logger(
-        subsystem: "com.apple.FoundationModels-MLX",
-        category: "GuidedGenerationLoop"
-    )
+    private static let logger = MLXLogger(label: "GuidedGenerationLoop")
 
     /// Result of a single generation step.
     enum StepResult {
@@ -149,9 +146,10 @@ public enum GuidedGenerationLoop {
 
         try kvCachePlan.applyAndValidate(to: cacheStorage)
 
-        var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
+        var detokenizer = context.tokenizer.makeStreamingDetokenizer()
         var tokenCount = 0
         var grammarStopped = false
+        var consumerStopped = false
         var whitespaceTracker = WhitespaceRunTracker(whitespaceTokenIDs: whitespaceTokenIDs)
 
         // Pre-compute bias arrays used in the zone policy.
@@ -321,18 +319,23 @@ public enum GuidedGenerationLoop {
             detokenizer.append(token: tokenId)
             if let text = detokenizer.next() {
                 accumulatedText += text
-                if !emit(text) { break }
+                if !emit(text) {
+                    consumerStopped = true
+                    break
+                }
             }
             tokenCount += 1
 
-            // Periodic progress logging (once per main loop iteration, not per FF token)
-            if tokenCount % 50 == 0 {
-                let elapsed = clock.now - startInstant
-                let ms =
-                    elapsed.components.seconds * 1000 + elapsed.components.attoseconds
-                    / 1_000_000_000_000_000
-                let prefix = String(accumulatedText.prefix(200))
-                logger.info("[GuidedGen] token=\(tokenCount) elapsed=\(ms)ms text=\(prefix)")
+            if diagnosticLog {
+                // Periodic progress logging (once per main loop iteration, not per FF token)
+                if tokenCount % 50 == 0 {
+                    let elapsed = clock.now - startInstant
+                    let ms =
+                        elapsed.components.seconds * 1000 + elapsed.components.attoseconds
+                        / 1_000_000_000_000_000
+                    let prefix = String(accumulatedText.prefix(200))
+                    logger.info("[GuidedGen] token=\(tokenCount) elapsed=\(ms)ms text=\(prefix)")
+                }
             }
 
             if commitResult.isTerminated {
@@ -371,6 +374,7 @@ public enum GuidedGenerationLoop {
                     if let text = detokenizer.next() {
                         accumulatedText += text
                         if !emit(text) {
+                            consumerStopped = true
                             shouldStopAfterFF = true
                             break
                         }
@@ -445,13 +449,19 @@ public enum GuidedGenerationLoop {
             }
         }
 
-        // Log final generation stats
-        let totalElapsed = clock.now - startInstant
-        let totalMs =
-            totalElapsed.components.seconds * 1000 + totalElapsed.components.attoseconds
-            / 1_000_000_000_000_000
-        logger.info("[GuidedGen] done tokens=\(tokenCount) elapsed=\(totalMs)ms")
+        if !consumerStopped, let text = detokenizer.finish(), !text.isEmpty {
+            accumulatedText += text
+            _ = emit(text)
+        }
 
+        if diagnosticLog {
+            // Log final generation stats
+            let totalElapsed = clock.now - startInstant
+            let totalMs =
+                totalElapsed.components.seconds * 1000 + totalElapsed.components.attoseconds
+                / 1_000_000_000_000_000
+            logger.info("[GuidedGen] done tokens=\(tokenCount) elapsed=\(totalMs)ms")
+        }
         // Flush any xgrammar warnings (limit exceedances, parser state)
         if diagnosticLog, let logs = constraint.flushLogs() {
             logger.warning("[GuidedGen] xgrammar logs:\n\(logs)")

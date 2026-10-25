@@ -16,6 +16,21 @@ do development _in_ mlx-swift-lm.
 
 ## Porting Models from MLX in Python
 
+Checkpoint namespaces can differ from runtime module paths. Implement
+``BaseLanguageModel/prepareCheckpoint(_:)`` with ``CheckpointNameMapping`` for
+renames and exclusions, or ``CheckpointComponent`` to select a component from a
+larger checkpoint. These operations preserve source metadata and per-layer
+precision. Keep architecture-specific numeric conversions in the model's hook.
+See <doc:model-compatibility> for the loading contract and validation rules.
+
+Models with cross-layer KV sharing must pass the owner's attention presentation
+and its pre-update RoPE offset to consuming layers. `KVCache.state` is for
+serialization: it can contain rewind history, packed quantization components, or
+only committed rows during staged decoding. Shared layers compute queries and
+attend without appending KV again. Preserve sharing even when no persistent cache
+is supplied. Gemma3n uses `AttentionKVState` to share regular, quantized, and
+cache-native attention within a forward pass without copying or unpacking KV.
+
 Let's consider a concrete example, [gemma.py](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma.py). For reference, here is the current port [Gemma.swift](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLLM/Models/Gemma.swift).
 
 ### Imports
@@ -300,7 +315,7 @@ public init(dimensions: Int, eps: Float = 1e-5) {
 }
 ```
 
-Note that the weight is given an initial value and shape based on the parameters to the initializer. In typical inference use, these values will be replaced when the weights are loaded (``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-8b333``).
+Note that the weight is given an initial value and shape based on the parameters to the initializer. In typical inference use, these values will be replaced when the weights are loaded (``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:componentLoading:)-fqoy``).
 
 * Note: If the property names in Python don't make good Swift names, you can use the `@ParameterInfo` property wrapper to specify the key: `@ParameterInfo(key: "some_weight") var weight: MLXArray`
 

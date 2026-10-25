@@ -180,6 +180,7 @@ public final class ModelContainer: Sendable {
     /// for await generation in stream {
     ///     switch generation {
     ///     case .chunk(let text): print(text)
+    ///     case .reasoning(let text): print(text)
     ///     case .info(let info): print(info.tokensPerSecond)
     ///     case .toolCall(let call): handleToolCall(call)
     ///     case .rejectedToolCall(let rejection): handleRejectedToolCall(rejection)
@@ -201,7 +202,12 @@ public final class ModelContainer: Sendable {
         wiredMemoryTicket: WiredMemoryTicket? = nil,
         tools: [[String: any Sendable]]? = nil
     ) async throws -> AsyncStream<Generation> {
+        let needed = ModelComponent.needed(by: input)
         let input = SendableBox(input)
+        let components = await context.read { context in
+            pendingOnDemandComponents(of: context.model, among: needed)
+        }
+        try await loadOnDemandComponents(components)
 
         // Note: this is only visiting the model exclusively
         // for the pre-fill time.  Beyond that there is no

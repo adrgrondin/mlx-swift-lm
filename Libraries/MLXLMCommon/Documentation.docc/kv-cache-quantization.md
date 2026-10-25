@@ -64,9 +64,10 @@ before inference. A bounded compressed ring cache is not currently implemented.
 ``ChatSession/cacheStatus()`` is the unified diagnostic surface for legacy and
 typed configuration. It reports the normalized request, request source,
 planned or realized phase, flattened cache topology, per-layer capacity source,
-strategy state, skip reason, and the container-owned `processedTokenCount`.
-Aggregate compressed, pending, skipped, and capacity-application counts are
-available on the same value.
+strategy state, skip reason, allocated bytes, and the container-owned
+`processedTokenCount`. Aggregate compressed, pending, skipped, and
+capacity-application counts, and the total `memoryBytes`, are available on the
+same value.
 ``LanguageModel/cacheStatus(parameters:)`` and
 ``ModelContainer/cacheStatus(parameters:)`` provide the same shape for planned
 caches. The lower-level ``kvCacheRuntimeReport(cache:configuration:)`` remains
@@ -76,6 +77,46 @@ A realized `ChatSession` cache is bound to its configuration. When parameters
 change, a session with a structured transcript rebuilds automatically on the
 next response. A restored raw cache has no transcript to replay and rejects an
 incompatible request; clear it or create a new session.
+
+## Reusing divergent prefixes
+
+Rotating caches normally discard history beyond their attention window. To reuse
+recent prefixes after rotation, opt into a bounded rewind reserve:
+
+```swift
+let parameters = GenerateParameters(
+    kvCache: KVCacheConfiguration(
+        rewind: try .init(maxTokens: 128)))
+```
+
+This retains up to 128 additional historical rows per rotating layer without
+widening its attention window. Full-attention caches already retain their history.
+The default has no reserve and preserves the existing memory bound. Multi-token
+prefill can temporarily retain more rows, as it does without a reserve.
+
+For each rotating layer, the extra retained storage is
+`batchSize * kvHeads * maxTokens * (keyHeadDim + valueHeadDim) * bytesPerElement`.
+For example, 128 reserve tokens with eight KV heads, 64-dimensional keys and values,
+and 16-bit storage add 256 KiB per layer at batch size one. This storage stays
+bounded as the conversation grows. It is not a limit on total process memory:
+prefill, temporary attention buffers, cache copies, and MLX's allocator pool also
+consume memory. Attention views slice contiguous rows directly and concatenate
+only the selected window when it crosses the ring boundary.
+
+``ChatSession`` checks the requested rewind against every layer's
+``KVCache/maxTrimCount``. If any layer lacks the necessary history, it rebuilds
+before modifying the caches. Larger history edits can therefore still require a
+full prefill. Recurrent layers do not acquire rewind support from this option.
+
+For raw caches, use ``canTrimPromptCache(_:numTokens:)`` or
+``trimPromptCache(_:numTokens:)``. The latter returns zero without modifying any
+layer when an exact rewind is unavailable. Calling ``RotatingKVCache/trim(_:)``
+directly can still discard more history than an exact rewind permits; a nonzero
+return alone does not establish that the earlier attention context was restored.
+
+The reserve and its retained history survive cache copying and serialization.
+Older readers reject the extended rotating-cache metadata rather than restoring
+it with the wrong attention window.
 
 ## Cache ownership and progress
 

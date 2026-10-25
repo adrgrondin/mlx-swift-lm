@@ -2,6 +2,7 @@
 
 import Dispatch
 import MLX
+import MLXScriptedLM
 import XCTest
 
 @testable import MLXLMCommon
@@ -27,6 +28,8 @@ final class GenerationExecutionTests: XCTestCase {
         var maxTokens: Int? = 1
         var tokenCount = 0
         var promptPrefillTime: TimeInterval { 0 }
+        var evictedTokenCount = 0
+        var reasoningTokenCount: Int?
         var onNext: @Sendable () -> Void = {}
         var onFinalize: @Sendable () -> Void = {}
 
@@ -52,7 +55,7 @@ final class GenerationExecutionTests: XCTestCase {
             let ticket = useTicket ? MLX.WiredSumPolicy().ticket(size: 0) : nil
             let (stream, task) = generateTask(
                 promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-                tokenizer: TestTokenizer(), iterator: iterator, wiredMemoryTicket: ticket)
+                tokenizer: PseudoWordTokenizer(), iterator: iterator, wiredMemoryTicket: ticket)
             for await _ in stream {}
             await task.value
         }
@@ -68,7 +71,7 @@ final class GenerationExecutionTests: XCTestCase {
         await Device.withDefaultDevice(.cpu) {
             let (stream, task) = generateTaskRecordingTokens(
                 promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-                tokenizer: TestTokenizer(),
+                tokenizer: PseudoWordTokenizer(),
                 iterator: Iterator(
                     maxTokens: 3,
                     onNext: {
@@ -97,7 +100,7 @@ final class GenerationExecutionTests: XCTestCase {
         let resumeSecond = DispatchSemaphore(value: 0)
         let (firstStream, first) = generateTaskRecordingTokens(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(
                 maxTokens: 10,
                 onNext: {
@@ -108,7 +111,7 @@ final class GenerationExecutionTests: XCTestCase {
                 onFinalize: { XCTAssertTrue(Task.isCancelled) }))
         let (secondStream, second) = generateTaskRecordingTokens(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(
                 onNext: {
                     secondEntered.fulfill()
@@ -144,14 +147,14 @@ final class GenerationExecutionTests: XCTestCase {
         let secondStarted = DispatchSemaphore(value: 0)
         let (firstStream, first) = generateTask(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(onNext: {
                 firstStarted.signal()
                 XCTAssertEqual(secondStarted.wait(timeout: .now() + 5), .success)
             }))
         let (secondStream, second) = generateTask(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(onNext: {
                 XCTAssertEqual(firstStarted.wait(timeout: .now() + 5), .success)
                 secondStarted.signal()
@@ -167,7 +170,7 @@ final class GenerationExecutionTests: XCTestCase {
         let finalized = expectation(description: "finalized after cancellation")
         let (stream, task) = generateTaskRecordingTokens(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(
                 maxTokens: 10,
                 onNext: {
@@ -199,7 +202,7 @@ final class GenerationExecutionTests: XCTestCase {
         let ticket = CancellingPolicy().ticket(size: 0)
         let (stream, task) = generateTaskRecordingTokens(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(
                 onNext: { XCTFail("Cancelled generation must not call next") },
                 onFinalize: {
@@ -223,7 +226,7 @@ final class GenerationExecutionTests: XCTestCase {
         let finalized = expectation(description: "consumer cancellation finalized")
         let (stream, task) = generateTask(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(
                 onNext: {
                     entered.fulfill()
@@ -247,7 +250,7 @@ final class GenerationExecutionTests: XCTestCase {
     func testMainActorCallerDoesNotRunIteratorOnMainThread() async {
         let (stream, task) = generateTask(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(onNext: {
                 XCTAssertFalse(Thread.isMainThread)
                 Self.assertCooperativeProgress()
@@ -260,7 +263,7 @@ final class GenerationExecutionTests: XCTestCase {
         let finalized = expectation(description: "empty iterator finalized")
         let (stream, task) = generateTaskRecordingTokens(
             promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             iterator: Iterator(
                 maxTokens: 0, onNext: { XCTFail("Empty iterator must not produce a token") },
                 onFinalize: { finalized.fulfill() }))
@@ -275,12 +278,37 @@ final class GenerationExecutionTests: XCTestCase {
         await fulfillment(of: [finalized], timeout: 0)
     }
 
+    func testGenerationReportsCompletionObservability() async {
+        let (stream, task) = generateTaskRecordingTokens(
+            promptTokenCount: 3,
+            modelConfiguration: .init(id: "test"),
+            tokenizer: PseudoWordTokenizer(),
+            iterator: Iterator(
+                maxTokens: 2,
+                evictedTokenCount: 4,
+                reasoningTokenCount: 1))
+
+        var completion: GenerateCompletionInfo?
+        for await event in stream {
+            switch event {
+            case .info(let info): completion = info
+            case .chunk, .reasoning, .toolCall, .rejectedToolCall: break
+            }
+        }
+
+        _ = await task.value
+        XCTAssertEqual(completion?.evictedTokenCount, 4)
+        XCTAssertEqual(completion?.reasoningTokenCount, 1)
+        XCTAssertEqual(completion?.answerTokenCount, 1)
+        XCTAssertTrue(completion?.summary().contains("4 context tokens dropped") == true)
+    }
+
     func testTaskContextAndRecordedTokensSurviveExecutionHop() async {
         let finalized = expectation(description: "iterator finalized")
         let (stream, task) = Context.$value.withValue(123) {
             generateTaskRecordingTokens(
                 promptTokenCount: 1, modelConfiguration: .init(id: "test"),
-                tokenizer: TestTokenizer(),
+                tokenizer: PseudoWordTokenizer(),
                 iterator: Iterator(
                     onNext: {
                         XCTAssertEqual(Context.value, 123)

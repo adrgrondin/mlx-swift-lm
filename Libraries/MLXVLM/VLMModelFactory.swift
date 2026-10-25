@@ -101,6 +101,8 @@ public enum VLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
         "prism_hadamard_qwen35": { try PrismHadamardQwen35(configuration: $0) },
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        "qwen3_8": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3_8_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
@@ -128,6 +130,14 @@ public enum VLMProcessorTypeRegistry {
         "Qwen2_5_VLProcessor": create(
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
         "Qwen3VLProcessor": create(
+            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen3_5VLProcessor": create(
+            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen3_5_VLProcessor": create(
+            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen3_8VLProcessor": create(
+            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen3_8_VLProcessor": create(
             Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
         "Idefics3Processor": create(
             Idefics3ProcessorConfiguration.self, Idefics3Processor.init),
@@ -279,6 +289,18 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let qwen3_8_27B_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-4bit",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let qwen3_8_27B_8bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-8bit",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
     static public let museGlimmer30B4bit = ModelConfiguration(
         id: "mlx-community/Muse-Glimmer-30B-4bit",
         defaultPrompt: "Describe the image in English",
@@ -310,6 +332,8 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             fastvlm,
             qwen3_5_27B_4bit,
             qwen3_5_35B_A3B_4bit,
+            qwen3_8_27B_4bit,
+            qwen3_8_27B_8bit,
             museGlimmer30B4bit,
         ]
     }
@@ -419,6 +443,11 @@ public final class VLMModelFactory: GenericModelFactory {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
+        // Honor `suppress_tokens` from generation_config.json (transformers'
+        // SuppressTokensLogitsProcessor): merge into the model's suppressed
+        // token IDs so the token iterators mask them during sampling.
+        mergeGenerationConfigSuppressedTokens(generationConfig, into: model)
+
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
@@ -461,7 +490,8 @@ public final class VLMModelFactory: GenericModelFactory {
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection)
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents)
 
         let tokenizer = try await tokenizerTask
         let processorConfiguration: VLMProcessorConfiguration

@@ -1053,14 +1053,20 @@ private struct CausalLMReranker {
                 count: maxLength - document.input.tokenIds.count)
         }
         let tokens = MLXArray(inputIDs).reshaped(batch.count, maxLength)
-        let logits = model(LMInput.Text(tokens: tokens), cache: nil, state: nil).logits
-        let scores = batch.enumerated().map { row, document in
-            probability(
-                logits: logits[row, document.input.tokenIds.count - 1],
-                tokens: classifierTokens)
-        }
+        let lengths = batch.map(\.input.tokenIds.count)
+        let logits =
+            if let model = model as? any HiddenStateLanguageModel {
+                model.projectLogits(
+                    lastPositions(model.hiddenStates(tokens, cache: nil), lengths: lengths))
+            } else {
+                lastPositions(
+                    model(LMInput.Text(tokens: tokens), cache: nil, state: nil).logits,
+                    lengths: lengths)
+            }
         MLX.eval(logits)
-        return scores
+        return batch.indices.map { row in
+            probability(logits: logits[row], tokens: classifierTokens)
+        }
     }
 
     private func nextTokenLogits(
@@ -1124,6 +1130,12 @@ private struct CausalLMReranker {
 private struct EncodedCausalDocument {
     var index: Int
     var input: RerankerInput
+}
+
+/// Selects position `length - 1` of each right-padded row, mapping `[B, L, D]` to `[B, D]`.
+private func lastPositions(_ array: MLXArray, lengths: [Int]) -> MLXArray {
+    let indices = MLXArray(lengths.map { Int32($0 - 1) }).reshaped(-1, 1, 1)
+    return takeAlong(array, indices, axis: 1).squeezed(axis: 1)
 }
 
 private func causalMicroBatches(

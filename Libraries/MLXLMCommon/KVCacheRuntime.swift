@@ -92,6 +92,19 @@ public func validateKVCacheCompatibility(
 ) throws {
     let leaves = KVCacheTree.leaves(in: cache)
 
+    if let rewind = configuration.rewind {
+        let incompatibleCount = leaves.count { leaf in
+            if case .rotating(let rotating) = leaf.kind {
+                return rotating.rewindCapacity < rewind.maxTokens
+            }
+            return false
+        }
+        guard incompatibleCount == 0 else {
+            throw KVCacheConfigurationError.incompatibleRewindCapacity(
+                expected: rewind.maxTokens, count: incompatibleCount)
+        }
+    }
+
     if let capacity = configuration.capacity {
         let incompatibleCapacityCount = leaves.count { leaf in
             switch leaf.kind {
@@ -194,6 +207,7 @@ extension KVCacheLeaf {
     ) -> KVCacheLayerStatus {
         let requested = configuration.strategy.identifier
         let layerKind = CacheLayerKind(cache: cache)
+        let memoryBytes = cache.innerState().reduce(0) { $0 + $1.nbytes }
         let capacitySource: KVCacheLayerStatus.CapacitySource? =
             switch self.kind {
             case .recurrent:
@@ -215,7 +229,8 @@ extension KVCacheLeaf {
                 capacitySource: capacitySource,
                 state: state,
                 resolvedStrategy: resolvedStrategy,
-                reason: reason)
+                reason: reason,
+                memoryBytes: memoryBytes)
         }
 
         switch self.kind {

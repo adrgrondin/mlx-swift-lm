@@ -33,6 +33,8 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
         super.init()
     }
 
+    func isCompatible(with target: any LanguageModel) -> Bool { true }
+
     func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
         MTPDrafterState(cache: [CountingKVCache()])
     }
@@ -293,6 +295,92 @@ private final class NonTrimmableCountingKVCache: CountingKVCache {
         let c = NonTrimmableCountingKVCache()
         c.offset = offset
         return c
+    }
+}
+
+// MARK: - Prefill reporting
+
+private final class PrefixLog: @unchecked Sendable {
+    var positions: [Int] = []
+}
+
+// MARK: - The prompt is read before the prefill
+
+/// Hands the target model to a tokenizer so a decode can record how many forward
+/// passes the target had run by then.
+private final class TargetProbe: @unchecked Sendable {
+    let target: MockMainModel
+    var forwardCountsAtDecode: [Int] = []
+    init(target: MockMainModel) { self.target = target }
+}
+
+private struct ProbeTokenizer: Tokenizer {
+    let probe: TargetProbe
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        probe.forwardCountsAtDecode.append(probe.target.callCount)
+        return tokenIds.map { "t\($0)" }.joined()
+    }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+}
+
+private struct FixedProcessor: UserInputProcessor {
+    func prepare(input: UserInput) throws -> LMInput { LMInput(tokens: MLXArray([Int32(1)])) }
+}
+
+@Suite("MTP generate reads the prompt first")
+struct MTPGenerateReadsPromptTests {
+    /// Reading the prompt tail out of its `MLXArray` after the iterator is built waits
+    /// for the prefill it queued, so the reasoning scanner's seed is read first.
+    @Test("the MTP generate overload decodes the prompt before the first forward pass")
+    func readsPromptBeforePrefill() async throws {
+        let main = MockMainModel(nextLogitTokens: [0, 0, 7, 7, 7, 7, 9])
+        let probe = TargetProbe(target: main)
+        let context = ModelContext(
+            configuration: ModelConfiguration(
+                id: "mtp", eosTokenIds: [9], reasoningConfig: .alwaysOnThinking),
+            model: main, processor: FixedProcessor(), tokenizer: ProbeTokenizer(probe: probe))
+
+        let stream = try generate(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            parameters: GenerateParameters(maxTokens: 4, temperature: 0), context: context,
+            mtpDrafter: MockDrafter(draftedTokenValue: 7), blockSize: 4)
+        for await _ in stream {}
+
+        #expect(probe.forwardCountsAtDecode.first == 0)
+        #expect(main.callCount > 0)
+    }
+}
+
+@Suite("MTP prefill reporting")
+struct MTPPrefillReportingTests {
+    @Test("the main cache's prefix is reported once")
+    func reusedPrefix() throws {
+        let main = MockMainModel(nextLogitTokens: [0, 0, 7])
+        let drafter = MockDrafter(draftedTokenValue: 7)
+        let log = PrefixLog()
+        var parameters = GenerateParameters(maxTokens: 1)
+        parameters.prefill = PrefillParameters(prefix: { log.positions.append($0) })
+        let warmCache = KVCacheSimple()
+        warmCache.offset = 2
+
+        _ = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: main,
+            drafter: drafter,
+            mainCache: [warmCache],
+            parameters: parameters,
+            blockSize: 4)
+
+        #expect(log.positions == [2])
     }
 }
 
