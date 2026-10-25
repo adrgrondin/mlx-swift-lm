@@ -25,7 +25,7 @@ import Testing
 @Suite(.serialized)
 struct Gemma4MobileIntegrationTests {
 
-    private func tinyConfigJSON() -> String {
+    private func tinyConfigJSON(aligned: Bool = false) -> String {
         """
         {
           "model_type": "gemma4",
@@ -47,27 +47,27 @@ struct Gemma4MobileIntegrationTests {
           },
           "text_config": {
             "model_type": "gemma4_text",
-            "hidden_size": 16,
-            "num_hidden_layers": 2,
-            "intermediate_size": 32,
+            "hidden_size": \(aligned ? 128 : 16),
+            "num_hidden_layers": \(aligned ? 4 : 2),
+            "intermediate_size": \(aligned ? 256 : 32),
             "num_attention_heads": 1,
-            "head_dim": 16,
-            "global_head_dim": 16,
+            "head_dim": \(aligned ? 128 : 16),
+            "global_head_dim": \(aligned ? 128 : 16),
             "global_partial_rotary_factor": 0.25,
             "rms_norm_eps": 0.000001,
             "vocab_size": 32,
             "vocab_size_per_layer_input": 32,
             "num_key_value_heads": 1,
             "num_global_key_value_heads": 1,
-            "num_kv_shared_layers": 0,
-            "hidden_size_per_layer_input": 8,
+            "num_kv_shared_layers": \(aligned ? 2 : 0),
+            "hidden_size_per_layer_input": \(aligned ? 128 : 8),
             "sliding_window": 8,
             "sliding_window_pattern": 2,
             "max_position_embeddings": 64,
             "attention_k_eq_v": false,
             "final_logit_softcapping": 30.0,
             "use_double_wide_mlp": false,
-            "layer_types": ["sliding_attention", "full_attention"],
+            "layer_types": \(aligned ? "[\"sliding_attention\", \"full_attention\", \"sliding_attention\", \"full_attention\"]" : "[\"sliding_attention\", \"full_attention\"]"),
             "tie_word_embeddings": false
           }
         }
@@ -178,6 +178,120 @@ struct Gemma4MobileIntegrationTests {
         #expect(logits.shape == [1, 3, config.textConfig.vocabSize])
         let values = logits.asType(.float32).asArray(Float.self)
         #expect(values.allSatisfy { $0.isFinite }, "logits must be finite, got \(values)")
+    }
+
+    @Test(
+        "Native mobile Gemma shares compressed KV after weight freeing",
+        arguments: ["affine", "turbo", "variance"])
+    func nativeCompressedSharedKV(kind: String) throws {
+        try withAlignedMobileModels { native, reference in
+            func makeCache(_ model: Gemma4Model) throws -> [KVCache] {
+                var cache = try model.newCache(parameters: nil)
+                switch kind {
+                case "affine": cache[1] = QuantizedKVCache(groupSize: 64, bits: 4)
+                case "turbo": cache[1] = TurboQuantKVCache(bits: 4)
+                default: cache[1] = VarianceNormalizedKVCache(tileSize: 32)
+                }
+                return cache
+            }
+            let nativeCache = try makeCache(native)
+            let referenceCache = try makeCache(reference)
+            for tokens in [[Int32(1), 2, 3], [4], [5, 6]] {
+                let input = MLXArray(tokens).reshaped([1, tokens.count])
+                let actual = mobileLogits(native, input: input, cache: nativeCache, compiled: true)
+                let expected = mobileLogits(
+                    reference, input: input, cache: referenceCache, compiled: false)
+                #expect(actual.shape == [1, tokens.count, native.vocabularySize])
+                #expect(abs(actual - expected).max().item(Float.self) < 1e-3)
+            }
+            #expect(nativeCache.allSatisfy { $0.offset == 6 })
+            if let turbo = nativeCache[1] as? TurboQuantKVCache {
+                #expect(turbo.isCompressed)
+            }
+        }
+    }
+
+    @Test("Native mobile Gemma rebuilds projections after parameter and module updates")
+    func nativeProjectionUpdates() throws {
+        try withAlignedMobileModels { native, reference in
+            let input = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+            var previous = mobileLogits(native, input: input, compiled: true)
+            let paths = [
+                ("self_attn.v_proj", UInt8(0x99)),
+                ("mlp.down_proj", UInt8(0x88)),
+            ]
+            let layer = native.languageModel.model.layers[0]
+            for (path, byte) in paths {
+                let leaves = Dictionary(uniqueKeysWithValues: layer.leafModules().flattened())
+                let projection = try #require(leaves[path] as? GemmaQuantizedLinear)
+                let replacement = MLXArray.full(
+                    [projection.shape.0, projection.inputDims / 2], values: MLXArray(byte))
+                // Updating a leaf must also refresh its decoder's cached/fused arguments.
+                try projection.update(
+                    parameters: ModuleParameters.unflattened([("weight", replacement)]),
+                    verify: [.noUnusedKeys, .shapeMismatch])
+                try reference.update(
+                    parameters: ModuleParameters.unflattened([
+                        ("language_model.model.layers.0.\(path).weight", replacement)
+                    ]), verify: [.noUnusedKeys, .shapeMismatch])
+                let actual = mobileLogits(native, input: input, compiled: true)
+                let expected = mobileLogits(reference, input: input, compiled: false)
+                #expect(abs(actual - expected).max().item(Float.self) < 1e-3)
+                #expect(abs(actual - previous).max().item(Float.self) > 1e-4)
+                previous = actual
+            }
+
+            // Replacing one module disables the native segment; the remaining
+            // projections must still work without their freed mobile buffers.
+            let replacement = MLXArray.zeros([128, 128])
+            try layer.update(
+                modules: ModuleChildren.unflattened([
+                    ("per_layer_projection", Linear(weight: replacement) as Module)
+                ]), verify: .all)
+            try reference.languageModel.model.layers[0].update(
+                modules: ModuleChildren.unflattened([
+                    ("per_layer_projection", Linear(weight: replacement) as Module)
+                ]), verify: .all)
+            let actual = mobileLogits(native, input: input, compiled: true)
+            let expected = mobileLogits(reference, input: input, compiled: false)
+            #expect(abs(actual - expected).max().item(Float.self) < 1e-3)
+        }
+    }
+
+    private func mobileLogits(
+        _ model: Gemma4Model, input: MLXArray, cache: [KVCache]? = nil, compiled: Bool
+    ) -> MLXArray {
+        Gemma4TextModel.useNativeCompiledPath = compiled
+        let logits = model(input, cache: cache)
+        eval(logits)
+        return logits
+    }
+
+    private func withAlignedMobileModels(
+        _ body: (Gemma4Model, Gemma4Model) throws -> Void
+    ) throws {
+        let oldPrecompile = Gemma4TextModel.precompileAtLoad
+        let oldCompiled = Gemma4TextModel.useNativeCompiledPath
+        defer {
+            Gemma4TextModel.precompileAtLoad = oldPrecompile
+            Gemma4TextModel.useNativeCompiledPath = oldCompiled
+        }
+        let data = Data(tinyConfigJSON(aligned: true).utf8)
+        let decoder = JSONDecoder()
+        decoder.userInfo[.rawConfigData] = data
+        let config = try decoder.decode(Gemma4Configuration.self, from: data)
+        let native = Gemma4Model(config)
+        let arrays = makeMobileCheckpoint(
+            model: native, quantizationConfig: config.quantizationConfig!, numLayers: 4)
+        let directory = try writeCheckpoint(arrays)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        Gemma4TextModel.useNativeCompiledPath = true
+        Gemma4TextModel.precompileAtLoad = true
+        try loadWeights(modelDirectory: directory, model: native)
+        let reference = Gemma4Model(config)
+        Gemma4TextModel.precompileAtLoad = false
+        try loadWeights(modelDirectory: directory, model: reference)
+        try body(native, reference)
     }
 
     // MARK: - Synthetic checkpoint
