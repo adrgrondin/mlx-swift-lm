@@ -282,6 +282,67 @@ struct Gemma4MobileQuantizationTests {
         #expect(values[outputDims * 2] == 5.0)
     }
 
+    @Test(
+        "Converted mobile linears observe partial parameter updates", arguments: [2, 4, 8],
+        [false, true])
+    func convertedLinearParameterUpdates(bits: Int, freeWeights: Bool) throws {
+        let width = 512
+        let rows = 4
+        let linear = GemmaQuantizedLinear(inputDims: width, outputDims: rows, numBits: bits)
+        func weights(positive: Bool) -> MLXArray {
+            if bits == 8 {
+                return MLXArray(
+                    [Int8](repeating: positive ? 1 : -1, count: rows * width), [rows, width])
+            }
+            let byte: UInt8 = bits == 2 ? (positive ? 0xff : 0x55) : (positive ? 0x99 : 0x77)
+            return MLXArray(
+                [UInt8](repeating: byte, count: rows * width * bits / 8),
+                [rows, width * bits / 8])
+        }
+        func expectOutput(_ expected: Float) {
+            for batch in [1, 17] {
+                let x = MLXArray.full([batch, width], values: MLXArray(Float(1.25) / Float(width)))
+                let output = linear(x)
+                eval(output)
+                #expect(output.shape == [batch, rows])
+                #expect(abs(output - expected).max().item(Float.self) < 1e-5)
+            }
+        }
+        try linear.update(
+            parameters: ModuleParameters.unflattened([("weight", weights(positive: false))]),
+            verify: [.noUnusedKeys, .shapeMismatch])
+        expectOutput(-1.25)
+        if freeWeights { linear.freeMobileWeights() }
+        expectOutput(-1.25)
+
+        try linear.update(
+            parameters: ModuleParameters.unflattened([("weight", weights(positive: true))]),
+            verify: [.noUnusedKeys, .shapeMismatch])
+        expectOutput(1.25)
+        if freeWeights { linear.freeMobileWeights() }
+        try linear.update(
+            parameters: ModuleParameters.unflattened([
+                ("weight_scale", MLXArray.full([rows, 1], values: MLXArray(Float(2))))
+            ]), verify: [.noUnusedKeys, .shapeMismatch])
+        expectOutput(2.5)
+        if freeWeights { linear.freeMobileWeights() }
+        try linear.update(
+            parameters: ModuleParameters.unflattened([
+                ("input_activation_scale", MLXArray(Float(1) / Float(width))),
+                ("output_activation_scale", MLXArray(Float(0.3))),
+            ]), verify: [.noUnusedKeys, .shapeMismatch])
+        expectOutput(2.1)
+
+        if freeWeights { linear.freeMobileWeights() }
+        #expect(throws: (any Error).self) {
+            try linear.update(
+                parameters: ModuleParameters.unflattened([
+                    ("weight", weights(positive: false)), ("unknown", MLXArray(Float(0))),
+                ]), verify: [.noUnusedKeys, .shapeMismatch])
+        }
+        expectOutput(-2.1)
+    }
+
     // MARK: - Per-layer bit resolution
 
     /// The E2B mobile `module_quant_configs` schema (regex patterns in the

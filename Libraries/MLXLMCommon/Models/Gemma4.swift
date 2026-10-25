@@ -18,12 +18,49 @@ public enum Gemma4SharedKVState {
         mode: QuantizationMode
     )
 
+    /// Cache-owned attention storage shared with later decoder layers.
+    case native(cache: KVCache, sequenceLength: Int)
+
+    package static func update(keys: MLXArray, values: MLXArray, cache: KVCache?) -> Self {
+        switch AttentionKVState.update(keys: keys, values: values, cache: cache) {
+        case .regular(let keys, let values):
+            return .regular(keys: keys, values: values)
+        case .quantized(let keys, let values, let groupSize, let bits, let mode):
+            return .quantized(
+                keys: keys, values: values, groupSize: groupSize, bits: bits, mode: mode)
+        case .native(let cache, let sequenceLength):
+            return .native(cache: cache, sequenceLength: sequenceLength)
+        }
+    }
+
+    package func attend(
+        queries: MLXArray, scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        let state: AttentionKVState
+        switch self {
+        case .regular(let keys, let values):
+            state = .regular(keys: keys, values: values)
+        case .quantized(let keys, let values, let groupSize, let bits, let mode):
+            state = .quantized(
+                keys: keys, values: values, groupSize: groupSize, bits: bits, mode: mode)
+        case .native(let cache, let sequenceLength):
+            guard let cache = cache as? any SharedAttentionKVCache else {
+                preconditionFailure("Gemma shared KV requires cache-native attention support")
+            }
+            state = .native(cache: cache, sequenceLength: sequenceLength)
+        }
+        return state.attend(queries: queries, scale: scale, mask: mask)
+    }
+
     public var sequenceLength: Int {
         switch self {
         case .regular(let keys, _):
             keys.dim(2)
         case .quantized(let keys, _, _, _, _):
             keys.0.dim(-2)
+        case .native(_, let sequenceLength):
+            sequenceLength
         }
     }
 }
