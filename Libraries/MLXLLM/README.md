@@ -64,6 +64,7 @@ Currently supported model types are:
 - GLM4MOE
 - AceReason
 - NemotronH
+- LFM3 ([usage and checkpoint details](../../README.md#liquidai-lfm3))
 
 See [llm-tool](../../Tools/llm-tool)
 

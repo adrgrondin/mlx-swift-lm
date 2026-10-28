@@ -9,14 +9,13 @@
 // gate per attention head, partial RoPE on full-attention layers, and an
 // optional RMSNorm on each block output ("sandwich norm").
 //
-// The configuration and backbone live here so that MLXLLM's `LFM3Model` and a future
-// MLXVLM wrapper share one implementation.
+// The text and vision-language models share this configuration and backbone.
 
 import Foundation
 import MLX
 import MLXNN
 
-public struct LFM3Configuration: Codable, Sendable {
+public struct LFM3Configuration: Codable, Sendable, ModelConfigurationValidating {
     public enum LayerType: String, Codable, Sendable {
         case conv
         case fullAttention = "full_attention"
@@ -103,6 +102,13 @@ public struct LFM3Configuration: Codable, Sendable {
         self.hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
         self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
         self.kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+        guard hiddenSize > 0, hiddenLayers > 0, attentionHeads > 0,
+            kvHeads > 0, attentionHeads % kvHeads == 0
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .attentionHeads, in: container,
+                debugDescription: "LFM3 dimensions and attention heads must be positive and compatible")
+        }
         self.headDim =
             try container.decodeIfPresent(Int.self, forKey: .headDim)
             ?? hiddenSize / attentionHeads
@@ -155,6 +161,27 @@ public struct LFM3Configuration: Codable, Sendable {
                 throw DecodingError.dataCorruptedError(
                     forKey: .ropeParameters, in: container,
                     debugDescription: "Unsupported LFM3 rope_type '\(rope.ropeType)'")
+            }
+        }
+        try validateModelConfiguration()
+    }
+
+    public func validateModelConfiguration() throws {
+        guard hiddenSize > 0, intermediateSize > 0, vocabularySize > 0,
+            hiddenLayers > 0, layerTypes.count == hiddenLayers,
+            attentionHeads > 0, kvHeads > 0, attentionHeads % kvHeads == 0,
+            headDim > 0, headDim % 2 == 0, convLCache > 1, slidingWindow > 0,
+            normEps.isFinite, normEps > 0
+        else {
+            throw ModelFactoryError.invalidConfiguration("Invalid LFM3 dimensions, cache, or norm")
+        }
+        for type in Set(layerTypes) where type != .conv {
+            guard let rope = ropeParameters[type.rawValue], rope.ropeType == "default",
+                rope.ropeTheta.isFinite, rope.ropeTheta > 0,
+                rope.partialRotaryFactor.isFinite, rope.partialRotaryFactor > 0,
+                rope.partialRotaryFactor <= 1
+            else {
+                throw ModelFactoryError.invalidConfiguration("Invalid LFM3 RoPE for \(type.rawValue)")
             }
         }
     }
