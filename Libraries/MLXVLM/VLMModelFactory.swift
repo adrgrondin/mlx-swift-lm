@@ -113,6 +113,7 @@ public enum VLMTypeRegistry {
         "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
         "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
+        "lfm3_vl": create(LFM3VLConfiguration.self, LFM3VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
@@ -157,6 +158,8 @@ public enum VLMProcessorTypeRegistry {
             Mistral3VLMProcessorConfiguration.self, Mistral3VLMProcessor.init),
         "Lfm2VlProcessor": create(
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
+        "Lfm3VlProcessor": create(
+            LFM3VLProcessorConfiguration.self, LFM3VLProcessor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "MuseGlimmerProcessor": create(
@@ -207,6 +210,11 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     static public let smolvlminstruct4bit = ModelConfiguration(
         id: "mlx-community/SmolVLM-Instruct-4bit",
         defaultPrompt: "Describe the image in English"
+    )
+
+    static public let lfm3_vl_2b_4bit = ModelConfiguration(
+        id: "LiquidAI/LFM3-VL-2B-MLX-4bit",
+        defaultPrompt: "Describe the image."
     )
 
     static public let lfm2_5_vl_1_6B_4bit = ModelConfiguration(
@@ -335,6 +343,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3_8_27B_4bit,
             qwen3_8_27B_8bit,
             museGlimmer30B4bit,
+            lfm3_vl_2b_4bit,
         ]
     }
 
