@@ -105,6 +105,67 @@ print(try await session.respond(to: "How about a great place to eat?"))
 
 For alternative integration approaches (custom downloaders, alternative tokenizer packages, local-only weights), see the [using documentation](Libraries/MLXLMCommon/Documentation.docc/using.md).
 
+## LiquidAI LFM3
+
+`MLXLLM` supports `LiquidAI/LFM3-1.7B` (`lfm3`), and `MLXVLM` supports
+`LiquidAI/LFM3-VL-2B` (`lfm3_vl`) with text, multiple images, and video.
+Both original BF16 safetensors and the official `-MLX-4bit` checkpoints use the
+same Swift implementations; no Python code is executed. Keep the VL checkpoint's
+nested `processor_config.json` alongside its weights and tokenizer files.
+LiquidAI d1 decision checkpoints are rejected: their shared model type does not
+imply causal chat support.
+
+```swift
+let model = try await LLMModelFactory.shared.loadContainer(
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
+    configuration: LLMRegistry.lfm3_1_7b_4bit
+)
+let session = ChatSession(model)
+print(try await session.respond(to: "What is the capital of France?"))
+```
+
+For vision, import `MLXVLM`, use `VLMModelFactory.shared` with
+`VLMRegistry.lfm3_vl_2b_4bit`, and pass images or videos to `ChatSession.respond`.
+Media prefill accepts one prompt at a time. The language backbone, hybrid cache,
+and XML tool-call format are shared with the text model.
+
+Thinking is enabled by the checkpoint template by default. Set
+`additionalContext: ["enable_thinking": false]` on the session to disable it;
+`preserve_thinking` can retain reasoning from earlier turns. If generation reaches
+its token limit during thinking, the partial text remains reasoning in saved
+history rather than becoming a final answer. No model-specific hard thinking-budget
+transition or speculative-decoding support is declared.
+Sampling parameters from model metadata are not applied automatically.
+
+LFM3 image processing uses the checkpoint's pixel budget, not Qwen's default
+vision-token cap. Pass `processing: .init()` to avoid `ChatSession`'s default
+512-pixel best-fit resize, or set explicit `minPixels` / `maxPixels` overrides
+for your memory budget. Video uses a clip-wide pixel budget; its default sampling
+is 2 fps, at least 4 and at most 768 frames, limited by the source frame count.
+An explicit `processing.video` frame count or FPS replaces the default request,
+subject to the model's frame limit. Odd sampled counts are preserved and the last
+frame is repeated only when forming temporal patches.
+
+Video assets are sampled by source-frame index rather than duration endpoints.
+Decoded `VideoFrame` inputs must have finite, increasing timestamps; these are
+preserved in prompts and their average spacing determines the sampling FPS.
+Asset prompts use frame-index/FPS timestamps, following the released processor.
+The official VL quantization uses 4-bit language projections, an 8-bit tied
+embedding, and BF16 vision/projector weights; it is not an all-4-bit model.
+Long context and high-resolution media require additional activation and cache
+memory beyond the weight size.
+
+Opt-in real-checkpoint tests live in `LFM3IntegrationTests`. Run them with:
+
+```sh
+TEST_RUNNER_MLX_RUN_LFM3_INTEGRATION=1 xcodebuild test \
+  -project IntegrationTesting/IntegrationTesting.xcodeproj \
+  -scheme IntegrationTesting -destination 'platform=macOS' \
+  -skipPackagePluginValidation \
+  -only-testing:IntegrationTestingTests/LFM3IntegrationTests
+```
+
 ## Prism runtime compatibility
 
 This branch uses Prism's [`sync/upstream-0.32.3`](https://github.com/PrismML-Eng/mlx-swift/tree/sync/upstream-0.32.3)

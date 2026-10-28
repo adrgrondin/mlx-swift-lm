@@ -83,6 +83,7 @@ Currently supported model types are:
 - gemma3
 - smolvlm
 - muse_glimmer
+- lfm3_vl ([image/video processing and usage](../../README.md#liquidai-lfm3))
 
 See [llm-tool](../../Tools/llm-tool)
 
