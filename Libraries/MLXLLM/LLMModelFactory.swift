@@ -476,11 +476,6 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Why is the sky blue?"
     )
 
-    static public let lfm3_1_7b_4bit = ModelConfiguration(
-        id: "LiquidAI/LFM3-1.7B-MLX-4bit",
-        defaultPrompt: "Why is the sky blue?"
-    )
-
     static public let lfm2_1_2b_4bit = ModelConfiguration(
         id: "mlx-community/LFM2-1.2B-4bit",
         defaultPrompt: "Why is the sky blue?",

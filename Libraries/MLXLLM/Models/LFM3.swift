@@ -8,3 +8,5 @@ public final class LFM3Model: LFM3LanguageModel, LLMModel {
         LFM3MessageGenerator()
     }
 }
+
+extension LFM3Model: HiddenStateLanguageModel {}

@@ -286,11 +286,12 @@ final class PrismHadamardTests: XCTestCase {
                 perLayerQuantization: base.perLayerQuantization)
             try loadWeights(
                 modelDirectory: directory, model: vlm,
-                perLayerQuantization: base.perLayerQuantization)
+                perLayerQuantization: base.perLayerQuantization,
+                componentLoading: .immediate)
         }
         let reference = MLXLLM.Qwen35Model(
             try JSONDecoder().decode(MLXLLM.Qwen35Configuration.self, from: data))
-        var denseWeights = llm.sanitize(weights: weights)
+        var denseWeights = try llm.sanitize(weights: weights)
         let metadata = try JSONDecoder().decode(
             MLXLMCommon.PrismHadamardConfiguration.self, from: data)
         for record in metadata.modules {
@@ -355,29 +356,36 @@ final class PrismHadamardTests: XCTestCase {
 
     func testVisionPackProcessesAnImageAndContinuesWithText() throws {
         let data = try configuration(block: 1024)
-        let model = try MLXVLM.PrismHadamardQwen35(configuration: data)
-        try withCheckpoint(checkpoint(configuration: data)) {
-            try loadWeights(modelDirectory: $0, model: model)
+        for loading in [ComponentLoading.immediate, .onFirstUse] {
+            let model = try MLXVLM.PrismHadamardQwen35(configuration: data)
+            try withCheckpoint(checkpoint(configuration: data)) { directory in
+                try loadWeights(
+                    modelDirectory: directory, model: model, componentLoading: loading)
+                let cache = try model.newCache(parameters: nil)
+                let input = LMInput(
+                    text: .init(tokens: MLXArray([1, 13, 15, 15, 15, 15, 2]).reshaped(1, 7)),
+                    image: .init(pixels: MLXArray.ones([4, 3 * 2 * 2]), frames: [THW(1, 2, 2)]))
+                let prepared = try model.prepare(input, cache: cache, state: nil, prefill: .init())
+                guard case .logits(let output) = prepared else {
+                    return XCTFail("expected vision logits")
+                }
+                XCTAssertTrue(isFinite(output.logits).all().item(Bool.self))
+                XCTAssertEqual(output.logits.dim(-1), 16)
+                let continued = model(
+                    .init(tokens: MLXArray([3]).reshaped(1, 1)), cache: cache, state: output.state)
+                XCTAssertTrue(isFinite(continued.logits).all().item(Bool.self))
+                XCTAssertEqual(continued.logits.shape, [1, 1, 16])
+                let fullInput = LMInput(
+                    text: .init(tokens: MLXArray([1, 13, 15, 15, 15, 15, 2, 3]).reshaped(1, 8)),
+                    image: input.image)
+                let full = try model.prepare(
+                    fullInput, cache: model.newCache(parameters: nil), state: nil, prefill: .init())
+                guard case .logits(let fullOutput) = full else {
+                    return XCTFail("expected vision logits")
+                }
+                assertClose(continued.logits[0, -1], fullOutput.logits[0, -1], tolerance: 0.02)
+            }
         }
-        let cache = try model.newCache(parameters: nil)
-        let input = LMInput(
-            text: .init(tokens: MLXArray([1, 13, 15, 15, 15, 15, 2]).reshaped(1, 7)),
-            image: .init(pixels: MLXArray.ones([4, 3 * 2 * 2]), frames: [THW(1, 2, 2)]))
-        let prepared = try model.prepare(input, cache: cache, state: nil, prefill: .init())
-        guard case .logits(let output) = prepared else { return XCTFail("expected vision logits") }
-        XCTAssertTrue(isFinite(output.logits).all().item(Bool.self))
-        XCTAssertEqual(output.logits.dim(-1), 16)
-        let continued = model(
-            .init(tokens: MLXArray([3]).reshaped(1, 1)), cache: cache, state: output.state)
-        XCTAssertTrue(isFinite(continued.logits).all().item(Bool.self))
-        XCTAssertEqual(continued.logits.shape, [1, 1, 16])
-        let fullInput = LMInput(
-            text: .init(tokens: MLXArray([1, 13, 15, 15, 15, 15, 2, 3]).reshaped(1, 8)),
-            image: input.image)
-        let full = try model.prepare(
-            fullInput, cache: model.newCache(parameters: nil), state: nil, prefill: .init())
-        guard case .logits(let fullOutput) = full else { return XCTFail("expected vision logits") }
-        assertClose(continued.logits[0, -1], fullOutput.logits[0, -1], tolerance: 0.02)
     }
 
     func testSchemaOneTextPackLoadsWithoutVision() throws {

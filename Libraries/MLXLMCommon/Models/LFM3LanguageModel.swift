@@ -5,7 +5,7 @@ import MLX
 import MLXNN
 
 /// The shared causal language head over the LFM3 backbone, used by text and vision models.
-open class LFM3LanguageModel: Module, LanguageModel, LoRAModel, KVCacheDimensionProvider {
+open class LFM3LanguageModel: Module, LoRAModel, KVCacheDimensionProvider {
     public let model: LFM3ModelInner
     public let configuration: LFM3Configuration
     @ModuleInfo(key: "lm_head") package var lmHead: Linear?
@@ -60,21 +60,11 @@ open class LFM3LanguageModel: Module, LanguageModel, LoRAModel, KVCacheDimension
             }
             if processed > 0 { eval(cache) }
             let output = logits(
-                embeddings: embeddings[0..., processed..., 0...], cache: cache.isEmpty ? nil : cache)
+                embeddings: embeddings[0..., processed..., 0...], cache: cache.isEmpty ? nil : cache
+            )
             prefill.progress?(total, total)
             return LMOutput(logits: output)
         }
-    }
-
-    public func prepare(
-        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
-    ) throws -> PrepareResult {
-        let tokens = input.text.tokens.ndim == 1
-            ? input.text.tokens.expandedDimensions(axis: 0) : input.text.tokens
-        return .logits(
-            try self.prefill(
-                embeddings: embed(tokens), lengths: input.text.sequenceLengths, cache: cache,
-                prefill: prefill))
     }
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
@@ -99,7 +89,7 @@ open class LFM3LanguageModel: Module, LanguageModel, LoRAModel, KVCacheDimension
     }
 }
 
-extension LFM3LanguageModel: HiddenStateLanguageModel {
+extension LFM3LanguageModel {
     package func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         model(inputs, cache: cache)
     }

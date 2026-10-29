@@ -5,9 +5,7 @@ import MLX
 import MLXLMCommon
 
 /// Text inference for Bonsai 2, including language weights from vision-capable packs.
-final class PrismHadamardQwen35: Qwen35Model, ModelWeightValidating, ModelWeightFiltering {
-    var excludedWeightPrefixes: [String] { ["vision_tower."] }
-
+final class PrismHadamardQwen35: Qwen35Model {
     private let packedConfiguration: PrismHadamardConfiguration
 
     init(configuration data: Data) throws {
@@ -18,15 +16,23 @@ final class PrismHadamardQwen35: Qwen35Model, ModelWeightValidating, ModelWeight
         try packedConfiguration.install(in: self)
     }
 
-    override func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+    private var checkpointMapping: CheckpointNameMapping {
         if packedConfiguration.schemaVersion == 1 {
-            return Dictionary(
-                uniqueKeysWithValues: weights.map { ("language_model." + $0.key, $0.value) })
+            return .init([.replacePrefix("", with: "language_model")])
         }
-        // Packed tensors and norms are already in MLX layout; do not shift or transpose them.
-        return weights.filter { name, _ in
-            !excludedWeightPrefixes.contains { name.hasPrefix($0) }
-        }
+        let visionNamespaces = (modelComponents[.vision] ?? []).flatMap(\.namespaces)
+        return .init((excludedCheckpointNamespaces + visionNamespaces).map { .excludePrefix($0) })
+    }
+
+    override func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        let checkpoint = try checkpoint.mapNames(using: checkpointMapping)
+        try validate(weights: checkpoint.weights)
+        return checkpoint
+    }
+
+    override func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        // Packed tensors and norms already use MLX layout.
+        try ModelCheckpoint(weights: weights).mapNames(using: checkpointMapping).weights
     }
 
     func validate(weights: [String: MLXArray]) throws {

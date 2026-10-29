@@ -194,7 +194,7 @@ final class LFM3VisionLayer: Module {
             _attention.wrappedValue = LFM3VisionAttention(c)
         }
         _feedForward.wrappedValue = LFM3MLP(
-            hiddenSize: c.hiddenSize, intermediateSize: c.intermediateSize)
+            dim: c.hiddenSize, hiddenDim: c.intermediateSize)
         _operatorNorm.wrappedValue = RMSNorm(dimensions: c.hiddenSize, eps: c.normEps)
         _ffnNorm.wrappedValue = RMSNorm(dimensions: c.hiddenSize, eps: c.normEps)
     }

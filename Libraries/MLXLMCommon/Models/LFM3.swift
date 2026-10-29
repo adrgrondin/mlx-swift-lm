@@ -107,7 +107,8 @@ public struct LFM3Configuration: Codable, Sendable, ModelConfigurationValidating
         else {
             throw DecodingError.dataCorruptedError(
                 forKey: .attentionHeads, in: container,
-                debugDescription: "LFM3 dimensions and attention heads must be positive and compatible")
+                debugDescription:
+                    "LFM3 dimensions and attention heads must be positive and compatible")
         }
         self.headDim =
             try container.decodeIfPresent(Int.self, forKey: .headDim)
@@ -181,7 +182,8 @@ public struct LFM3Configuration: Codable, Sendable, ModelConfigurationValidating
                 rope.partialRotaryFactor.isFinite, rope.partialRotaryFactor > 0,
                 rope.partialRotaryFactor <= 1
             else {
-                throw ModelFactoryError.invalidConfiguration("Invalid LFM3 RoPE for \(type.rawValue)")
+                throw ModelFactoryError.invalidConfiguration(
+                    "Invalid LFM3 RoPE for \(type.rawValue)")
             }
         }
     }
@@ -290,16 +292,26 @@ class LFM3ShortConv: Module {
     }
 
     func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
-        let BCx = inProj(x).split(parts: 3, axis: -1)
+        let mask = cache?.makeMask(N: x.dim(1))?.expandedDimensions(axis: -1)
+        let input = mask.map { MLX.where($0, x, zeros(like: x)) } ?? x
+        let BCx = inProj(input).split(parts: 3, axis: -1)
         let (B, C) = (BCx[0], BCx[1])
         var Bx = B * BCx[2]
+        if let mask { Bx = MLX.where(mask, Bx, zeros(like: Bx)) }
 
         // The cache holds the last `lCache - 1` inputs, so the conv needs no padding.
         let state =
             cache?[0] ?? MLXArray.zeros([Bx.dim(0), lCache - 1, hiddenSize], dtype: Bx.dtype)
         Bx = concatenated([state, Bx], axis: -2)
         if let cache {
-            cache[0] = contiguous(Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...])
+            if let lengths = cache.currentLengths {
+                let ends = clip(lengths, min: 0, max: x.dim(1)).asType(.int32)
+                let indices = (ends[0..., .newAxis] + MLXArray(0 ..< (lCache - 1)))[
+                    0..., 0..., .newAxis]
+                cache[0] = contiguous(takeAlong(Bx, indices, axis: 1))
+            } else {
+                cache[0] = contiguous(Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...])
+            }
             cache.advance(x.dim(1))
         }
 
@@ -307,18 +319,18 @@ class LFM3ShortConv: Module {
     }
 }
 
-class LFM3MLP: Module, UnaryLayer {
+package class LFM3MLP: Module, UnaryLayer {
     @ModuleInfo(key: "w1") var w1: Linear
     @ModuleInfo(key: "w2") var w2: Linear
     @ModuleInfo(key: "w3") var w3: Linear
 
-    init(dim: Int, hiddenDim: Int) {
+    package init(dim: Int, hiddenDim: Int) {
         _w1.wrappedValue = Linear(dim, hiddenDim, bias: false)
         _w2.wrappedValue = Linear(hiddenDim, dim, bias: false)
         _w3.wrappedValue = Linear(dim, hiddenDim, bias: false)
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    package func callAsFunction(_ x: MLXArray) -> MLXArray {
         w2(silu(w1(x)) * w3(x))
     }
 }
