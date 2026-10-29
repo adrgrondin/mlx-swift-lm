@@ -153,14 +153,11 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 /// Each work item lazily opens its file, evaluates only its assigned tensors (forcing that
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
 /// header cannot be parsed is loaded whole by one work item, which is exactly the serial
-/// loader's behavior for that file. Excluded prefixes are filtered before evaluating arrays,
-/// including on the whole-file fallback path. File headers and metadata are still read.
-func loadWeightArrays(urls: [URL], excludingPrefixes: [String] = []) throws -> (
+/// loader's behavior for that file.
+func loadWeightArrays(urls: [URL]) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
-    let checkpoint = try loadModelCheckpoint(urls: urls) { name in
-        !excludingPrefixes.contains { name.hasPrefix($0) }
-    }
+    let checkpoint = try loadModelCheckpoint(urls: urls)
     return (checkpoint.weights, checkpoint.metadata)
 }
 
@@ -427,16 +424,10 @@ public func loadWeights(
             of: model, urls: weightURLs, excluded: excludedComponents,
             loading: componentLoading, perLayerQuantization: perLayerQuantization)
         + model.excludedCheckpointNamespaces
-    let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
-    let excludedPrefixes = (model as? any ModelWeightFiltering)?.excludedWeightPrefixes ?? []
-    var checkpoint = try loadModelCheckpoint(urls: weightURLs) { name in
-        exclusions.mapName(name) != nil && !excludedPrefixes.contains { name.hasPrefix($0) }
-    }
+    var checkpoint = try loadModelCheckpoint(
+        urls: weightURLs, excludedNamespaces: excludedNamespaces)
     checkpoint.perLayerQuantization = perLayerQuantization
     checkpoint = try model.prepareCheckpoint(checkpoint)
-    if let validating = model as? any ModelWeightValidating {
-        try validating.validate(weights: checkpoint.weights)
-    }
     try applyCheckpoint(checkpoint, to: model)
 
     // Build derived inference-only state and realize the model while the loader

@@ -166,17 +166,15 @@ TEST_RUNNER_MLX_RUN_LFM3_INTEGRATION=1 xcodebuild test \
   -only-testing:IntegrationTestingTests/LFM3IntegrationTests
 ```
 
-## Prism runtime compatibility
+## Bonsai runtime compatibility
 
-This branch uses Prism's [`sync/upstream-0.32.3`](https://github.com/PrismML-Eng/mlx-swift/tree/sync/upstream-0.32.3)
-runtime to retain 1-bit Bonsai support while picking up the newer MLX Swift APIs and kernels.
-The model-level Gemma mobile packing, Bonsai checkpoint validation, and text-only vision
-exclusion remain in this package. The newer runtime's shared/fused Hadamard layers are not
-automatically substituted for our checkpoint-compatible layers.
-
-This runtime includes [upstream's 0.32.3 logger fix](https://github.com/ml-explore/mlx-swift/commit/19601207e9a0de51e03ee6ec0c3c5f3784275075),
-addressing the known logging crash on iOS/macOS versions before 26.4 while retaining Prism's
-low-bit kernels. Builds and tests on OS 27 do not replace runtime testing on older devices.
+This branch uses [`adrgrondin/mlx-swift`, branch `bionic/0.33.0-bonsai`](https://github.com/adrgrondin/mlx-swift/tree/bionic/0.33.0-bonsai),
+based on upstream 0.33.0. Upstream now includes 1-bit affine quantization; the fork fixes
+Metal NAX JIT compilation for split-head attention at dimensions 256 and 512.
+The model-level Gemma mobile packing, Bonsai transforms, checkpoint validation, and
+text-only vision exclusion remain in this package. Bonsai uses upstream's checkpoint
+preparation and namespace-exclusion APIs without applying ordinary Qwen weight transforms.
+Builds and tests on OS 27 do not replace runtime testing on older devices.
 
 ## Gemma 4 mobile inference
 
@@ -207,7 +205,9 @@ Use `VLMModelFactory` for text and images, or `LLMModelFactory` for text-only in
 The text-only loader does not create a vision tower and skips its tensor data before loading
 weights into memory; checkpoint headers are still read and validated, and downloads are
 unchanged. Corrupt or truncated excluded tensors can therefore still fail loading.
-`VLMModelFactory` still loads both towers, even for text-only prompts.
+`VLMModelFactory` retains vision support and follows upstream's component-loading policy:
+the vision tower loads on first image use by default, or immediately with
+`componentLoading: .immediate`.
 No Python runtime is imported or executed.
 
 The Swift loader implements the model pack's

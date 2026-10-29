@@ -5,7 +5,7 @@ import MLX
 import MLXLMCommon
 
 /// Bonsai 2's packed language model with the unrotated Qwen3.5 vision tower.
-final class PrismHadamardQwen35: Qwen35, ModelWeightValidating {
+final class PrismHadamardQwen35: Qwen35 {
     private let packedConfiguration: PrismHadamardConfiguration
 
     init(configuration data: Data) throws {
@@ -18,6 +18,17 @@ final class PrismHadamardQwen35: Qwen35, ModelWeightValidating {
         let configuration = try decoder.decode(Qwen35Configuration.self, from: data)
         super.init(configuration)
         try packedConfiguration.install(in: self)
+    }
+
+    override func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        // Deferred vision loads use this hook with only the unrotated vision tensors.
+        let visionOnly =
+            !checkpoint.weights.isEmpty
+            && checkpoint.weights.keys.allSatisfy { $0.hasPrefix("vision_tower.") }
+        if !visionOnly {
+            try validate(weights: checkpoint.weights)
+        }
+        return checkpoint
     }
 
     override func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

@@ -322,8 +322,9 @@ final class LoadWeightsTests: XCTestCase {
 
         Memory.peakMemory = 0
         let baseline = Memory.activeMemory
-        let (weights, metadata) = try loadWeightArrays(
-            urls: [url], excludingPrefixes: ["vision_tower."])
+        let checkpoint = try loadModelCheckpoint(
+            urls: [url], excludedNamespaces: ["vision_tower"])
+        let (weights, metadata) = (checkpoint.weights, checkpoint.metadata)
         XCTAssertEqual(Set(weights.keys), ["language_model.weight", "vision_tower_extra.weight"])
         XCTAssertEqual(weights["language_model.weight"]?.asArray(Float.self), [1])
         XCTAssertEqual(weights["vision_tower_extra.weight"]?.asArray(Float.self), [2])
@@ -365,7 +366,7 @@ final class LoadWeightsTests: XCTestCase {
             try data.write(to: url)
 
             XCTAssertThrowsError(
-                try loadWeightArrays(urls: [url], excludingPrefixes: ["vision_tower."]))
+                try loadModelCheckpoint(urls: [url], excludedNamespaces: ["vision_tower"]))
         }
     }
 
@@ -382,13 +383,15 @@ final class LoadWeightsTests: XCTestCase {
             arrays: ["language_model.weight": MLXArray.zeros([4])],
             metadata: ["format": "pt"], url: textURL)
 
-        let (empty, metadata) = try loadWeightArrays(
-            urls: [visionURL], excludingPrefixes: ["vision_tower."])
+        let emptyCheckpoint = try loadModelCheckpoint(
+            urls: [visionURL], excludedNamespaces: ["vision_tower"])
+        let (empty, metadata) = (emptyCheckpoint.weights, emptyCheckpoint.metadata)
         XCTAssertTrue(empty.isEmpty)
         XCTAssertEqual(metadata, ["format": "mlx"])
 
-        let (weights, firstMetadata) = try loadWeightArrays(
-            urls: [visionURL, textURL], excludingPrefixes: ["vision_tower."])
+        let checkpoint = try loadModelCheckpoint(
+            urls: [visionURL, textURL], excludedNamespaces: ["vision_tower"])
+        let (weights, firstMetadata) = (checkpoint.weights, checkpoint.metadata)
         XCTAssertEqual(Set(weights.keys), ["language_model.weight"])
         XCTAssertEqual(firstMetadata, ["format": "mlx"])
     }

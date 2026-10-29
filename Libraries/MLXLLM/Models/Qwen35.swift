@@ -1290,6 +1290,7 @@ extension Qwen35TextModel: SpeculativeCacheRewindModel {
 public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
+    public var excludedCheckpointNamespaces: [String] { [] }
 
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
 
