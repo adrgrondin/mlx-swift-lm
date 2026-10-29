@@ -70,19 +70,6 @@ private final class FailingInferenceStateModel: Module, LanguageModel,
     }
 }
 
-/// A model whose `sanitize` raises an MLX error and passes on the failed result.
-private final class MLXErrorSanitizingModel: Module, BaseLanguageModel {
-    @ModuleInfo(key: "layer") var layer = Linear(2, 2, bias: false)
-
-    func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws
-        -> [String: MLXArray]
-    {
-        var weights = weights
-        weights["layer.weight"] = weights["layer.weight"]?.transposed(0, 2, 1)
-        return weights
-    }
-}
-
 private final class FusionLoadingModel: Module, LanguageModel, KVCacheDimensionProvider {
     enum Failure { case materialization, installation, rollback, ordinaryMaterialization }
     enum InstallationError: Error { case failed }
@@ -148,6 +135,19 @@ private final class FusionLoadingModel: Module, LanguageModel, KVCacheDimensionP
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         projections[0](inputs)
+    }
+}
+
+/// A model whose `sanitize` raises an MLX error and passes on the failed result.
+private final class MLXErrorSanitizingModel: Module, BaseLanguageModel {
+    @ModuleInfo(key: "layer") var layer = Linear(2, 2, bias: false)
+
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws
+        -> [String: MLXArray]
+    {
+        var weights = weights
+        weights["layer.weight"] = weights["layer.weight"]?.transposed(0, 2, 1)
+        return weights
     }
 }
 
@@ -322,8 +322,9 @@ final class LoadWeightsTests: XCTestCase {
 
         Memory.peakMemory = 0
         let baseline = Memory.activeMemory
-        let (weights, metadata) = try loadWeightArrays(
-            urls: [url], excludingPrefixes: ["vision_tower."])
+        let checkpoint = try loadModelCheckpoint(
+            urls: [url], excludedNamespaces: ["vision_tower"])
+        let (weights, metadata) = (checkpoint.weights, checkpoint.metadata)
         XCTAssertEqual(Set(weights.keys), ["language_model.weight", "vision_tower_extra.weight"])
         XCTAssertEqual(weights["language_model.weight"]?.asArray(Float.self), [1])
         XCTAssertEqual(weights["vision_tower_extra.weight"]?.asArray(Float.self), [2])
@@ -365,7 +366,7 @@ final class LoadWeightsTests: XCTestCase {
             try data.write(to: url)
 
             XCTAssertThrowsError(
-                try loadWeightArrays(urls: [url], excludingPrefixes: ["vision_tower."]))
+                try loadModelCheckpoint(urls: [url], excludedNamespaces: ["vision_tower"]))
         }
     }
 
@@ -382,13 +383,15 @@ final class LoadWeightsTests: XCTestCase {
             arrays: ["language_model.weight": MLXArray.zeros([4])],
             metadata: ["format": "pt"], url: textURL)
 
-        let (empty, metadata) = try loadWeightArrays(
-            urls: [visionURL], excludingPrefixes: ["vision_tower."])
+        let emptyCheckpoint = try loadModelCheckpoint(
+            urls: [visionURL], excludedNamespaces: ["vision_tower"])
+        let (empty, metadata) = (emptyCheckpoint.weights, emptyCheckpoint.metadata)
         XCTAssertTrue(empty.isEmpty)
         XCTAssertEqual(metadata, ["format": "mlx"])
 
-        let (weights, firstMetadata) = try loadWeightArrays(
-            urls: [visionURL, textURL], excludingPrefixes: ["vision_tower."])
+        let checkpoint = try loadModelCheckpoint(
+            urls: [visionURL, textURL], excludedNamespaces: ["vision_tower"])
+        let (weights, firstMetadata) = (checkpoint.weights, checkpoint.metadata)
         XCTAssertEqual(Set(weights.keys), ["language_model.weight"])
         XCTAssertEqual(firstMetadata, ["format": "mlx"])
     }

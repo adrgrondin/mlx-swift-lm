@@ -230,7 +230,8 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
             try save(
                 arrays: parameters, metadata: ["format": "mlx"],
                 url: directory.appendingPathComponent("model.safetensors"))
-            try await loadWeights(modelDirectory: directory, model: model)
+            try await loadWeights(
+                modelDirectory: directory, model: model, componentLoading: .immediate)
             XCTAssertEqual(Set(model.parameters().flattened().map(\.0)), Set(parameters.keys))
         }
         XCTAssertTrue(textLayer.hasFusedInputProjection)

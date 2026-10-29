@@ -153,9 +153,8 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 /// Each work item lazily opens its file, evaluates only its assigned tensors (forcing that
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
 /// header cannot be parsed is loaded whole by one work item, which is exactly the serial
-/// loader's behavior for that file. Excluded prefixes are filtered before evaluating arrays,
-/// including on the whole-file fallback path. File headers and metadata are still read.
-func loadWeightArrays(urls: [URL], excludingPrefixes: [String] = []) throws -> (
+/// loader's behavior for that file.
+func loadWeightArrays(urls: [URL]) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
     let checkpoint = try loadModelCheckpoint(urls: urls)
@@ -237,12 +236,10 @@ func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bo
                     selected = all.filter { isRead($0.key) }
                 }
 
-
                 // force this range's I/O here, on this stream, in file-offset order
                 if !selected.isEmpty { eval(Array(selected.values)) }
                 state.merge(file: item.file, weights: selected, metadata: metadata)
             }
-
         } catch {
             state.record(error: error)
         }
@@ -432,34 +429,6 @@ public func loadWeights(
     checkpoint.perLayerQuantization = perLayerQuantization
     checkpoint = try model.prepareCheckpoint(checkpoint)
     try applyCheckpoint(checkpoint, to: model)
-
-<<<<<<< HEAD
-=======
-    // per-model cleanup (models can inspect metadata to customize behavior)
-    weights = try withError { model.sanitize(weights: weights, metadata: metadata) }
-    if let validating = model as? any ModelWeightValidating {
-        try validating.validate(weights: weights)
-    }
-
-    // quantize if needed
-    if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
-                } else {
-                    return quantization?.asTuple
-                }
-            } else {
-                return nil
-            }
-        }
-    }
-
-    // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
->>>>>>> e2856f0 (Fix recoverable Qwen fusion preparation failures)
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
