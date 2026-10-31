@@ -343,14 +343,17 @@ public class GatedDeltaTests: XCTestCase {
     /// from the custom kernel, which keeps `g` in float32 (ml-explore/mlx#4725).
     func testGatedDeltaFastPathKeepsDecayNearOneInFloat32() throws {
         let inputs = makeQwen35Inputs(T: 256, decay: 0.999)
-
+        // With no key/value updates, only decay changes the carried state.
+        // This isolates gate precision from chunked matrix-product rounding.
+        let k = MLXArray.zeros(like: inputs.k)
+        let v = MLXArray.zeros(like: inputs.v)
+        let initialState = MLXArray.ones([1, 32, 128, 128], dtype: .float32)
         let (_, stateFast) = gatedDeltaUpdate(
-            q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
-            aLog: inputs.aLog, dtBias: inputs.dtBias)
+            q: inputs.q, k: k, v: v, a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias, state: initialState)
         let (_, stateKernel) = gatedDeltaUpdate(
-            q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
-            aLog: inputs.aLog, dtBias: inputs.dtBias, mask: keepAll(inputs))
-
+            q: inputs.q, k: k, v: v, a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias, state: initialState, mask: keepAll(inputs))
         XCTAssertLessThan(
             relativeDrift(stateFast, stateKernel), 1e-3,
             "A decay of 0.999 was rounded to 1 before the MLXFast kernel."
