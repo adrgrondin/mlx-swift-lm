@@ -23,23 +23,29 @@ func lfm3TestConfig(
 final class LFM3ExtensionTests: XCTestCase {
     func testTextPreparationUsesTokenPrefill() throws {
         try Device.withDefaultDevice(.cpu) {
-            let model = LFM3Model(try lfm3TestConfig())
-            eval(model)
-            let tokens = MLXArray(Array(1 ... 9))
-            let expected = model(tokens[.newAxis, .ellipsis], cache: nil)[0..., -1, 0...]
-            for stepSize in [32, 3] {
-                let cache = try model.newCache(parameters: nil)
-                let prepared = try model.prepare(
-                    LMInput(tokens: tokens), cache: cache, state: nil,
-                    prefill: .init(stepSize: stepSize))
-                guard case .tokens(let remaining) = prepared else {
-                    return XCTFail("text preparation should leave token ids for the iterator")
+            let configuration = try lfm3TestConfig()
+            let models: [any LanguageModel] = [
+                LFM3LanguageModel(configuration), LFM3Model(configuration),
+            ]
+            for model in models {
+                eval(model)
+                let tokens = MLXArray(Array(1 ... 9))
+                let expected = model(tokens[.newAxis, .ellipsis], cache: nil)[0..., -1, 0...]
+                for stepSize in [32, 3] {
+                    let cache = try model.newCache(parameters: nil)
+                    let prepared = try model.prepare(
+                        LMInput(tokens: tokens), cache: cache, state: nil,
+                        prefill: .init(stepSize: stepSize))
+                    guard case .tokens(let remaining) = prepared else {
+                        return XCTFail("text preparation should leave token ids for the iterator")
+                    }
+                    XCTAssertEqual(remaining.tokens.size, stepSize == 32 ? 9 : 1)
+                    let output = model.nextTokenLogits(
+                        .init(tokens: remaining.tokens[.newAxis, .ellipsis]), cache: cache,
+                        state: nil)
+                    XCTAssertLessThan(
+                        abs(output.logits[0..., -1, 0...] - expected).max().item(Float.self), 1e-4)
                 }
-                XCTAssertEqual(remaining.tokens.size, stepSize == 32 ? 9 : 1)
-                let output = model.nextTokenLogits(
-                    .init(tokens: remaining.tokens[.newAxis, .ellipsis]), cache: cache, state: nil)
-                XCTAssertLessThan(
-                    abs(output.logits[0..., -1, 0...] - expected).max().item(Float.self), 1e-4)
             }
         }
     }

@@ -27,38 +27,7 @@ extension LLMModel {
     ) throws
         -> PrepareResult
     {
-        let stepSize = prefill.resolvedStepSize()
-        let y = input.text
-        let total = y.tokens.size
-
-        // A prompt that fits in one chunk is handed to the iterator whole,
-        // keeping short prompts bitwise-identical to the pre-chunking path.
-        // `.unchunked` (forEachChunk processes nothing) takes the same route
-        // at any prompt length.
-        guard total > stepSize else { return .tokens(y) }
-
-        var processed = 0
-        try withPreparedCache(cache, lengths: y.sequenceLengths) {
-            // asyncEval lets the CPU build chunk N+1's graph while the GPU evaluates
-            // chunk N. Under .remainder the reserved tail is the legacy leftover
-            // (up to a full step) rather than a single token.
-            var state: LMOutput.State? = state
-            processed = try prefill.forEachChunk(
-                total: total, reserving: prefill.chunking == .remainder ? stepSize : 1
-            ) { range in
-                let input = y[.newAxis, range]
-                let output = self(input, cache: cache.isEmpty ? nil : cache, state: state)
-                state = output.state
-                asyncEval(cache)
-            }
-
-            // Single sync after the loop to flush any remaining async work.
-            if processed > 0 {
-                eval(cache)
-            }
-        }
-
-        return .tokens(y[processed...])
+        try prepareTextInput(input, cache: cache, state: state, prefill: prefill)
     }
 
     public func messageGenerator(tokenizer: Tokenizer) -> MessageGenerator {

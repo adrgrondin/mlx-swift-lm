@@ -132,6 +132,8 @@ including its attention, RoPE, hybrid caches, and quantized vocabulary projectio
 Both wrappers share the language head. Text retains upstream token prefill; vision uses
 chunked embedding prefill. Padding-aware convolution state and reasoning-history
 formatting are preserved; there is no separate vision-language decoder.
+The shared `LFM3LanguageModel` retains the public `LanguageModel` API, including
+checkpoint loading and text preparation.
 
 Thinking is enabled by the checkpoint template by default. Set
 `additionalContext: ["enable_thinking": false]` on the session to disable it;

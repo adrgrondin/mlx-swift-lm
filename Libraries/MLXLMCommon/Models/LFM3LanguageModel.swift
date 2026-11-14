@@ -4,8 +4,8 @@ import Foundation
 import MLX
 import MLXNN
 
-/// The shared causal language head over the LFM3 backbone, used by text and vision models.
-open class LFM3LanguageModel: Module, LoRAModel, KVCacheDimensionProvider {
+/// The shared causal language model over the LFM3 backbone, also used by vision models.
+open class LFM3LanguageModel: Module, LanguageModel, LoRAModel, KVCacheDimensionProvider {
     public let model: LFM3ModelInner
     public let configuration: LFM3Configuration
     @ModuleInfo(key: "lm_head") package var lmHead: Linear?
@@ -67,6 +67,12 @@ open class LFM3LanguageModel: Module, LoRAModel, KVCacheDimensionProvider {
         }
     }
 
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        try prepareTextInput(input, cache: cache, state: state, prefill: prefill)
+    }
+
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         try model.newCache(parameters: parameters)
     }
@@ -89,7 +95,7 @@ open class LFM3LanguageModel: Module, LoRAModel, KVCacheDimensionProvider {
     }
 }
 
-extension LFM3LanguageModel {
+extension LFM3LanguageModel: HiddenStateLanguageModel {
     package func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         model(inputs, cache: cache)
     }

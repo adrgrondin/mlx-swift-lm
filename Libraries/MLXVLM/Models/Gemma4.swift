@@ -631,10 +631,13 @@ final class Gemma4TextAttention: Module {
     @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale?
     @ModuleInfo var rope: OffsetLayer
 
-    // Fused q/k/v validation state. The kernel reads the three original packed
-    // projections directly, so no concatenated weight cache is retained.
-    private var _fusedQKVReady = false
-    private var _fusedQKVDisabled = false
+    // Cache scale compatibility without retaining replaced projection weights.
+    private struct FusedQKVSource {
+        weak var linear: GemmaQuantizedLinear?
+        let version: Int
+    }
+    private var _fusedQKVSources: [FusedQKVSource] = []
+    private var _fusedQKVScalesMatch = false
 
     init(config: Gemma4TextConfiguration, layerIdx: Int, kvSharedOnly: Bool = false) {
         self.config = config
@@ -699,19 +702,24 @@ final class Gemma4TextAttention: Module {
         q: GemmaQuantizedLinear, k: GemmaQuantizedLinear, v: GemmaQuantizedLinear,
         x: MLXArray
     ) -> MLXArray? {
-        if _fusedQKVDisabled { return nil }
         let batchSize = x.shape.dropLast().reduce(1, *)
-        guard q.canUseQMV(batchSize: batchSize) else { return nil }
+        let projections = [q, k, v]
+        guard projections.allSatisfy({ $0.canUseQMV(batchSize: batchSize) }) else { return nil }
         guard q.numBits == k.numBits && q.numBits == v.numBits else { return nil }
         guard q.inputDims == k.inputDims && q.inputDims == v.inputDims else { return nil }
 
-        if !_fusedQKVReady {
-            guard gemmaQKVInputScalesMatch(q, k, v) else {
-                _fusedQKVDisabled = true
-                return nil
+        let current =
+            _fusedQKVSources.count == projections.count
+            && zip(projections, _fusedQKVSources).allSatisfy { projection, source in
+                source.linear === projection && source.version == projection.parameterVersion
             }
-            _fusedQKVReady = true
+        if !current {
+            _fusedQKVScalesMatch = gemmaQKVInputScalesMatch(q, k, v)
+            _fusedQKVSources = projections.map {
+                FusedQKVSource(linear: $0, version: $0.parameterVersion)
+            }
         }
+        guard _fusedQKVScalesMatch else { return nil }
 
         return gemmaFusedQKVMatmul(x: x, q: q, k: k, v: v)
     }

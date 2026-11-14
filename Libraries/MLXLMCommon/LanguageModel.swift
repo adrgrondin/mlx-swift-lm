@@ -410,6 +410,31 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 }
 
 extension LanguageModel {
+    /// Prefill text tokens into the cache, leaving the tail for the token iterator.
+    package func prepareTextInput(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let stepSize = prefill.resolvedStepSize()
+        let y = input.text
+        let total = y.tokens.size
+        guard total > stepSize else { return .tokens(y) }
+
+        var processed = 0
+        try withPreparedCache(cache, lengths: y.sequenceLengths) {
+            var state = state
+            processed = try prefill.forEachChunk(
+                total: total, reserving: prefill.chunking == .remainder ? stepSize : 1
+            ) { range in
+                let input = y[.newAxis, range]
+                let output = self(input, cache: cache.isEmpty ? nil : cache, state: state)
+                state = output.state
+                asyncEval(cache)
+            }
+            if processed > 0 { eval(cache) }
+        }
+        return .tokens(y[processed...])
+    }
+
     public func nextTokenLogits(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
