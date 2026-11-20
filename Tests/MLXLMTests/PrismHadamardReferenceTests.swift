@@ -71,7 +71,7 @@ final class PrismHadamardReferenceTests: XCTestCase {
                 }
                 let configData = try JSONSerialization.data(withJSONObject: config)
                 var models: [any LanguageModel] = [
-                    try MLXLLM.PrismHadamardQwen35(configuration: configData)
+                    try MLXLLM.PrismHadamardQwen35Model(configuration: configData)
                 ]
                 if schema == 2 {
                     models.append(try MLXVLM.PrismHadamardQwen35(configuration: configData))

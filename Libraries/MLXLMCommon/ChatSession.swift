@@ -215,6 +215,51 @@ public final class ChatSession {
         /// only an exact token match can reuse it.
         var transcriptBuiltCache = true
 
+        /// Prefixes of `cachedTokens` and the prefill state that represents them, kept for a
+        /// later prompt that rewrites what followed and diverges past where a trim reaches.
+        var checkpoints = Checkpoints()
+
+        struct Checkpoint {
+            let tokens: [Int]
+            let prefill: PrefillCheckpoint
+        }
+
+        /// The two places a later prompt rewrites from.
+        struct Checkpoints {
+            /// Before the reply to the last user message. A template that drops past reasoning
+            /// rewrites from here on the next user turn.
+            var turn: Checkpoint?
+            /// Before the latest reply to tool results. A template can render that reply's call
+            /// differently from how the model wrote it, so the next tool step rewrites from here.
+            var step: Checkpoint?
+
+            var all: [Checkpoint] { [turn, step].compactMap { $0 } }
+
+            /// The longest checkpoint that `tokens` starts with.
+            func longest(prefixing tokens: [Int]) -> Checkpoint? {
+                all.filter { tokens.starts(with: $0.tokens) }.max {
+                    $0.tokens.count < $1.tokens.count
+                }
+            }
+
+            /// Drops each checkpoint that `tokens` no longer starts with.
+            mutating func keep(prefixing tokens: [Int]) {
+                if let turn, !tokens.starts(with: turn.tokens) { self.turn = nil }
+                if let step, !tokens.starts(with: step.tokens) { self.step = nil }
+            }
+
+            /// Records `checkpoint` before the reply to a `role` message. A user turn starts
+            /// over, so it also drops the step checkpoint of the turn before it.
+            mutating func record(_ checkpoint: Checkpoint, answering role: Chat.Message.Role) {
+                if role == .tool {
+                    step = checkpoint
+                } else {
+                    turn = checkpoint
+                    step = nil
+                }
+            }
+        }
+
         @discardableResult
         mutating func record(
             _ assistant: AssistantGeneration,
@@ -228,6 +273,7 @@ public final class ChatSession {
                 // the ledger and rebuild from the retained messages.
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+                checkpoints = .init()
                 return false
             }
 
@@ -246,6 +292,7 @@ public final class ChatSession {
                 // un-emitted lookahead).
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+                checkpoints = .init()
             }
 
             // A turn that produced only reasoning appends an empty assistant message.
@@ -277,8 +324,9 @@ public final class ChatSession {
         /// for an empty generation and rolled back along with the user's message.
         var producedReasoning = false
 
-        /// Reasoning the model finished: an answer or a tool call followed it.
-        /// Recorded beside the message for templates that replay it.
+        /// Reasoning the model finished: an answer or a tool call followed it, or the
+        /// step ended at a safe point. Recorded beside the message for templates that
+        /// replay it.
         var finishedReasoning = ""
 
         /// Reasoning with nothing after it yet. A turn that ends here was cut off
@@ -293,7 +341,11 @@ public final class ChatSession {
         }
 
         mutating func consume(_ item: Generation) {
-            if item.chunk != nil || item.toolCall != nil {
+            // A step that ends at a safe point stops where its cache does, so its thought is
+            // complete as far as the cache goes. Recording it lets the next step continue.
+            if item.chunk != nil || item.toolCall != nil
+                || item.info?.stopReason.isSafePoint == true
+            {
                 finishedReasoning += openReasoning
                 openReasoning = ""
             }
@@ -462,7 +514,15 @@ public final class ChatSession {
                 cache: stored.main.cache,
                 plan: stored.main.plan,
                 phase: .realized,
-                processedTokenCount: stored.main.processedTokenCount)
+                processedTokenCount: stored.main.processedTokenCount,
+                checkpoint: stored.conversation.flatMap { conversation in
+                    let checkpoints = conversation.checkpoints.all
+                    return checkpoints.map(\.prefill.cache.processedTokenCount).max().map {
+                        .init(
+                            tokens: $0,
+                            memory: checkpoints.map(\.prefill.cache.retainedBytes).reduce(0, +))
+                    }
+                })
         }) {
             return realized
         }
@@ -772,7 +832,7 @@ public final class ChatSession {
     /// > transcript, so this initializer uses fragment-based continuation. A later
     /// > image-bearing turn continues warm from the cached prefix rather than rebuilding and
     /// > re-rendering earlier messages. Positions stay correct, but the prompt differs — and on
-    /// > vision encoders that attend across image boundaries (Qwen2-VL today) so do the new
+    /// > vision encoders that attend across image boundaries so do the new
     /// > image's features, since it is encoded alone rather than beside the cached one.
     /// > Use a history initializer when later turns must re-render the full conversation.
     public convenience init(
@@ -1092,6 +1152,27 @@ public final class ChatSession {
         try steeringRequests.steer(text, policy: policy, response: response)
     }
 
+    /// End a running response at its next safe point and keep what it generated.
+    ///
+    /// Cancelling the stream's consumer rolls the turn back: the prompt and the
+    /// partial reply leave the transcript, and the next call prefills the whole
+    /// conversation again. An interrupted response instead records the reply up to
+    /// that point, so the next call continues the same cache. Its stream finishes
+    /// normally, and the step it ends reports ``GenerateStopReason/interrupted``.
+    ///
+    /// The response stops as a steered step does, inside a thought too. With
+    /// `toolDispatch`, calls the model already made run first, and the step that
+    /// answers their results stops at its first safe point. Instructions the
+    /// response has not applied are reported as ``SteeringEvent/failed(_:)``.
+    ///
+    /// - Parameter response: the response to interrupt. The default targets the
+    ///   response ``steer(_:policy:response:)`` would target.
+    /// - Throws: ``SteeringError/noActiveResponse`` or ``SteeringError/responseEnded``
+    ///   when no response is running.
+    public func interrupt(response: ResponseID? = nil) throws {
+        try steeringRequests.interrupt(response)
+    }
+
     /// Produces a streaming response to a prompt by transforming the
     /// raw `Generation` values.
     ///
@@ -1233,6 +1314,7 @@ public final class ChatSession {
                             // rather than silently continuing with the old cache policy.
                             restored.cachedTokens.removeAll()
                             restored.uncommittedTokens.removeAll()
+                            restored.checkpoints = .init()
                             kvCache = KVCacheStorage(
                                 try model.newCache(parameters: generateParameters),
                                 plan: kvCachePlan)
@@ -1365,6 +1447,10 @@ public final class ChatSession {
                             input: preparedInput, modelConfiguration: modelConfiguration,
                             tokenizer: tokenizer)
                         var prefilledReasoningStartDelimiter: String?
+                        // Where this turn's prefill pauses to checkpoint the cache, in `input`, and
+                        // the role of the message whose reply follows that checkpoint.
+                        var checkpointPosition: Int?
+                        var checkpointAnswers = Chat.Message.Role.user
                         pendingMessages.removeAll()
 
                         let speculativeMemoryEvaluation: SpeculativeDecodingMemoryEvaluation?
@@ -1490,13 +1576,16 @@ public final class ChatSession {
                                 structuredToolCallCount: structuredToolCallCount,
                                 usesSpeculativeDecoding: speculationIsEligibleForParameters,
                                 canSplitPreparedMedia: model is PreparedInputSplitting)
+                            let checkpoint = currentConversation.checkpoints.longest(
+                                prefixing: promptTokenIds)
                             let cacheState = PromptCacheState(
                                 cachedTokens: cachedTokenIds,
                                 processedTokenCount: kvCache.processedTokenCount,
                                 mainCacheIsAligned: mainCacheIsAligned,
                                 speculativeReuseCapability: speculativeReuseCapability,
                                 maxTrimCount: (kvCache.cache + (draftKVCache?.cache ?? []))
-                                    .map(\.maxTrimCount).min() ?? 0)
+                                    .map(\.maxTrimCount).min() ?? 0,
+                                checkpointLength: checkpoint?.tokens.count)
 
                             var decision = promptCachePolicy.decide(
                                 turn: turn, cache: cacheState)
@@ -1510,12 +1599,11 @@ public final class ChatSession {
                                 decision = .rebuild
                             }
 
-                            // Rewinding is the one decision that can fail while being
-                            // applied: a cache may trim fewer tokens than requested.
+                            // Rewinding can fail while being applied: a cache may trim
+                            // fewer tokens than requested, or refuse a checkpoint.
                             // Verify and downgrade to a rebuild before prefilling.
-                            if case .trimToCommonPrefix(let commonPrefixLength, let trimCount) =
-                                decision
-                            {
+                            switch decision {
+                            case .trimToCommonPrefix(let commonPrefixLength, let trimCount):
                                 let mainTrimmed = kvCache.trim(trimCount)
                                 let draftTrimmed = draftKVCache.map { $0.trim(trimCount) }
                                 let mainTrimIsAligned =
@@ -1526,26 +1614,33 @@ public final class ChatSession {
                                         draftTrimmed == trimCount
                                             && draftCache.processedTokenCount == commonPrefixLength
                                     } ?? true
-
                                 if !(mainTrimIsAligned && draftTrimIsAligned) {
                                     decision = .rebuild
-                                } else if !currentConversation.transcriptBuiltCache {
-                                    // A fork shares its source's arrays. A copy keeps only
-                                    // the prefix, so the next write does not copy the rest.
-                                    kvCache = kvCache.copy()
-                                    draftKVCache = draftKVCache?.copy()
                                 }
-                            } else if case .trimToCommonPrefixMainOnly(
-                                let commonPrefixLength, let trimCount) = decision
-                            {
+                            case .trimToCommonPrefixMainOnly(let commonPrefixLength, let trimCount):
                                 let mainTrimmed = kvCache.trim(trimCount)
                                 if mainTrimmed != trimCount
                                     || kvCache.processedTokenCount != commonPrefixLength
                                 {
                                     decision = .rebuild
-                                } else if !currentConversation.transcriptBuiltCache {
-                                    kvCache = kvCache.copy()
                                 }
+                            case .restoreCheckpoint:
+                                if let checkpoint,
+                                    cachedTokenIds.starts(with: checkpoint.tokens),
+                                    kvCache.restore(checkpoint.prefill.cache)
+                                {
+                                    lmState = checkpoint.prefill.state
+                                } else {
+                                    decision = .rebuild
+                                }
+                            default:
+                                break
+                            }
+                            if decision.rewinds, !currentConversation.transcriptBuiltCache {
+                                // A fork shares its source's arrays. A copy keeps only
+                                // the prefix, so the next write does not copy the rest.
+                                kvCache = kvCache.copy()
+                                draftKVCache = draftKVCache?.copy()
                             }
 
                             // Splitting a prepared input is the other decision that
@@ -1598,11 +1693,11 @@ public final class ChatSession {
                                 }
                                 cachedPromptTokenCount = suffixStart
 
-                            case .trimToCommonPrefix(let commonPrefixLength, _):
+                            case .trimToCommonPrefix(let prefixLength, _),
+                                .restoreCheckpoint(let prefixLength):
                                 input = LMInput(
-                                    tokens: MLXArray(
-                                        Array(promptTokenIds.dropFirst(commonPrefixLength))))
-                                cachedPromptTokenCount = commonPrefixLength
+                                    tokens: MLXArray(Array(promptTokenIds.dropFirst(prefixLength))))
+                                cachedPromptTokenCount = prefixLength
 
                             case .trimToCommonPrefixMainOnly(let commonPrefixLength, _):
                                 input = LMInput(
@@ -1614,6 +1709,7 @@ public final class ChatSession {
                                 requiresMainOnlyContinuation = true
 
                             case .rebuild:
+                                currentConversation.checkpoints = .init()
                                 kvCache = KVCacheStorage(
                                     try model.newCache(parameters: generateParameters),
                                     plan: kvCachePlan)
@@ -1635,13 +1731,38 @@ public final class ChatSession {
                                 .appendSuffixToMain(_, let representedTokens),
                                 .appendMediaSuffix(_, let representedTokens):
                                 currentConversation.cachedTokens = representedTokens
-                            case .prefillAll, .trimToCommonPrefix,
-                                .trimToCommonPrefixMainOnly, .rebuild:
+                            case .prefillAll, .trimToCommonPrefix, .trimToCommonPrefixMainOnly,
+                                .restoreCheckpoint, .rebuild:
                                 currentConversation.cachedTokens = promptTokenIds
                             }
                             currentConversation.uncommittedTokens.removeAll()
                             currentConversation.transcriptBuiltCache = true
+                            currentConversation.checkpoints.keep(
+                                prefixing: currentConversation.cachedTokens)
                             conversation = currentConversation
+
+                            // A user turn keeps its checkpoint until a prompt rewrites the turn.
+                            // Every tool step moves the step checkpoint, because the next step
+                            // rewrites the call this one makes. Both sit before prefilled
+                            // reasoning and the final prompt token.
+                            if let answering = templateMessages.last?.role,
+                                answering == .tool
+                                    || (answering == .user
+                                        && (!decision.reusesCachedPrefix || decision.rewinds)),
+                                generateParameters.prefill.chunking == .balanced,
+                                !containsNewMedia, !carriesPreparedMedia, draftKVCache == nil,
+                                input.text.mask == nil,
+                                kvCache.needsCheckpoint
+                            {
+                                let prefilledReasoning = modelConfiguration.reasoningConfig?
+                                    .prefilledBlock(
+                                        endingPrompt: promptTokenIds, tokenizer: tokenizer)
+                                let heldBack = max(1, prefilledReasoning?.tokenCount ?? 0)
+                                if input.text.cacheSequenceLength >= heldBack {
+                                    checkpointPosition = input.text.cacheSequenceLength - heldBack
+                                    checkpointAnswers = answering
+                                }
+                            }
                         }
 
                         guard input.text.tokens.size > 0 else {
@@ -1674,7 +1795,7 @@ public final class ChatSession {
                                 modelConfiguration: modelConfiguration,
                                 tokenizer: tokenizer,
                                 iterator: iterator,
-                                steering: conversation == nil ? nil : steering,
+                                steering: steering,
                                 handler: transformer.makeHandler(wrapping: base))
                         }
 
@@ -1684,8 +1805,19 @@ public final class ChatSession {
                             let iterator = try TokenIterator(
                                 input: input, model: model, cacheStorage: kvCache,
                                 state: lmState,
-                                parameters: generateParameters, components: components)
+                                parameters: generateParameters, components: components,
+                                checkpointAt: checkpointPosition)
                             lmState = iterator.state
+                            if let prefill = iterator.prefillCheckpoint,
+                                let tokens = conversation?.cachedTokens
+                            {
+                                conversation?.checkpoints.record(
+                                    .init(
+                                        tokens: Array(
+                                            tokens.prefix(prefill.cache.processedTokenCount)),
+                                        prefill: prefill),
+                                    answering: checkpointAnswers)
+                            }
 
                             return startGeneration(iterator)
                         }
@@ -1716,7 +1848,18 @@ public final class ChatSession {
                             requiresMainOnlyContinuation = true
                         }
 
-                        if !speculationIsEligibleForParameters || requiresMainOnlyContinuation {
+                        if let diffusionModel = model as? any BlockDiffusionLanguageModel {
+                            guard speculativeDecoding == nil else {
+                                throw GenerateError.unsupportedSpeculativeDecoding(
+                                    String(describing: type(of: model)))
+                            }
+                            let iterator = try BlockDiffusionTokenIterator(
+                                input: input, model: diffusionModel, cacheStorage: kvCache,
+                                parameters: generateParameters, components: components)
+                            generation = startGeneration(iterator)
+                        } else if !speculationIsEligibleForParameters
+                            || requiresMainOnlyContinuation
+                        {
                             if speculativeDecoding != nil {
                                 if !speculationIsEligibleForParameters {
                                     speculativeDecodingFallbackReason = .unsupportedSampling
@@ -1779,6 +1922,12 @@ public final class ChatSession {
                                 let draftModel = await draftContainer.perform { context in
                                     SendableBox(context.model)
                                 }.consume()
+
+                                guard !draftModel.capabilities.contains(.blockDiffusion) else {
+                                    throw GenerateError.unsupportedSpeculativeDecoding(
+                                        String(describing: type(of: draftModel)))
+                                }
+
                                 let memoryEvaluation = speculativeDecoding.memoryPolicy?.evaluate(
                                     mainModel: model,
                                     draftModel: draftModel)
@@ -1972,6 +2121,7 @@ public final class ChatSession {
 
                         try Task.checkCancellation()
                         // Let the assistant answer tool results before adding a user turn.
+                        // An interrupted response takes no more instructions.
                         if !pendingMessages.contains(where: { $0.role == .tool }) {
                             applyingSteering = try steering.take(
                                 closeIfEmpty: pendingMessages.isEmpty)

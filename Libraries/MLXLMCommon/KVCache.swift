@@ -4,6 +4,12 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Materializes a bounded state view. A contiguous slice can still pin its source's allocation.
+func materializedCacheState(_ array: MLXArray) -> MLXArray {
+    let input = array.ndim == 0 ? array.reshaped(1) : array
+    return take(input, MLXArray(0 ..< input.dim(0)), axis: 0).reshaped(array.shape)
+}
+
 /// Offset to use with ``applyRotaryPosition(_:to:offset:)``.
 ///
 /// See ``KVCache/ropeOffset``.
@@ -61,6 +67,14 @@ public protocol KVCache: Evaluatable {
 
     /// get the current state for serialization
     var state: [MLXArray] { get set }
+
+    /// Read the live attention keys and values without updating the cache.
+    ///
+    /// Unlike ``KVCache/state``, which is an implementation-defined serialization
+    /// representation, this returns dense K/V in chronological order, trimmed
+    /// to the entries currently visible to attention. Caches that do not store
+    /// attention K/V return `nil`.
+    func currentKeyValues() -> (keys: MLXArray, values: MLXArray)?
 
     /// get/set metadata state as string array for serialization
     var metaState: [String] { get set }
@@ -144,6 +158,8 @@ extension KVCache {
     public func prepare(lengths: MLXArray?) {}
 
     public func finalize() {}
+
+    public func currentKeyValues() -> (keys: MLXArray, values: MLXArray)? { nil }
 }
 
 public func withPreparedCache<Result>(
@@ -268,6 +284,8 @@ open class BaseKVCache: KVCache {
             }
         }
     }
+
+    open func currentKeyValues() -> (keys: MLXArray, values: MLXArray)? { nil }
 
     open var metaState: [String] {
         get { [""] }
@@ -538,6 +556,15 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         }
     }
 
+    public override func currentKeyValues() -> (keys: MLXArray, values: MLXArray)? {
+        guard let keys, let values else { return nil }
+        let count = Swift.min(offset, keys.dim(2))
+        return (
+            keys[.ellipsis, ..<count, 0...],
+            values[.ellipsis, ..<count, 0...]
+        )
+    }
+
     public override var isTrimmable: Bool { true }
 
     @discardableResult
@@ -802,6 +829,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return (view(keys), view(values))
     }
 
+    public override func currentKeyValues() -> (keys: MLXArray, values: MLXArray)? {
+        logicalView(tail: .max)
+    }
+
     private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         if self.keys == nil {
             self.keys = keys
@@ -926,6 +957,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             // Note: RotatingKVCache doesn't set offset from keys like KVCache does
             // The offset is managed through meta_state
         }
+    }
+
+    var temporalState: [MLXArray] {
+        guard let keys = self.keys, let values = self.values else { return [] }
+        return [temporalOrder(keys), temporalOrder(values)]
     }
 
     public override var metaState: [String] {
@@ -1119,6 +1155,22 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
+    /// Excludes a multi-token prefill's temporary rows beyond the configured history.
+    package func copyForCheckpoint() -> any KVCache {
+        let new = copy() as! RotatingKVCache
+        if (keys?.dim(2) ?? 0) > storageCapacity,
+            let (keys, values) = retainedView(tail: storageCapacity)
+        {
+            new.keys = keys
+            new.values = values
+            new.idx = keys.dim(2)
+            new.wrappedFlag = false
+        }
+        new.keys = new.keys.map(materializedCacheState)
+        new.values = new.values.map(materializedCacheState)
+        return new
+    }
+
     /// Convert to a quantized cache.
     ///
     /// Rotating-cache quantization needs a representation that preserves temporal ordering and
@@ -1251,6 +1303,18 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         let trimmedValues = treeMap({ $0[.ellipsis, ..<offset, 0...] }, values)
 
         return (trimmedKeys, trimmedValues)
+    }
+
+    public override func currentKeyValues() -> (keys: MLXArray, values: MLXArray)? {
+        guard let (keys, values) = getQuantizedState() else { return nil }
+        return (
+            dequantized(
+                keys.0, scales: keys.1, biases: keys.2,
+                groupSize: groupSize, bits: bits, mode: mode),
+            dequantized(
+                values.0, scales: values.1, biases: values.2,
+                groupSize: groupSize, bits: bits, mode: mode)
+        )
     }
 
     /// Update cache and return quantized tuples (Python's update_and_fetch)
@@ -1543,6 +1607,15 @@ public class ChunkedKVCache: KVCacheSimple {
         return (self.keys![.ellipsis, ..<end, 0...], self.values![.ellipsis, ..<end, 0...])
     }
 
+    public override func currentKeyValues() -> (keys: MLXArray, values: MLXArray)? {
+        guard let keys, let values else { return nil }
+        let count = Swift.min(offset - startPosition, keys.dim(2))
+        return (
+            keys[.ellipsis, ..<count, 0...],
+            values[.ellipsis, ..<count, 0...]
+        )
+    }
+
     @discardableResult
     public override func trim(_ n: Int) -> Int {
         let trimmed = min(offset - startPosition, n)
@@ -1603,7 +1676,7 @@ public class ArraysCache: BaseKVCache {
     }
 
     public override func innerState() -> [MLXArray] {
-        cache.compactMap { $0 }
+        (cache + [leftPadding, lengths]).compactMap { $0 }
     }
 
     public subscript(index: Int) -> MLXArray? {
@@ -1631,6 +1704,14 @@ public class ArraysCache: BaseKVCache {
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         new.lengths = self.lengths
+    }
+
+    package func copyForCheckpoint() -> any KVCache {
+        let new = copy() as! ArraysCache
+        new.cache = cache.map { $0.map(materializedCacheState) }
+        new.leftPadding = leftPadding.map(materializedCacheState)
+        new.lengths = lengths.map(materializedCacheState)
+        return new
     }
 
     internal var batchSize: Int {
@@ -2059,15 +2140,17 @@ public class CacheList: BaseKVCache {
     /// Rewrite every non-composite child while preserving its stable tree path.
     func rewriteLeaves(
         path: [Int],
+        includingAuxiliary: Bool = false,
         using transform: (KVCacheLeaf) -> KVCache
     ) {
         caches = caches.enumerated().map { index, child in
             let childPath = path + [index]
             if let list = child as? CacheList {
-                list.rewriteLeaves(path: childPath, using: transform)
+                list.rewriteLeaves(
+                    path: childPath, includingAuxiliary: includingAuxiliary, using: transform)
                 return list
             }
-            if child is any AuxiliaryKVCache {
+            if !includingAuxiliary && child is any AuxiliaryKVCache {
                 return child
             }
             let leaf = KVCacheLeaf(path: childPath, cache: child)
@@ -2196,9 +2279,9 @@ struct KVCacheError: Error, LocalizedError {
 /// A snapshot does not carry the chat transcript. A `ChatSession` restored from one appends each
 /// new message rather than re-rendering the conversation, so a later image-bearing turn builds a
 /// different prompt than it would in a session that still holds its history. Positions stay
-/// correct either way. On vision encoders that attend across image boundaries (Qwen2-VL today)
-/// the new image's features differ too, since it is encoded alone rather than beside the cached
-/// one; Qwen2.5-VL, Qwen3-VL, and GLM-OCR isolate each image and are unaffected.
+/// correct either way. On vision encoders that attend across image boundaries the new image's
+/// features differ too, since it is encoded alone rather than beside the cached one; Qwen2-VL,
+/// Qwen2.5-VL, Qwen3-VL, and GLM-OCR isolate each image and are unaffected.
 ///
 /// The cache instances are mutable reference types. Transfer a snapshot to one session or copy the
 /// caches before constructing multiple sessions from it.

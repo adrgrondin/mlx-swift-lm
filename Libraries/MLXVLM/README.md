@@ -84,6 +84,28 @@ Currently supported model types are:
 - smolvlm
 - muse_glimmer
 - lfm3_vl ([image/video processing and usage](../../README.md#liquidai-lfm3))
+- diffusion_gemma
+
+## DiffusionGemma
+
+DiffusionGemma loads through `VLMModelFactory` and supports text, images, video
+frames, and Gemma 4 tool-call parsing. `ChatSession` and the `generate` APIs select
+block diffusion automatically. Audio and speculative decoding are unsupported.
+
+Set `GenerateParameters.diffusion` to control denoiser temperature, canvas size,
+and the entropy-bound or confidence-threshold sampler. `maxTokens` limits emitted
+tokens; `seed` also controls canvas initialization. Autoregressive sampling and
+penalty settings do not affect diffusion. A custom logit processor applies to
+every canvas position at each denoising step, as in Transformers. Its history
+holds the prompt and the emitted tokens, never provisional canvas tokens. A
+processor that steers one token at a time, such as a thinking budget, conforms
+to `SequentialLogitProcessor` and is skipped with a warning. Generation
+component validators still run before prefill.
+
+Checkpoint preparation maps text and vision tensors together with their file
+metadata and per-layer quantization settings. Conflicting aliases fail loading,
+and unknown tensors remain visible to strict parameter validation. Untied output
+projections require their own checkpoint weights.
 
 See [llm-tool](../../Tools/llm-tool)
 

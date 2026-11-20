@@ -70,7 +70,7 @@ See also [MLXLMCommon](Libraries/MLXLMCommon). The simplest way to get started i
 dependencies: [
     .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
     .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
-    .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+    .package(url: "https://github.com/huggingface/swift-transformers", from: "1.4.0"),
 ],
 targets: [
     .target(
@@ -109,6 +109,8 @@ For alternative integration approaches (custom downloaders, alternative tokenize
 
 `MLXLLM` supports `LiquidAI/LFM3-1.7B` (`lfm3`), and `MLXVLM` supports
 `LiquidAI/LFM3-VL-2B` (`lfm3_vl`) with text, multiple images, and video.
+Use `swift-transformers` 1.4.0 or later, or a compatible `TokenizerLoader` that
+honors BPE `ignore_merges` and splits regexes by Unicode code point.
 Both original BF16 safetensors and the official `-MLX-4bit` checkpoints use the
 same Swift implementations; no Python code is executed. Keep the VL checkpoint's
 nested `processor_config.json` alongside its weights and tokenizer files.

@@ -93,6 +93,10 @@ public final class LFM3VL: Module, VLMModel, KVCacheDimensionProvider {
         _projector.wrappedValue = LFM3MultiModalProjector(configuration)
     }
 
+    public func validate(tokenizer: any Tokenizer) throws {
+        try languageModel.validate(tokenizer: tokenizer)
+    }
+
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         try languageModel.newCache(parameters: parameters)
     }

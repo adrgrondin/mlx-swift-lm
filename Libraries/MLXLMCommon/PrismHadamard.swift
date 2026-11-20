@@ -43,6 +43,46 @@ package struct PrismHadamardConfiguration: Decodable {
         }
     }
 
+    private struct CheckpointFormat: Decodable {
+        let schemaVersion: Int?
+        let baseModelType: String?
+        let tensorNamespace: String?
+        let modules: [HadamardQuantizedModule]
+        let components: [String: Bool]?
+
+        enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case baseModelType = "base_model_type"
+            case tensorNamespace = "tensor_namespace"
+            case modules, components
+        }
+
+        var requiresLegacyLayout: Bool {
+            tensorNamespace == "mlx-lm-text" || schemaVersion == nil || baseModelType == nil
+                || modules.contains { $0.block == 0 }
+        }
+    }
+
+    package static func loadManifest(from data: Data, decoder: JSONDecoder) throws -> (
+        manifest: HadamardQuantizedManifest, legacy: Self?, hasVision: Bool?
+    ) {
+        let format = try decoder.decode(CheckpointFormat.self, from: data)
+        let legacy = format.requiresLegacyLayout ? try decoder.decode(Self.self, from: data) : nil
+        let manifest =
+            try legacy?.manifest ?? decoder.decode(HadamardQuantizedManifest.self, from: data)
+        return (manifest, legacy, format.components?["vision"])
+    }
+
+    package var manifest: HadamardQuantizedManifest {
+        .init(
+            baseModelType: "qwen3_5", tensorNamespace: "mlx-vlm-qwen3_5",
+            gdnActivationLayout: "grouped",
+            modules: modules.map {
+                .init(path: $0.path, block: $0.block, embedding: $0.embedding, dtype: $0.dtype)
+            },
+            quantization: .init(groupSize: 128, bits: 2))
+    }
+
     package let schemaVersion: Int
     package let modules: [Record]
     package let hasVision: Bool
@@ -113,19 +153,36 @@ package struct PrismHadamardConfiguration: Decodable {
                 throw PrismHadamardError.invalidCheckpoint(
                     "invalid transform dimensions at \(record.path)")
             }
-            let replacement: Module =
-                record.embedding
-                ? PrismHadamardEmbedding(rows: rows, width: width, block: record.block)
-                : PrismHadamardLinear(rows: rows, width: width, block: record.block)
+            let replacement: Module
+            if record.block == 0 {
+                replacement =
+                    record.embedding
+                    ? PrismHadamardEmbedding(rows: rows, width: width, block: 0)
+                    : PrismHadamardLinear(rows: rows, width: width, block: 0)
+            } else {
+                let rotation = SignedBlockHadamard(blockSize: record.block)
+                if let embedding = leaves[path] as? Embedding {
+                    replacement = HadamardQuantizedEmbedding(
+                        replacing: embedding, groupSize: 128, bits: 2, rotation: rotation)
+                } else if let linear = leaves[path] as? Linear {
+                    replacement = HadamardQuantizedLinear(
+                        replacing: linear, groupSize: 128, bits: 2, rotation: rotation)
+                } else {
+                    throw PrismHadamardError.invalidCheckpoint(
+                        "unsupported module target \(record.path)")
+                }
+            }
             updates.append((path, replacement))
         }
         try model.update(modules: ModuleChildren.unflattened(updates), verify: [.all])
     }
 
-    /// Reject malformed tensors before parameter updates or any inference optimization.
-    package func validate(weights: [String: MLXArray], in model: Module) throws {
+    fileprivate static func validatePackedWeights(
+        _ weights: [String: MLXArray], in model: Module,
+        modules: [HadamardQuantizedModule], pathPrefix: String
+    ) throws {
         let expected = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
-        let paths = Set(modules.map { "language_model." + $0.path })
+        let paths = Set(modules.map { pathPrefix + $0.path })
         for key in weights.keys where key.hasSuffix(".scales") {
             guard paths.contains(String(key.dropLast(".scales".count))) else {
                 throw PrismHadamardError.invalidCheckpoint("undeclared packed module at \(key)")
@@ -133,7 +190,7 @@ package struct PrismHadamardConfiguration: Decodable {
         }
         var signChecks = [MLXArray]()
         for record in modules {
-            let path = "language_model." + record.path
+            let path = pathPrefix + record.path
             for (suffix, dtype) in [
                 ("weight", DType.uint32), ("scales", .float16), ("biases", .float16),
             ] {
@@ -163,16 +220,32 @@ package struct PrismHadamardConfiguration: Decodable {
     }
 }
 
+extension HadamardQuantizedCheckpointPolicy {
+    package func preparePrismCheckpoint(_ checkpoint: ModelCheckpoint, in model: Module) throws
+        -> ModelCheckpoint
+    {
+        let format = manifest.quantization
+        // The published FP16 Prism format requires exact packed tensor dtypes. A deferred
+        // vision checkpoint has no packed language tensors to validate.
+        if format.bits == 2, format.groupSize == 128, format.mode == .affine,
+            manifest.modules.allSatisfy({ $0.dtype == "float16" }),
+            checkpoint.weights.keys.contains(where: { $0.hasPrefix(pathPrefix) })
+        {
+            try PrismHadamardConfiguration.validatePackedWeights(
+                checkpoint.weights, in: model, modules: manifest.modules, pathPrefix: pathPrefix)
+            return normalizingUnpackedWeights(in: checkpoint)
+        }
+        return try prepare(checkpoint)
+    }
+}
+
 /// The reference runtime computes the normalized transform in FP32, then restores the input dtype.
 package func prismHadamardTransform(
     _ x: MLXArray, block: Int, signs: MLXArray?, inverse: Bool = false
 ) -> MLXArray {
     guard block != 0, let signs else { return x }
-    var transformed = x.asType(.float32)
-    if !inverse { transformed = transformed * signs }
-    transformed = hadamardTransform(transformed.reshaped(-1, block)).reshaped(x.shape)
-    if inverse { transformed = transformed * signs }
-    return transformed.asType(x.dtype)
+    let rotation = SignedBlockHadamard(blockSize: block)
+    return inverse ? rotation.inverse(x, signs: signs) : rotation.forward(x, signs: signs)
 }
 
 // Do not subclass QuantizedLinear: ordinary projection fusion would discard the transform.

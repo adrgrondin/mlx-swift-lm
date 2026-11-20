@@ -73,6 +73,25 @@ open class LFM3LanguageModel: Module, LanguageModel, LoRAModel, KVCacheDimension
         try prepareTextInput(input, cache: cache, state: state, prefill: prefill)
     }
 
+    public func validate(tokenizer: any Tokenizer) throws {
+        guard tokenizer.convertTokenToId("<|startoftext|>") == 124894,
+            tokenizer.convertTokenToId(".reduce") == 96744
+        else { return }
+        for (text, pieces) in [
+            (".reduce", [".reduce"]), ("line.\r\nThis", ["line", ".čĊ", "This"]),
+        ] {
+            let expected = pieces.compactMap { tokenizer.convertTokenToId($0) }
+            guard expected.count == pieces.count,
+                !expected.contains(where: { $0 == tokenizer.unknownTokenId })
+            else { continue }
+            guard tokenizer.encode(text: text, addSpecialTokens: false) == expected else {
+                throw ModelFactoryError.invalidConfiguration(
+                    "LFM3 requires a tokenizer that honors BPE ignore_merges and splits regexes by code point. Use swift-transformers with fixes #397 and #398, or a compatible TokenizerLoader."
+                )
+            }
+        }
+    }
+
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         try model.newCache(parameters: parameters)
     }
@@ -111,7 +130,11 @@ package func prepareLFM3Checkpoint(_ checkpoint: ModelCheckpoint, tiedEmbeddings
     var checkpoint = try checkpoint.mapNames(
         using: .init(tiedEmbeddings ? [.excludeModule("lm_head")] : []))
     for (name, value) in checkpoint.weights where name.hasSuffix("conv.conv.weight") {
-        if value.ndim == 3 && value.dim(1) == 1 && value.dim(2) > 1 {
+        guard value.ndim == 3 else {
+            throw ModelFactoryError.invalidConfiguration(
+                "LFM3 convolution tensor \(name) must have rank 3, got \(value.shape)")
+        }
+        if value.dim(-1) > value.dim(1) {
             checkpoint.weights[name] = value.transposed(0, 2, 1)
         }
     }

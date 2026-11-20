@@ -291,12 +291,13 @@ final class PrismHadamardTests: XCTestCase {
         }
         let reference = MLXLLM.Qwen35Model(
             try JSONDecoder().decode(MLXLLM.Qwen35Configuration.self, from: data))
-        var denseWeights = try llm.sanitize(weights: weights)
+        var denseWeights = try llm.sanitize(weights: weights, metadata: ["format": "mlx"])
         let metadata = try JSONDecoder().decode(
             MLXLMCommon.PrismHadamardConfiguration.self, from: data)
         for record in metadata.modules {
             let path = "language_model." + record.path
             let packed = try XCTUnwrap(denseWeights[path + ".weight"])
+            XCTAssertTrue(packed === weights[path + ".weight"])
             let scales = try XCTUnwrap(denseWeights.removeValue(forKey: path + ".scales"))
             let biases = try XCTUnwrap(denseWeights.removeValue(forKey: path + ".biases"))
             let signs = try XCTUnwrap(denseWeights.removeValue(forKey: path + ".signs"))
@@ -329,18 +330,61 @@ final class PrismHadamardTests: XCTestCase {
             let leaves = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
             XCTAssertTrue(
                 leaves["language_model.model.layers.0.linear_attn.in_proj_qkv"]
-                    is PrismHadamardLinear)
-            XCTAssertTrue(leaves["language_model.model.embed_tokens"] is PrismHadamardEmbedding)
+                    is HadamardQuantizedLinear)
+            XCTAssertTrue(leaves["language_model.model.embed_tokens"] is HadamardQuantizedEmbedding)
         }
         XCTAssertFalse(llm.parameters().flattened().contains { $0.0.hasPrefix("vision_tower.") })
         XCTAssertTrue(vlm.parameters().flattened().contains { $0.0.hasPrefix("vision_tower.") })
     }
 
+    func testPackedWeightsStayIdenticalAcrossFileAndMappedPreparation() throws {
+        let data = try configuration()
+        let weights = try checkpoint(configuration: data)
+        let text = try MLXLLM.PrismHadamardQwen35Model(configuration: data)
+        let vision = try MLXVLM.PrismHadamardQwen35(configuration: data)
+        let metadata = ["format": "mlx"]
+        let modelCheckpoint = ModelCheckpoint(weights: weights, metadata: metadata)
+        let norm = "language_model.model.layers.0.input_layernorm.weight"
+        let decay = "language_model.model.layers.0.linear_attn.A_log"
+        XCTAssertEqual(weights[norm]?.dtype, .float32)
+
+        let preparedWeights = try [
+            text.prepareCheckpoint(modelCheckpoint).weights,
+            vision.prepareCheckpoint(modelCheckpoint).weights,
+            text.sanitize(weights: weights, metadata: metadata),
+        ]
+        for prepared in preparedWeights {
+            XCTAssertEqual(prepared[norm]?.dtype, .float16)
+            XCTAssertTrue(prepared[decay] === weights[decay])
+            for suffix in ["weight", "signs", "scales", "biases"] {
+                let key = "language_model.model.embed_tokens." + suffix
+                XCTAssertTrue(try XCTUnwrap(prepared[key]) === weights[key])
+            }
+        }
+    }
+
+    func testModernGroup128ManifestAcceptsBFloat16InBothRegistries() async throws {
+        var config = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: configuration()) as? [String: Any])
+        var modules = try XCTUnwrap(config["modules"] as? [[String: Any]])
+        for i in modules.indices { modules[i]["dtype"] = "bfloat16" }
+        config["modules"] = modules
+        let data = try JSONSerialization.data(withJSONObject: config)
+        let key = "language_model.model.layers.0.input_layernorm.weight"
+        let checkpoint = ModelCheckpoint(weights: [key: MLXArray.ones([512])])
+        for registry in [LLMTypeRegistry.shared, VLMTypeRegistry.shared] {
+            let model = try await registry.createModel(
+                configuration: data, modelType: "prism_hadamard_qwen35")
+            XCTAssertEqual(try model.prepareCheckpoint(checkpoint).weights[key]?.dtype, .bfloat16)
+        }
+    }
+
     func testTextOnlyLoaderExcludesVisionParameters() throws {
         let data = try configuration()
         let weights = try checkpoint(configuration: data)
-        let model = try MLXLLM.PrismHadamardQwen35(configuration: data)
+        let model = try MLXLLM.PrismHadamardQwen35Model(configuration: data)
         let textWeights = weights.filter { !$0.key.hasPrefix("vision_tower.") }
+        let expected = try model.sanitize(weights: textWeights, metadata: ["format": "mlx"])
         try withCheckpoint(textWeights) { directory in
             let visionURL = directory.appendingPathComponent("model-vision.safetensors")
             try save(
@@ -349,8 +393,10 @@ final class PrismHadamardTests: XCTestCase {
         }
         let loaded = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
         XCTAssertEqual(Set(loaded.keys), Set(textWeights.keys))
-        for (name, expected) in textWeights {
-            assertClose(try XCTUnwrap(loaded[name]), expected, tolerance: 0)
+        for (name, expected) in expected {
+            let actual = try XCTUnwrap(loaded[name])
+            XCTAssertEqual(actual.dtype, expected.dtype, name)
+            assertClose(actual, expected, tolerance: 0)
         }
     }
 
@@ -396,7 +442,7 @@ final class PrismHadamardTests: XCTestCase {
                 key.hasPrefix("language_model.")
                     ? (String(key.dropFirst("language_model.".count)), value) : nil
             })
-        let model = try MLXLLM.PrismHadamardQwen35(configuration: data)
+        let model = try MLXLLM.PrismHadamardQwen35Model(configuration: data)
         try withCheckpoint(textWeights) { try loadWeights(modelDirectory: $0, model: model) }
         XCTAssertThrowsError(try MLXVLM.PrismHadamardQwen35(configuration: data))
     }
@@ -410,7 +456,7 @@ final class PrismHadamardTests: XCTestCase {
             minimal.removeValue(forKey: "gdn_activation_layout")
             if schema == 2 { minimal.removeValue(forKey: "schema_version") }
             XCTAssertNoThrow(
-                try MLXLLM.PrismHadamardQwen35(
+                try MLXLLM.PrismHadamardQwen35Model(
                     configuration: JSONSerialization.data(withJSONObject: minimal)))
             for (key, value) in [
                 ("tensor_namespace", schema == 1 ? "mlx-vlm-qwen3_5" : "mlx-lm-text"),
@@ -419,13 +465,13 @@ final class PrismHadamardTests: XCTestCase {
                 var invalid = original
                 invalid[key] = value
                 XCTAssertThrowsError(
-                    try MLXLLM.PrismHadamardQwen35(
+                    try MLXLLM.PrismHadamardQwen35Model(
                         configuration: JSONSerialization.data(withJSONObject: invalid)))
             }
             var missingNamespace = original
             missingNamespace.removeValue(forKey: "tensor_namespace")
             XCTAssertThrowsError(
-                try MLXLLM.PrismHadamardQwen35(
+                try MLXLLM.PrismHadamardQwen35Model(
                     configuration: JSONSerialization.data(withJSONObject: missingNamespace)))
         }
     }
@@ -438,7 +484,7 @@ final class PrismHadamardTests: XCTestCase {
             var records = try XCTUnwrap(config["modules"] as? [[String: Any]])
             for i in records.indices { records[i]["block"] = block }
             config["modules"] = records
-            let model = try MLXLLM.PrismHadamardQwen35(
+            let model = try MLXLLM.PrismHadamardQwen35Model(
                 configuration: JSONSerialization.data(withJSONObject: config))
             let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
             XCTAssertEqual(
@@ -472,12 +518,11 @@ final class PrismHadamardTests: XCTestCase {
         let original = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         for (key, value) in [
             ("schema_version", 3 as Any), ("gdn_activation_layout", "ungrouped" as Any),
-            ("quantization", ["bits": 4, "group_size": 128, "mode": "affine"] as Any),
         ] {
             var invalid = original
             invalid[key] = value
             XCTAssertThrowsError(
-                try MLXLLM.PrismHadamardQwen35(
+                try MLXLLM.PrismHadamardQwen35Model(
                     configuration: JSONSerialization.data(withJSONObject: invalid)))
         }
         for change in ["duplicate", "path", "block", "dtype", "embedding"] {
@@ -492,9 +537,18 @@ final class PrismHadamardTests: XCTestCase {
             }
             invalid["modules"] = records
             XCTAssertThrowsError(
-                try MLXLLM.PrismHadamardQwen35(
+                try MLXLLM.PrismHadamardQwen35Model(
                     configuration: JSONSerialization.data(withJSONObject: invalid)))
         }
+    }
+
+    func testLegacyManifestRejectsNonTernaryPacking() throws {
+        var config = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: configuration(schema: 1)) as? [String: Any])
+        config["quantization"] = ["bits": 4, "group_size": 128, "mode": "affine"]
+        XCTAssertThrowsError(
+            try MLXLLM.PrismHadamardQwen35Model(
+                configuration: JSONSerialization.data(withJSONObject: config)))
     }
 
     func testMalformedWeightsAbortTheSharedLoader() throws {
@@ -515,7 +569,7 @@ final class PrismHadamardTests: XCTestCase {
                 weights[prefix + "scales"] = weights[prefix + "scales"]?.asType(.float32)
             default: weights["language_model.unknown.scales"] = MLXArray.ones([1])
             }
-            let model = try MLXLLM.PrismHadamardQwen35(configuration: data)
+            let model = try MLXLLM.PrismHadamardQwen35Model(configuration: data)
             try withCheckpoint(weights) { directory in
                 XCTAssertThrowsError(try loadWeights(modelDirectory: directory, model: model)) {
                     error in

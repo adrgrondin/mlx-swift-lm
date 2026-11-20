@@ -74,6 +74,7 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
             "mistral3": "Mistral3Processor",
             "prism_hadamard_qwen35": "Qwen3VLProcessor",
             "gemma4_unified": "Gemma4UnifiedProcessor",
+            "diffusion_gemma": "DiffusionGemma4Processor",
         ]),
     ])
 
