@@ -141,12 +141,17 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Example: `<|channel|>commentary to=functions.get_weather<|message|>{"location": "Tokyo"}<|call|>`
     case gptOSS = "gpt_oss"
 
+    /// Inkling 2 assistant frames with a named JSON invocation channel.
+    case inkling2
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
     /// - Returns: A parser instance configured for this format
     public func createParser() -> any ToolCallParser {
         switch self {
+        case .inkling2:
+            return Inkling2ToolCallParser()
         case .json:
             return JSONToolCallParser(
                 startTag: "<tool_call>", endTag: "</tool_call>", supportsBareJSON: true)
@@ -203,13 +208,14 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     ) -> any TokenStreamDecoder {
         if let decoder = makeProtocolTokenStreamDecoder(
             tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
-            toolCallPolicy: toolCallPolicy)
+            toolCallPolicy: toolCallPolicy, reasoning: reasoning)
         {
             return decoder
         }
         return StandardTokenStreamDecoder(
             tokenizer: tokenizer, format: self, tools: tools, stopStrings: stopStrings,
-            toolCallPolicy: toolCallPolicy, reasoning: reasoning)
+            toolCallPolicy: toolCallPolicy, reasoning: reasoning,
+            parsesToolCalls: self != .inkling2)
     }
 
     /// Builds a decoder only for formats which own a framed token protocol.
@@ -220,9 +226,15 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         tokenizer: any Tokenizer,
         tools: [[String: any Sendable]]?,
         stopStrings: Set<String>,
-        toolCallPolicy: ToolCallPolicy = .init()
+        toolCallPolicy: ToolCallPolicy = .init(),
+        reasoning: (config: ReasoningConfig, primedInside: Bool)? = nil
     ) -> (any TokenStreamDecoder)? {
         switch self {
+        case .inkling2:
+            return Inkling2StreamDecoder(
+                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+                policy: toolCallPolicy, reasoning: reasoning)
+
         case .gptOSS:
             return HarmonyStreamAdapter(
                 tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
@@ -256,8 +268,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         case .atem:
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
-            .miniCPM5, .mistral,
-            .llama3:
+            .miniCPM5, .mistral, .llama3, .inkling2:
             return []
         }
     }
@@ -278,7 +289,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 }
             }
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
-            .miniCPM5, .mistral, .llama3:
+            .miniCPM5, .mistral, .llama3, .inkling2:
             0
         }
     }

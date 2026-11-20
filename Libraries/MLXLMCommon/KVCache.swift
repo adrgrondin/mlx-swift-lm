@@ -719,7 +719,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     /// Number of leading tokens that are never rotated out of the window.
-    var keepCount: Int { keep }
+    package var keepCount: Int { keep }
 
     public init(maxSize: Int, keep: Int = 0, step: Int = 256, rewindCapacity: Int = 0) {
         precondition(rewindCapacity >= 0 && maxSize <= Int.max - rewindCapacity)

@@ -115,6 +115,9 @@ public enum VLMTypeRegistry {
         "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm3_vl": create(LFM3VLConfiguration.self, LFM3VL.init),
+        "inkling2_loop": { data in
+            try Inkling2(JSONDecoder().decode(Inkling2Configuration.self, from: data))
+        },
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
@@ -163,6 +166,7 @@ public enum VLMProcessorTypeRegistry {
             LFM2VLProcessorConfiguration.self, LFM2VLProcessor.init),
         "Lfm3VlProcessor": create(
             LFM3VLProcessorConfiguration.self, LFM3VLProcessor.init),
+        "Inkling2Processor": create(Inkling2Configuration.self, Inkling2Processor.init),
         "Glm46VProcessor": create(
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "MuseGlimmerProcessor": create(
@@ -214,6 +218,9 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         id: "mlx-community/SmolVLM-Instruct-4bit",
         defaultPrompt: "Describe the image in English"
     )
+
+    static public let inkling2Mini4Bit = ModelConfiguration(
+        id: "mlx-community/Inkling-2-Mini-4bit")
 
     static public let lfm3_vl_2b_4bit = ModelConfiguration(
         id: "LiquidAI/LFM3-VL-2B-MLX-4bit",
@@ -357,6 +364,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             bonsai2_27B_ternary_2bit,
             museGlimmer30B4bit,
             lfm3_vl_2b_4bit,
+            inkling2Mini4Bit,
         ]
     }
 

@@ -68,7 +68,7 @@ extension TokenStreamDecoder {
 struct StandardTokenStreamDecoder: TokenStreamDecoder {
     private let tokenizer: any Tokenizer
     private var detokenizer: any StreamingDetokenizer
-    private let toolCallProcessor: ToolCallProcessor
+    private let toolCallProcessor: ToolCallProcessor?
     private var stopStringFilter: StopStringFilter
 
     /// Whether the latest token completed text that ends in a visible character.
@@ -84,6 +84,7 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
     /// by id, and the emitter does not scan for their text. The same holds for each
     /// implicit end delimiter that is a single token.
     private let reasoningTokens: ReasoningDelimiterTokens?
+    private let suppressedControlTokens: [Int: String]
 
     init(
         tokenizer: any Tokenizer,
@@ -91,17 +92,27 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
         tools: [[String: any Sendable]]?,
         stopStrings: Set<String>,
         toolCallPolicy: ToolCallPolicy = .init(),
-        reasoning: (config: ReasoningConfig, primedInside: Bool)? = nil
+        reasoning: (config: ReasoningConfig, primedInside: Bool)? = nil,
+        parsesToolCalls: Bool = true
     ) {
         self.tokenizer = tokenizer
         self.detokenizer = tokenizer.makeStreamingDetokenizer()
-        self.toolCallProcessor = ToolCallProcessor(
-            format: format, tools: tools, toolCallPolicy: toolCallPolicy)
+        self.toolCallProcessor =
+            parsesToolCalls
+            ? ToolCallProcessor(format: format, tools: tools, toolCallPolicy: toolCallPolicy) : nil
         self.stopStringFilter = StopStringFilter(stopStrings: stopStrings)
         let reasoningTokens = reasoning.flatMap {
             ReasoningDelimiterTokens(config: $0.config, tokenizer: tokenizer)
         }
         self.reasoningTokens = reasoningTokens
+        var suppressedControlTokens: [Int: String] = [:]
+        for text in reasoning?.config.suppressedControlTokens ?? [] {
+            if let id = tokenizer.singleTokenID(for: text), tokenizer.decode(tokenIds: [id]) == text
+            {
+                suppressedControlTokens[id] = text
+            }
+        }
+        self.suppressedControlTokens = suppressedControlTokens
         self.reasoningEmitter = reasoning.map {
             ReasoningEventEmitter(
                 config: $0.config, primedInside: $0.primedInside,
@@ -109,8 +120,8 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
         }
     }
 
-    var rejectedToolCallCount: Int { toolCallProcessor.rejectedToolCallCount }
-    var recoveredToolCallCount: Int { toolCallProcessor.recoveredToolCallCount }
+    var rejectedToolCallCount: Int { toolCallProcessor?.rejectedToolCallCount ?? 0 }
+    var recoveredToolCallCount: Int { toolCallProcessor?.recoveredToolCallCount ?? 0 }
 
     var isInsideReasoning: Bool { reasoningEmitter?.isInsideReasoning ?? false }
 
@@ -119,16 +130,19 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
     var canEndForSteering: Bool {
         endsInVisibleText && stopStringFilter.buffer.isEmpty
             && (reasoningEmitter?.canEndForSteering ?? true)
-            && toolCallProcessor.canEndForSteering
+            && (toolCallProcessor?.canEndForSteering ?? true)
     }
 
     mutating func push(_ token: Int, emit: (TokenStreamEvent) -> Bool) -> Bool {
         endsInVisibleText = false
+        let suppressed = suppressedControlTokens[token]
         if let boundary = reasoningTokens?.boundary(for: token),
-            reasoningEmitter?.isBoundary(boundary) == true
+            reasoningEmitter?.isBoundary(boundary) == true,
+            suppressed == nil || isInsideReasoning
         {
             return push(boundary, emit: emit)
         }
+        if let suppressed { return consumeFramingToken(suppressed, emit: emit) }
         detokenizer.append(token: token)
         guard let chunk = detokenizer.next() else { return true }
         endsInVisibleText = chunk.last?.isWhitespace == false
@@ -139,22 +153,26 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
     private mutating func push(
         _ boundary: ReasoningEventEmitter.Boundary, emit: (TokenStreamEvent) -> Bool
     ) -> Bool {
-        // Text still held by the detokenizer and the stop filter precedes the boundary.
+        guard let delimiter = reasoningTokens?.text(of: boundary) else { return true }
+        guard consumeFramingToken(delimiter, emit: emit) else { return false }
+        guard let segments = reasoningEmitter?.process(boundary: boundary) else { return true }
+        return emitSegments(segments, emit: emit)
+    }
+
+    private mutating func consumeFramingToken(_ token: String, emit: (TokenStreamEvent) -> Bool)
+        -> Bool
+    {
         if let text = detokenizer.finish(), !process(text, emit: emit) { return false }
         detokenizer = tokenizer.makeStreamingDetokenizer()
         if let text = stopStringFilter.finish(), !route(text, emit: emit) { return false }
 
-        // The delimiter is never decoded, so offer its text to the stop filter here:
-        // a caller may stop on it. Whatever the filter passes or holds is dropped.
-        guard let delimiter = reasoningTokens?.text(of: boundary) else { return true }
-        if stopStringFilter.process(delimiter).stopped {
+        // A caller may stop on framing even though it is never emitted as text.
+        if stopStringFilter.process(token).stopped {
             _ = emit(.stop)
             return false
         }
         stopStringFilter.buffer = ""
-
-        guard let segments = reasoningEmitter?.process(boundary: boundary) else { return true }
-        return emitSegments(segments, emit: emit)
+        return true
     }
 
     private mutating func process(_ chunk: String, emit: (TokenStreamEvent) -> Bool) -> Bool {
@@ -184,7 +202,7 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
             return false
         }
 
-        return emitOutputs(toolCallProcessor.processEOSOutputs(), emit: emit)
+        return emitOutputs(toolCallProcessor?.processEOSOutputs() ?? [], emit: emit)
     }
 
     /// Splits reasoning off first and lets only non-reasoning text reach the
@@ -192,7 +210,7 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
     /// would otherwise produce a phantom tool call.
     private mutating func route(_ text: String, emit: (TokenStreamEvent) -> Bool) -> Bool {
         guard let segments = reasoningEmitter?.process(text) else {
-            return emitOutputs(toolCallProcessor.processChunkOutputs(text), emit: emit)
+            return emitResponse(text, emit: emit)
         }
         return emitSegments(segments, emit: emit)
     }
@@ -208,11 +226,15 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
             case .reasoning(let reasoning):
                 guard emit(.reasoning(reasoning)) else { return false }
             case .response(let response):
-                guard emitOutputs(toolCallProcessor.processChunkOutputs(response), emit: emit)
-                else { return false }
+                guard emitResponse(response, emit: emit) else { return false }
             }
         }
         return true
+    }
+
+    private func emitResponse(_ text: String, emit: (TokenStreamEvent) -> Bool) -> Bool {
+        guard let toolCallProcessor else { return emit(.response(text)) }
+        return emitOutputs(toolCallProcessor.processChunkOutputs(text), emit: emit)
     }
 
     /// Maps ordered processor outputs onto stream events, keeping response text,

@@ -220,6 +220,20 @@ public class ToolCallProcessor {
         return drainOrderedOutputs()
     }
 
+    func processFramedCall(_ rawText: String, rejection: RejectedToolCall.Reason?) -> [Output] {
+        orderedOutputEnabled = true
+        if let rejection {
+            appendRejectedToolCall(reason: rejection, rawText: rawText)
+        } else if let call = parser.parse(content: rawText, tools: tools) {
+            appendToolCall(call, rawText: rawText)
+        } else {
+            appendRejectedToolCall(reason: .malformedSyntax, rawText: rawText)
+        }
+        _ = drainToolCalls()
+        _ = drainRejectedToolCalls()
+        return drainOrderedOutputs()
+    }
+
     /// Removes and returns every parsed call in parse order.
     /// A second call returns an empty array until more chunks are processed.
     public func drainToolCalls() -> [ToolCall] {

@@ -107,6 +107,29 @@ struct ReasoningDelimiterTokenTests {
 
     private var qwen: ReasoningConfig { QwenReasoningProtocol.tagged }
 
+    @Test func suppressesControlTokensWithoutSuppressingLiteralText() {
+        var config = ReasoningConfig(
+            startDelimiter: "<|think|>", endDelimiter: "<|end|>", promptStrategy: .none)
+        config.suppressedControlTokens = ["<|role|>", "<|answer|>", "<|end|>"]
+        let tokenizer = VocabularyTokenizer(vocabulary: [
+            1: "<|think|>", 2: "<|end|>", 3: "<|role|>", 4: "<|answer|>",
+            10: "thought", 11: "answer", 12: "<|role|>",
+        ])
+        var decoder = StandardTokenStreamDecoder(
+            tokenizer: tokenizer, format: .json, tools: nil, stopStrings: [],
+            reasoning: (config: config, primedInside: false))
+        var collected = Collected()
+        func collect(_ event: TokenStreamEvent) -> Bool {
+            if case .reasoning(let text) = event { collected.reasoning.append(text) }
+            if case .response(let text) = event { collected.response.append(text) }
+            return true
+        }
+        for id in [3, 1, 10, 2, 3, 4, 11, 12, 2] { _ = decoder.push(id, emit: collect) }
+        _ = decoder.finish(emit: collect)
+        #expect(collected.reasoningText == "thought")
+        #expect(collected.responseText == "answer<|role|>")
+    }
+
     // MARK: - Resolution
 
     @Test("Delimiters resolve only when each is one token that decodes to itself")

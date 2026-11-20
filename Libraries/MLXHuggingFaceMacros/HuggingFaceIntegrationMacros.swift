@@ -82,11 +82,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
             //
             { (huggingFaceTokenizer: Tokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
                 struct TokenizerBridge: MLXLMCommon.Tokenizer {
-                    private let upstream: any Tokenizers.Tokenizer
-
-                    init(_ upstream: any Tokenizers.Tokenizer) {
-                        self.upstream = upstream
-                    }
+                    let upstream: any Tokenizers.Tokenizer
 
                     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
                         upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
@@ -115,6 +111,12 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         additionalContext: [String: any Sendable]?
                     ) throws -> [Int] {
                         do {
+                            if let ids = try MLXLMCommon._Inkling2ToolPrompt.renderIfNeeded(
+                                tokenizer: self, messages: messages, tools: tools,
+                                additionalContext: additionalContext)
+                            {
+                                return ids
+                            }
                             return try upstream.applyChatTemplate(
                                 messages: messages, tools: tools, additionalContext: additionalContext)
                         } catch Tokenizers.TokenizerError.missingChatTemplate {
@@ -123,7 +125,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                     }
                 }
 
-                return TokenizerBridge(huggingFaceTokenizer)
+                return TokenizerBridge(upstream: huggingFaceTokenizer)
             }(\(argument))
             """
     }

@@ -167,6 +167,9 @@ public struct ReasoningConfig: Sendable, Equatable {
     /// delimiter-pair protocol, e.g. `<think>` ... `</think>`.
     public var channel: ReasoningChannel?
 
+    /// Single-token response framing discarded unless it closes an open reasoning span.
+    package var suppressedControlTokens: [String] = []
+
     public init(
         startDelimiter: String,
         endDelimiter: String,

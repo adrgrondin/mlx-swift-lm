@@ -72,6 +72,7 @@ The following models have been tried:
 - mlx-community/gemma-3-27b-it-qat-4bit
 - HuggingFaceTB/SmolVLM2-500M-Video-Instruct-mlx
 - mlx-community/Muse-Glimmer-30B-4bit
+- mlx-community/Inkling-2-Mini-4bit
 
 Currently supported model types are:
 
@@ -85,6 +86,35 @@ Currently supported model types are:
 - muse_glimmer
 - lfm3_vl ([image/video processing and usage](../../README.md#liquidai-lfm3))
 - diffusion_gemma
+- inkling2_loop
+
+## Inkling 2 Mini
+
+Load [Inkling-2-Mini-4bit](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit)
+with `VLMModelFactory.shared` and `VLMRegistry.inkling2Mini4Bit`. It accepts text
+and one or more still images in a single prompt. The image processor reads its
+settings from `config.json`. Prompts without tool history or declarations use the
+checkpoint's `chat_template.jinja`. The experts retain the checkpoint's NVFP4 and MXFP8
+weights, including per-expert scales for NVFP4. `ChatSession.streamDetails`
+reports reasoning separately from the answer and omits the wire markers. You can
+set `reasoning_effort` in `ChatSession`'s `additionalContext`. Tool prompts work
+with both `#huggingFaceTokenizerLoader()` and `#adaptHuggingFaceTokenizer`.
+`ChatSession` can dispatch validated calls and replay tool results without treating
+literal token spellings in them as model controls. A configured stop string in a
+tool frame stops generation before that frame can be dispatched.
+
+The processor caps each image at 4,096 image tokens by default. Override that cap
+with `UserInput.Processing.maxPixels`; the limit includes padding to the 40×40
+merge grid. Images already within the budget are not resized by the cap.
+
+Inkling supports bounded KV caches with a retained prefix. Affine KV-cache
+quantization compresses eligible full-attention layers; decode materializes their
+keys and values because Inkling's per-query attention sinks need dense attention.
+
+This port targets the published MLX conversion. Raw training checkpoints, video,
+audio, and DSpark are not supported. Prefill uses the reference relative-attention
+math rather than the upstream fused kernel, so long prompts can be slower and
+use more memory.
 
 ## DiffusionGemma
 

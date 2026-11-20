@@ -70,6 +70,7 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
     /// Shared instance, preloaded with this package's built-in loading rules.
     public static let shared = VLMProcessorLoadingRegistry(resolvers: [
         Qwen35ProcessorLoadingResolver(),
+        Inkling2ProcessorLoadingResolver(),
         ModelTypeProcessorResolver(processorTypes: [
             "mistral3": "Mistral3Processor",
             "prism_hadamard_qwen35": "Qwen3VLProcessor",
